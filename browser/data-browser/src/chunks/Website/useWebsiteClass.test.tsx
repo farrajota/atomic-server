@@ -22,9 +22,11 @@ const classResource = (shortname?: string, error?: Error) => ({
 function storeWhere(
   read: (subject: string) => Promise<unknown>,
   listeners: (() => void)[] = [],
+  refetch?: (subject: string) => Promise<unknown>,
 ): Store {
   return {
     getResource: read,
+    fetchResourceFromServer: refetch ?? read,
     subscribe: (_subject: string, callback: () => void) => {
       listeners.push(callback);
 
@@ -73,6 +75,62 @@ describe('useWebsiteClass', () => {
     });
 
     await waitFor(() => expect(result.current).toBe(WEBSITE_CLASS));
+  });
+
+  // The first version of this fix tried three times and then stopped for good.
+  // Under load that is not enough: each `getResource` can take its own 10s
+  // timeout, so three tries are spent inside half a minute and the page stays a
+  // bare property list for as long as it is open. `website.spec:10` failed that
+  // way at line 101, with the version view rendered as a property list.
+  it('keeps asking past the third failure', async () => {
+    let reads = 0;
+    const store = storeWhere(async () => {
+      reads++;
+
+      if (reads <= 5) throw new Error('Async Request timed out after 10000ms');
+
+      return classResource('website-project');
+    });
+
+    const { result } = renderHook(() => useWebsiteClass(WEBSITE_CLASS), {
+      wrapper: wrapper(store),
+    });
+
+    // 150 + 300 + 600 + 1200 + 2400 ms of backoff before the sixth read.
+    await waitFor(() => expect(result.current).toBe(WEBSITE_CLASS), {
+      timeout: 8000,
+    });
+    expect(reads).toBe(6);
+  }, 12_000);
+
+  // `store.getResource` answers from the cache and returns a resource that
+  // once failed unchanged, so asking it again is not asking anyone. Without
+  // the refetch this test never resolves, however long the hook keeps trying.
+  it('goes back to the server once the cached class is an errored one', async () => {
+    let cached = 0;
+    let fetched = 0;
+    const store = storeWhere(
+      async () => {
+        cached++;
+
+        return classResource(undefined, new Error('could not read'));
+      },
+      [],
+      async () => {
+        fetched++;
+
+        return classResource('website-project');
+      },
+    );
+
+    const { result } = renderHook(() => useWebsiteClass(WEBSITE_CLASS), {
+      wrapper: wrapper(store),
+    });
+
+    await waitFor(() => expect(result.current).toBe(WEBSITE_CLASS));
+    // The first pass reads the cache; only the retry pays for a roundtrip.
+    expect(cached).toBe(1);
+    expect(fetched).toBe(1);
   });
 
   it('settles on a resource that is genuinely not a website, without retrying', async () => {
