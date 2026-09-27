@@ -3,6 +3,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { ClientDbWorker } from './client-db.js';
 import { RequestCancelledError } from './error.js';
 
+/** The 2s leader election plus the 15s a steal gets to settle, and a tick. */
+const LEADER_ELECTION_AND_STEAL_MS = 17_500;
+
 describe('ClientDbWorker without a secure context', () => {
   it('parks in server-only mode with a clear error when Web Locks are unavailable', async () => {
     // Simulate an insecure context (plain HTTP on a non-localhost origin, e.g.
@@ -67,6 +70,100 @@ describe('ClientDbWorker cold initialization', () => {
       await initialized;
       expect(request).toHaveBeenCalledTimes(1);
       expect(warn).not.toHaveBeenCalled();
+    } finally {
+      db.destroy();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  // Run 4686 carried 60 "reclaiming the lock did not succeed" messages and not
+  // one "stealing OPFS lock" warning beside them, which can only mean the lock
+  // was ours the whole time and the page was waiting on its own wasm import.
+  // The message sent the reader after another tab that never existed, and the
+  // park made every write throw `ClientDb unavailable`, so `createDrive`'s save
+  // failed and `/app/dev-drive` never navigated.
+  it('waits for its own slow worker instead of blaming another tab', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn((_name, _options, callback) => callback());
+    vi.stubGlobal('navigator', { locks: { request } });
+    vi.stubGlobal(
+      'BroadcastChannel',
+      class {
+        postMessage() {}
+        close() {}
+      },
+    );
+    // Longer than the 15s a steal gets: on the CI box the same boot measured
+    // 7.9s, so twice a bad day is still our own database opening.
+    vi.stubGlobal(
+      'Worker',
+      class {
+        onmessage?: (event: unknown) => void;
+        postMessage(message: { id: string }) {
+          setTimeout(
+            () =>
+              this.onmessage?.({ data: { id: message.id, type: 'result' } }),
+            30_000,
+          );
+        }
+        terminate() {}
+      },
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const db = new ClientDbWorker('wasm-url', 'worker-url');
+
+    try {
+      const initialized = db.init('https://example.com');
+
+      // Past the old 15s cap, and the page must not have given up yet.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(db.initError).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(11_000);
+      await initialized;
+
+      // One lock request, no steal, no warning, and the cache is in use.
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(warn).not.toHaveBeenCalled();
+      expect(db.initError).toBeUndefined();
+      await expect(db.waitForReady()).resolves.toBe(true);
+    } finally {
+      db.destroy();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still names a real holder when the lock had to be stolen', async () => {
+    vi.useFakeTimers();
+    // A ghost leader: the lock is held, so our queued callback never runs and
+    // no worker is ever spawned. The steal is ignored, as an engine without
+    // `steal` support does.
+    const request = vi.fn(() => new Promise(() => {}));
+    vi.stubGlobal('navigator', { locks: { request } });
+    vi.stubGlobal(
+      'BroadcastChannel',
+      class {
+        postMessage() {}
+        close() {}
+      },
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const db = new ClientDbWorker('wasm-url', 'worker-url');
+
+    try {
+      const initialized = db.init('https://example.com');
+      await vi.advanceTimersByTimeAsync(LEADER_ELECTION_AND_STEAL_MS);
+      await initialized;
+
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('stealing OPFS lock'),
+      );
+      expect(db.initError?.message).toMatch(/another tab/i);
     } finally {
       db.destroy();
       vi.restoreAllMocks();
