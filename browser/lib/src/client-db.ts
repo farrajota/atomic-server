@@ -215,18 +215,28 @@ const STEAL_SETTLE_WAIT_MS = 15_000;
 
 // The same wait, for the case where nothing was stolen because we already own
 // the lock and our own leader init is simply still running. Nothing is
-// contended here, so the only thing a short cap buys is a wrong diagnosis and
-// a write that throws: `send()` parks every caller on `initPromise` until
-// `doInit` resolves, so a cap that fires first turns a slow boot into
-// "ClientDb unavailable" for each write, and `Resource.save()` rejects a
-// commit the server has already acked.
+// contended there, so the message this cap produces has to say so: see the
+// `still-stuck` branch below.
 //
 // The election times out on essentially every cold load, because
 // `leadershipGained` resolves only after the worker's wasm import and OPFS
-// open, which is far more than 2s: CI run 4686 measured
-// `clientdb.election` at exactly 2000.3ms and `clientdb.workerInit` at
-// 7948.8ms on the same load, 53% of the steal budget it was then sharing.
-const OWN_BOOT_SETTLE_WAIT_MS = 60_000;
+// open, which is far more than 2s: CI run 4686 measured `clientdb.election` at
+// exactly 2000.3ms and `clientdb.workerInit` at 7948.8ms on the same load.
+//
+// The cap is deliberately the SAME as the steal's, and raising it is a trap
+// worth naming, because it looks like an improvement. Parking makes every
+// subsequent write throw `ClientDb unavailable`, and `Resource.save()` then
+// rejects a commit the server has already acked, so waiting longer does let a
+// write through. But `send()` parks every caller on `initPromise`, and
+// `Store.hydrateFromLocalDb` runs BEFORE the server fetch for most subjects,
+// so the same wait blocks every read for as long as the boot takes. Measured
+// against a worker whose init takes 40s: at 15s a read rejects at 17000ms,
+// which is what lets the store fall through and ask the server; raised to 60s
+// the same read settles at 40005ms, and a caller with its own budget (a class
+// lookup gets 10s per read and three tries) gives up for good instead. Reads
+// want to fail fast, writes want to wait. Splitting those two is the fix; one
+// number cannot serve both.
+const OWN_BOOT_SETTLE_WAIT_MS = 15_000;
 
 // Lock stealing (`navigator.locks.request({ steal: true })`) is attempted on
 // every browser. Modern Firefox (and Zen) honors `steal` — verified manually
