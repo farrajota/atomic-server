@@ -12,6 +12,7 @@ import {
   envCpuThrottle,
   registerPerfPage,
 } from './perf-attach';
+import { installEmptyDiscoveryRoom } from './fixtures';
 
 /** Playwright tag for the light CI gate (`pnpm test-e2e:light` / `--grep @smoke`). */
 export const smoke = { tag: '@smoke' } as const;
@@ -280,6 +281,18 @@ export const before = async (
   if (throttle) await applyCpuThrottle(page, throttle);
 
   if (testInfo) registerPerfPage(testInfo, page);
+
+  // Peer discovery never reaches the public service from a test, whichever
+  // `test` the spec imported. `fixtures.ts` installs this for the specs that
+  // take their `test` from there, but 22 spec files import `test` straight from
+  // `@playwright/test` and so never got it, and every page they open dials
+  // `wss://atomic.place/webrtc-signal` for real. That is silent exactly where it
+  // matters: on a runner that can reach the host the socket connects and the
+  // suite passes while depending on a production service, and only where the
+  // host is unreachable does it surface, as console noise. Nineteen of those 22
+  // call this function, which is why it goes here; the fixture registering it a
+  // second time is harmless.
+  await installEmptyDiscoveryRoom(page.context());
 
   await installCommitWatcher(page);
   await test.step('Initialize fresh agent and drive', () => devDrive(page));
