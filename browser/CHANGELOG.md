@@ -4,6 +4,11 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- Pasting an agent secret that opens a different agent than the signed-in
+  account no longer signs that account out on its own. The app now says which
+  account is signed in, shows both agents, and lets the user stay signed in or
+  use the secret and sign out.
+
 - Turning workspace sync off says what is actually in the way. All three of its
   preconditions used to answer with "Open this drive with local storage
   available before disconnecting", so someone signed out, or on a server this
