@@ -221,6 +221,10 @@ test('interactive demo leads to template selection and back from the top bar', a
   const choose = bar.getByRole('button', { name: 'Choose a template' });
   await expect(choose).toBeVisible({ timeout: 90000 });
   await expect(bar.getByRole('button', { name: 'Leave demo' })).toBeVisible();
+  // The demo's app arrives from behind the splash with a slight scale (about
+  // half a second), and a box measured meanwhile is a little smaller than it
+  // settles at: the bar read 55.2 tall against a nav 55.7 down.
+  await expect(page.locator('#root')).not.toHaveClass(/boot-revealing/);
   const barBox = await bar.boundingBox();
   const nav = await page
     .getByLabel('navigation', { exact: true })
