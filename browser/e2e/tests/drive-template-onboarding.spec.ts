@@ -212,7 +212,7 @@ test('blank drive remains a short path without feedback covering it on mobile', 
 test('interactive demo leads to template selection and back from the top bar', async ({
   page,
 }) => {
-  test.setTimeout(120000);
+  test.setTimeout(240000);
   // A guest, not a dev drive: a signed-in visitor who opens the demo is sent
   // to their own workspace instead (DemoRoute's signedInDrive).
   await page.setViewportSize({ width: 390, height: 844 });
@@ -243,7 +243,10 @@ test('interactive demo leads to template selection and back from the top bar', a
     ),
   );
   await page.reload();
-  await expect(choose).toBeVisible({ timeout: 30000 });
+  // The reload brings the demo up again from nothing, which took as long as
+  // the first visit (11 s alone here, 24 s at four workers), so it gets the
+  // first visit's budget: on run 4919 three attempts ran out at 30 s.
+  await expect(choose).toBeVisible({ timeout: 90000 });
 
   // The demo is not a template, and the gallery keeps the way back.
   await choose.click();
