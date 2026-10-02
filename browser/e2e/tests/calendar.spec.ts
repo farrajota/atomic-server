@@ -293,6 +293,11 @@ test.describe('choosing a view type from a tab (#1806)', () => {
     await page.getByTestId('menu-item-table').click();
     const tableTab = page.getByRole('tab', { name: 'Table', exact: true });
     await expect(tableTab).toHaveAttribute('aria-selected', 'true');
+    // The tab reads as selected before `?view=` carries it. The switch that
+    // wrote the Table view lands in the URL a moment later, and a menu action
+    // started before then sees that arrival as the person choosing another tab,
+    // so it adds its view and does not switch to it.
+    await expect(page).toHaveURL(/[?&]view=/);
 
     // Clicking the active tab opens its menu. The only table view cannot be
     // changed in place; Calendar there adds a view instead.
