@@ -125,6 +125,7 @@ msgstr "AI Agents"
 #: src/chunks/Website/WebsitePage.tsx
 #: src/components/AvatarCropper.tsx
 #: src/components/ConfirmationDialog.tsx
+#: src/components/HostUI/hostUIDialogs.tsx
 #: src/components/ParentPicker/ParentPickerDialog.tsx
 #: src/components/Share/ShareDialog.tsx
 #: src/components/forms/NewForm/CustomCreateActions/CustomForms/NewArticleDialog.tsx
@@ -10296,6 +10297,25 @@ msgstr "Touch: two fingers pan and zoom. Once a pen has been seen, one finger pa
 #: src/views/Canvas/CanvasPage.tsx
 msgid "Tap the zoom button (it shows the zoom level) to fit all strokes; drag left/right to zoom continuously"
 msgstr "Tap the zoom button (it shows the zoom level) to fit all strokes; drag left/right to zoom continuously"
+
+#. 0: appTitle
+#. 0: appTitle
+#. 0: appTitle
+#. 0: appTitle
+#: src/components/HostUI/hostUI.tsx
+#: src/components/HostUI/hostUI.tsx
+#: src/components/HostUI/hostUIDialogs.tsx
+#: src/components/HostUI/hostUIDialogs.tsx
+msgid "Asked by {0}"
+msgstr "Asked by {0}"
+
+#: src/components/HostUI/hostUIDialogs.tsx
+msgid "Choose a resource"
+msgstr "Choose a resource"
+
+#: src/components/HostUI/hostUIDialogs.tsx
+msgid "Choose"
+msgstr "Choose"
 
 #: src/views/DriveUnavailable.tsx
 msgid "This drive isn't connected to a server, so it syncs directly between devices. Open it on a device that has it, and it will arrive here."

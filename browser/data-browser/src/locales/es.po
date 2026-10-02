@@ -125,6 +125,7 @@ msgstr "Agentes de IA"
 #: src/chunks/Website/WebsitePage.tsx
 #: src/components/AvatarCropper.tsx
 #: src/components/ConfirmationDialog.tsx
+#: src/components/HostUI/hostUIDialogs.tsx
 #: src/components/ParentPicker/ParentPickerDialog.tsx
 #: src/components/Share/ShareDialog.tsx
 #: src/components/forms/NewForm/CustomCreateActions/CustomForms/NewArticleDialog.tsx
@@ -10278,6 +10279,25 @@ msgstr ""
 #: src/views/Canvas/CanvasPage.tsx
 msgid "Tap the zoom button (it shows the zoom level) to fit all strokes; drag left/right to zoom continuously"
 msgstr ""
+
+#. 0: appTitle
+#. 0: appTitle
+#. 0: appTitle
+#. 0: appTitle
+#: src/components/HostUI/hostUI.tsx
+#: src/components/HostUI/hostUI.tsx
+#: src/components/HostUI/hostUIDialogs.tsx
+#: src/components/HostUI/hostUIDialogs.tsx
+msgid "Asked by {0}"
+msgstr "Solicitado por {0}"
+
+#: src/components/HostUI/hostUIDialogs.tsx
+msgid "Choose a resource"
+msgstr "Elegir un recurso"
+
+#: src/components/HostUI/hostUIDialogs.tsx
+msgid "Choose"
+msgstr "Elegir"
 
 #: src/views/DriveUnavailable.tsx
 msgid "This drive isn't connected to a server, so it syncs directly between devices. Open it on a device that has it, and it will arrive here."
