@@ -277,6 +277,9 @@ test.describe('apps', () => {
       timeout: 60_000,
     });
 
+    await app.getByRole('button', { name: 'Add Apple' }).click();
+    await expect(said).toHaveText('added Apple');
+
     // Atomic's own form for the app's row class, prefilled by the app and
     // saved by the person.
     await app.getByRole('button', { name: 'New row' }).click();
@@ -484,10 +487,15 @@ const PICKERS_APP = `export async function view({ root, store }) {
     b.addEventListener('click', onClick);
     root.append(b);
   };
-  const apple = await store.newResource({
-    parent: table,
-    isA: [rowClass],
-    propVals: { [name]: 'Apple' },
+  // Made on a click, not when the view starts: the host can start a view twice
+  // while the page settles, and every start would add its own Apple.
+  button('Add Apple', async () => {
+    await store.newResource({
+      parent: table,
+      isA: [rowClass],
+      propVals: { [name]: 'Apple' },
+    });
+    said.textContent = 'added Apple';
   });
   button('New row', async () => {
     const made = await store.ui.form({
@@ -526,7 +534,6 @@ const PICKERS_APP = `export async function view({ root, store }) {
     said.textContent = 'file ' + (await store.ui.pickFile({ accept: ['image/*'] }));
   });
   root.append(said);
-  void apple;
 }`;
 
 const APPLY_APP = `export async function view({ root, store }) {
