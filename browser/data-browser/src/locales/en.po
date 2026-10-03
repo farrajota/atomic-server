@@ -10043,6 +10043,16 @@ msgstr "Open sync settings"
 msgid "Go to"
 msgstr "Go to"
 
+#. 0: hidden
+#: src/components/SideBar/SideBarMoreRow.tsx
+msgid "{0} more, open to see all"
+msgstr "{0} more, open to see all"
+
+#. 0: olderCount
+#: src/views/ChatRoom/ChatRoomView.tsx
+msgid "Show older messages ({0})"
+msgstr "Show older messages ({0})"
+
 #: src/components/SideBar/AccountMenu.tsx
 msgid "Profile"
 msgstr "Profile"

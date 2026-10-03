@@ -934,6 +934,33 @@ describe('Store', () => {
     expect(results).toEqual([subject]);
   });
 
+  it('drops destroyed subjects from local search answers', async ({
+    expect,
+  }) => {
+    const store = new Store({ serverUrl: 'https://atomicdata.dev' });
+    const alive = 'https://atomicdata.dev/search-alive';
+    const gone = 'https://atomicdata.dev/search-gone';
+    const fakeClientDb = {
+      isReady: true,
+      isInitialized: true,
+      initError: undefined,
+      waitForReady: async () => true,
+      search: async () => [gone, alive],
+      removeResource: async () => undefined,
+    };
+
+    store.setClientDb(
+      fakeClientDb as unknown as Parameters<Store['setClientDb']>[0],
+    );
+    store.removeResource(gone);
+
+    const results = await store.search('anything', {
+      parents: 'https://atomicdata.dev/test-drive',
+    });
+
+    expect(results).toEqual([alive]);
+  });
+
   it('excludes subjects with a pending outbox entry from the VV sync state (F1 interim)', async ({
     expect,
   }) => {
@@ -967,6 +994,58 @@ describe('Store', () => {
 
     expect(syncState.resources[clean.subject]).toBeDefined();
     expect(syncState.resources[dirty.subject]).toBeUndefined();
+  });
+
+  it('builds a sparse sync state whose size does not grow with the peer count', async ({
+    expect,
+  }) => {
+    const { store } = await testStore();
+    const driveSubject = 'https://example.com/drive';
+    const children = [];
+
+    // Every resource created on a client has a peer of its own.
+    for (let i = 0; i < 12; i++) {
+      const child = await store.newResource({
+        isA: 'https://atomicdata.dev/classes/Folder',
+        propVals: { [core.properties.name]: `Child ${i}` },
+        parent: driveSubject,
+      });
+      await child.save();
+      children.push(child);
+    }
+
+    const dense = await store.computeDriveSyncState(driveSubject);
+    const sparse = await store.computeDriveSyncState(driveSubject, {
+      sparse: true,
+    });
+
+    expect(sparse.hashVersion).toBe(2);
+    expect(sparse.resources).toEqual({});
+    expect(Object.keys(sparse.vvs!).sort()).toEqual(
+      Object.keys(dense.resources).sort(),
+    );
+
+    // Same information as the dense matrix, without the zeros.
+    for (const [subject, counters] of Object.entries(dense.resources)) {
+      const expected = Object.fromEntries(
+        counters
+          .map((counter, i) => [dense.peers[i], counter] as const)
+          .filter(([, counter]) => counter !== 0),
+      );
+      expect(sparse.vvs![subject]).toEqual(expected);
+    }
+
+    // Dense is resources x peers, sparse is the non-zero entries only.
+    const denseCells = Object.values(dense.resources).reduce(
+      (sum, counters) => sum + counters.length,
+      0,
+    );
+    const sparseCells = Object.values(sparse.vvs!).reduce(
+      (sum, vv) => sum + Object.keys(vv).length,
+      0,
+    );
+    expect(dense.peers.length).toBeGreaterThanOrEqual(children.length);
+    expect(sparseCells).toBeLessThan(denseCells / 4);
   });
 
   it('cold-drains outbox entries for subjects no longer in memory', async ({

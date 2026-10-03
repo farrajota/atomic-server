@@ -202,6 +202,9 @@ const REPEATABLE_RPC_TYPES = new Set([
   'envelopesFor',
   'getAllVersionVectors',
   'getVersionVectorsForDrive',
+  'getDriveSubjects',
+  'indexPendingSearch',
+  'getVersionVectorsForSubjects',
   'outboxEntries',
 ]);
 
@@ -861,19 +864,63 @@ export class ClientDbWorker {
    * callers must not follow this with a separate flush RPC, which could race
    * an identity handoff closing the worker.
    */
-  async putResourceWithSnapshot(
+  putResourceWithSnapshot(
     subject: string,
     jsonAd: string,
     snapshot?: Uint8Array,
     outbox?: ClientDbOutboxWrite,
   ): Promise<void> {
-    await this.send({
-      type: 'putResourceWithSnapshot',
-      subject,
-      jsonAd,
-      snapshot,
-      outbox,
+    // Writes made in the same tick leave as one message: a chunk of pushed
+    // resources is applied in a loop, and one transaction per resource made a
+    // 1200-folder first sync keep the worker busy for minutes.
+    return new Promise<void>((resolve, reject) => {
+      this.pendingPuts.push({ jsonAd, snapshot, outbox, resolve, reject });
+
+      if (this.pendingPuts.length === 1) {
+        queueMicrotask(() => this.flushPendingPuts());
+      }
     });
+  }
+
+  private pendingPuts: {
+    jsonAd: string;
+    snapshot?: Uint8Array;
+    outbox?: ClientDbOutboxWrite;
+    resolve: () => void;
+    reject: (e: unknown) => void;
+  }[] = [];
+
+  /** Send the writes queued by {@link putResourceWithSnapshot}. Called before
+   *  any other message too, so the worker sees them in the order they were
+   *  made. */
+  private flushPendingPuts(): void {
+    const batch = this.pendingPuts;
+
+    if (batch.length === 0) return;
+
+    this.pendingPuts = [];
+
+    const message =
+      batch.length === 1
+        ? {
+            type: 'putResourceWithSnapshot',
+            jsonAd: batch[0].jsonAd,
+            snapshot: batch[0].snapshot,
+            outbox: batch[0].outbox,
+          }
+        : {
+            type: 'putResourcesWithSnapshots',
+            items: batch.map(({ jsonAd, snapshot, outbox }) => ({
+              jsonAd,
+              snapshot,
+              outbox,
+            })),
+          };
+
+    this.send(message, true).then(
+      () => batch.forEach(item => item.resolve()),
+      e => batch.forEach(item => item.reject(e)),
+    );
   }
 
   /** The outbox rows stored for `agent`: one JSON value per subject. */
@@ -1101,6 +1148,44 @@ export class ClientDbWorker {
     return versionVectorRecords(r);
   }
 
+  /** The subjects of one drive, without reading any snapshot. */
+  /** Merge and persist pulled resource states inside the worker, without
+   *  building them in this thread. */
+  async applyStateUpdates(
+    subjects: string[],
+    states: Uint8Array[],
+  ): Promise<number> {
+    return (await this.send({
+      type: 'applyStateUpdates',
+      subjects,
+      states,
+    })) as number;
+  }
+
+  /** Add search entries for up to `limit` resources stored without them.
+   *  Resolves to how many were done; 0 means nothing is left. */
+  async indexPendingSearch(limit: number): Promise<number> {
+    return (await this.send({ type: 'indexPendingSearch', limit })) as number;
+  }
+
+  async getDriveSubjects(drive: string): Promise<string[]> {
+    return (await this.send({ type: 'getDriveSubjects', drive })) as string[];
+  }
+
+  /** Version vectors of exactly these subjects. A big drive is read in slices
+   *  of these, so reads queued on the same database worker run between the
+   *  slices instead of behind one long scan. */
+  async getVersionVectorsForSubjects(
+    subjects: string[],
+  ): Promise<Record<string, Record<string, number>>> {
+    const r = await this.send({
+      type: 'getVersionVectorsForSubjects',
+      subjects,
+    });
+
+    return versionVectorRecords(r);
+  }
+
   /**
    * Seal this drive's history into one Cloud Vault object.
    *
@@ -1301,8 +1386,13 @@ export class ClientDbWorker {
 
   /* ---------------------------- Internal send ----------------------------- */
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async send(msg: Record<string, any>): Promise<unknown> {
+  private async send(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    msg: Record<string, any>,
+    isPutBatch = false,
+  ): Promise<unknown> {
+    if (!isPutBatch) this.flushPendingPuts();
+
     // Websocket fanout can call into the DB before init() has resolved
     // (leadership election + leader announce takes a few ticks). Wait for
     // init rather than rejecting — the caller already started init, we just
