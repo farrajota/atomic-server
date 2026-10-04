@@ -4,6 +4,9 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- The shared sign-in card no longer says "This browser does not support passkeys".
+  Where a passkey cannot work it shows no passkey option at all, and the
+  portal and the app now decide that the same way.
 - Apps can use Atomic's own UI through `store.ui`: a confirm dialog, a toast, a
   menu at the click, the resource menu, the share dialog and opening a
   resource. Atomic draws them, names the app that asked, and a menu is no
