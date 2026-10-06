@@ -109,6 +109,12 @@ pub fn check_read<'a>(
     Box::pin(check_rights(store, resource, for_agent, Right::Read))
 }
 
+/// How many resources referencing one blob [`check_blob_read`] examines
+/// before it refuses. Anyone who may read a blob can reference it from as
+/// many resources as they like; without a bound, every request for its bytes
+/// would pay one rights check per reference.
+pub const MAX_BLOB_REFERENCES_CHECKED: usize = 64;
+
 /// May `for_agent` read the blob whose BLAKE3 hash is `hash_hex`?
 ///
 /// A blob has no rights of its own; it borrows them from the resources that
@@ -144,21 +150,41 @@ pub async fn check_blob_read_excluding(
         (urls::BLOB, crate::Value::AtomicUrl(blob.as_str().into())),
         (urls::CHUNKS, crate::Value::AtomicUrl(blob.as_str().into())),
     ];
+    // One cache for every reference: they usually share a parent and drive,
+    // whose rights then resolve once instead of once per reference.
+    let cache = std::sync::Mutex::new(RightsCache::default());
+    let mut examined = 0usize;
     for (property, value) in references {
+        if examined >= MAX_BLOB_REFERENCES_CHECKED {
+            break;
+        }
         let mut query = crate::storelike::Query::new();
         query.property = Some(property.to_string());
         query.value = Some(value);
+        // One extra, in case the excluded resource is among them.
+        query.limit = Some(MAX_BLOB_REFERENCES_CHECKED - examined + 1);
         for referencing in store.query(&query).await?.resources {
             if excluded.as_deref() == Some(referencing.get_subject().pure_id().as_str()) {
                 continue;
             }
-            if let Ok(explanation) = check_read(store, &referencing, for_agent).await {
+            if examined >= MAX_BLOB_REFERENCES_CHECKED {
+                break;
+            }
+            examined += 1;
+            if let Ok(explanation) =
+                check_rights_cached(store, &referencing, for_agent, Right::Read, Some(&cache)).await
+            {
                 return Ok(explanation);
             }
         }
     }
+    let scope = if examined >= MAX_BLOB_REFERENCES_CHECKED {
+        format!("of the first {MAX_BLOB_REFERENCES_CHECKED} resources referencing")
+    } else {
+        "resource referencing".to_string()
+    };
     Err(crate::errors::AtomicError::unauthorized(format!(
-        "No resource referencing blob {hash_hex} is readable by {for_agent}"
+        "No {scope} blob {hash_hex} is readable by {for_agent}"
     )))
 }
 
@@ -1117,6 +1143,57 @@ mod test {
         assert!(
             !can_read(draft.clone()).await,
             "unpublishing by re-parenting out of the public folder must revoke public read"
+        );
+    }
+
+    /// Bytes referenced from many resources the caller may not read must not
+    /// cost a rights walk per reference: the walk of their shared ancestry is
+    /// resolved once, and at most `MAX_BLOB_REFERENCES_CHECKED` references
+    /// are examined before the request is refused.
+    #[tokio::test]
+    async fn blob_read_checks_cost_does_not_grow_with_the_number_of_references() {
+        let db = crate::Db::init_temp("blob_read_amplification")
+            .await
+            .unwrap();
+        let (_owner, drive) = db.setup("Owner").await.unwrap();
+        let hash = blake3::hash(b"popular bytes").to_hex().to_string();
+        for i in 0..(3 * super::MAX_BLOB_REFERENCES_CHECKED) {
+            db.create_resource(
+                crate::urls::FILE,
+                &drive,
+                &format!("copy-{i}"),
+                Some(vec![
+                    (crate::urls::INTERNAL_ID, Value::String(hash.clone())),
+                    (
+                        crate::urls::DOWNLOAD_URL,
+                        Value::String(format!("http://localhost/download/files/{hash}")),
+                    ),
+                ]),
+            )
+            .await
+            .unwrap();
+        }
+        let stranger = db.create_agent(Some("Stranger")).await.unwrap();
+
+        db.reset_fetch_counters();
+        let err = super::check_blob_read(
+            &db,
+            &hash,
+            &crate::agents::ForAgent::AgentSubject(stranger.subject),
+        )
+        .await
+        .expect_err("no reference is readable by the stranger");
+        let fetches = db.get_resource_call_count() + db.get_resource_shallow_call_count();
+        // Loading the examined references themselves, plus their shared
+        // ancestry once: bounded by the cap, not by the 3x as many references.
+        assert!(
+            fetches <= super::MAX_BLOB_REFERENCES_CHECKED + 5,
+            "{fetches} resource fetches for one refused blob read"
+        );
+        assert!(
+            err.message
+                .contains(&super::MAX_BLOB_REFERENCES_CHECKED.to_string()),
+            "the refusal says where it stopped: {err}"
         );
     }
 }
