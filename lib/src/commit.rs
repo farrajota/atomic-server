@@ -988,6 +988,21 @@ impl Commit {
             } else {
                 // This should use the _old_ resource, not the new one, as the new one might maliciously give itself write rights.
                 crate::hierarchy::check_write(store, &resource_old, &validate_for.into()).await?;
+
+                // Write on the resource covers taking it out of its old place,
+                // not dropping it into a new one. A move puts it in the new
+                // parent's tree and, through the `drive` stamp re-derived
+                // below, under that drive's grants, so the new parent must
+                // accept it exactly as it would a new child: `append` (or
+                // `write`) there.
+                if applied.changed_props.iter().any(|p| p == urls::PARENT) {
+                    crate::hierarchy::check_append(
+                        store,
+                        &applied.resource_new,
+                        &validate_for.into(),
+                    )
+                    .await?;
+                }
             }
 
             if commit.destroy.unwrap_or(false) && !is_new {
@@ -3864,6 +3879,108 @@ mod test {
             .apply_commit(by_owner, &rights_opts())
             .await
             .expect("the node's own agent may create a top-level drive");
+    }
+
+    /// A known agent that is not the store's default one.
+    async fn second_agent(store: &Store) -> Agent {
+        let agent = Agent::new(Some("mover")).unwrap();
+        store
+            .add_resource(&agent.to_resource().unwrap())
+            .await
+            .unwrap();
+        agent
+    }
+
+    /// A child of `parent`, created by `signer` with rights checks on.
+    async fn child_of(store: &Store, signer: &Agent, parent: &str) -> Resource {
+        let mut b = CommitBuilder::new("placeholder".into());
+        b.set(urls::PARENT.into(), Value::AtomicUrl(parent.into()));
+        b.set(urls::NAME.into(), Value::String("movable".into()));
+        let commit = Commit::create_did(b, signer, store).await.unwrap();
+        store
+            .apply_commit(commit, &rights_opts())
+            .await
+            .expect("a drive writer may create a child")
+            .resource_new
+            .unwrap()
+    }
+
+    /// A commit by `signer` that moves `resource` under `new_parent`.
+    async fn move_commit(
+        store: &Store,
+        signer: &Agent,
+        resource: &Resource,
+        new_parent: &str,
+    ) -> Commit {
+        let mut moved = resource.clone();
+        moved
+            .set_unsafe(urls::PARENT.into(), Value::AtomicUrl(new_parent.into()))
+            .unwrap();
+        moved
+            .get_commit_builder()
+            .clone()
+            .sign(signer, store, &moved)
+            .await
+            .unwrap()
+    }
+
+    fn canonical_prop(resource: &Resource, prop: &str) -> String {
+        crate::identifiers::canonicalize_scheme(&resource.get(prop).unwrap().to_string())
+    }
+
+    /// Moving a resource puts it in the new parent's tree and, through the
+    /// re-derived `drive` stamp, under that drive's grants. Write on the
+    /// resource itself only covers taking it out of its old place: dropping
+    /// it into a drive the signer has no rights on must be refused, exactly
+    /// as creating a new child there would be.
+    #[tokio::test]
+    async fn moving_a_resource_requires_append_on_the_new_parent() {
+        let (store, victim) = store_with_known_agent().await;
+        let victim_drive = owned_drive(&store, &victim).await;
+        let mover = second_agent(&store).await;
+        let own_drive = owned_drive(&store, &mover).await;
+        let doc = child_of(&store, &mover, &own_drive).await;
+
+        let err = store
+            .apply_commit(
+                move_commit(&store, &mover, &doc, &victim_drive).await,
+                &rights_opts(),
+            )
+            .await
+            .expect_err("moving into a drive the signer cannot append to must be refused");
+
+        let stored = store.get_resource(doc.get_subject()).await.unwrap();
+        assert_eq!(
+            canonical_prop(&stored, urls::PARENT),
+            crate::identifiers::canonicalize_scheme(&own_drive),
+            "refused move must not have been applied: {err}"
+        );
+        assert_eq!(
+            canonical_prop(&stored, urls::DRIVE_PROP),
+            crate::identifiers::canonicalize_scheme(&own_drive),
+            "refused move must not have re-stamped the drive"
+        );
+    }
+
+    /// The allowed side of the same rule: a signer who may append to the new
+    /// parent moves the resource, and its `drive` stamp follows the move.
+    #[tokio::test]
+    async fn moving_a_resource_to_a_parent_the_signer_may_append_to_rederives_its_drive() {
+        let (store, _owner) = store_with_known_agent().await;
+        let mover = second_agent(&store).await;
+        let from = owned_drive(&store, &mover).await;
+        let to = owned_drive(&store, &mover).await;
+        let doc = child_of(&store, &mover, &from).await;
+
+        store
+            .apply_commit(move_commit(&store, &mover, &doc, &to).await, &rights_opts())
+            .await
+            .expect("a writer of both drives may move a resource between them");
+
+        let stored = store.get_resource(doc.get_subject()).await.unwrap();
+        let to = crate::identifiers::canonicalize_scheme(&to);
+        assert_eq!(canonical_prop(&stored, urls::PARENT), to);
+        assert_eq!(canonical_prop(&stored, urls::DRIVE_PROP), to);
     }
 
     /// The genesis cert binds the resource's original `parent` and `drive`.
