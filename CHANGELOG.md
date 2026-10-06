@@ -7,6 +7,7 @@ See [STATUS.md](server/STATUS.md) to learn more about which features will remain
 
 ## UNRELEASED
 
+- `--served-domain-suffix` / `ATOMIC_SERVED_DOMAIN_SUFFIX` takes a comma-separated list (`atomicserver.eu,atomic.place`), so a node can answer under two domains while it moves from one to the other.
 - Forms (beta): guests can fill in a form without an account, and each answer
   becomes a row in a Table. New default ontology `forms`
   (`lib/defaults/forms.json`: `Form`, `FormPage`, `FormField`, `FormHeading`,
@@ -38,6 +39,13 @@ See [STATUS.md](server/STATUS.md) to learn more about which features will remain
   recipient could hold. Read rights are checked per subscriber against the
   resource when it is sent, and a connection already reached through the
   resource or its drive doesn't get it twice.
+- End-to-end encrypted conversations. `atomic_lib::conversation` derives an
+  agent's X25519 `encryptionKey`, keeps a conversation's keys in a keyring
+  wrapped to each member, and seals and opens messages; the WASM build exports
+  it. New default ontology `conversations` (`lib/defaults/conversations.json`)
+  with the `Conversation` and `SealedMessage` classes. New endpoint
+  `/conversations` lists the conversations on the server the requesting agent
+  is a member of. See `planning/encrypted-conversations.md`.
 
 - New default ontology `notifications` (`lib/defaults/notifications.json`):
   the `Inbox` and `Notification` classes, and an `inbox` property the private

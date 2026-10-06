@@ -6,6 +6,7 @@ pub mod blob_backend;
 mod canonical_scheme;
 #[cfg(all(feature = "db", not(target_arch = "wasm32")))]
 pub mod compaction;
+mod compressed_kv;
 mod encoding;
 pub mod encrypted_backend;
 pub mod kv_store;
@@ -208,6 +209,19 @@ pub struct DriveUsage {
     pub resource_count: u64,
     pub blob_bytes: u64,
     pub loro_bytes: u64,
+}
+
+/// One resource's share of a drive's storage, for the "where does space go"
+/// view. `blob_bytes` is attributed to the first resource that references a
+/// blob, so shared bytes are counted once, as in [`DriveUsage`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResourceUsage {
+    pub subject: String,
+    pub name: Option<String>,
+    pub parent: Option<String>,
+    pub is_a: Option<String>,
+    pub loro_bytes: u64,
+    pub blob_bytes: u64,
 }
 
 /// Result of loading an agent from a secret.
@@ -504,7 +518,7 @@ impl Db {
         Db {
             path,
             blob_backend: None,
-            kv,
+            kv: Arc::new(compressed_kv::CompressedKv::new(kv)),
             default_agent: Arc::new(Mutex::new(None)),
             node_key: Arc::new(std::sync::OnceLock::new()),
             endpoints: vec![],
@@ -1432,20 +1446,32 @@ impl Db {
         let agent = self.get_default_agent()?;
         let agent_resource = self.get_resource(&agent.subject).await?;
 
-        let subjects = match agent_resource.get(urls::DRIVES) {
+        // Keep legacy Agent.drives entries, then include the private home where
+        // create_drive records new drives. Read both during the migration.
+        let mut subjects = match agent_resource.get(urls::DRIVES) {
             Ok(Value::ResourceArray(arr)) => arr.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             _ => vec![],
         };
-
-        // Fallback: active drive not in agent resource
-        let subjects = if subjects.is_empty() {
-            match self.get_active_drive() {
-                Some(active) => vec![active],
-                None => vec![],
+        if let Ok(personal) = self.private_drive_subject() {
+            if let Ok(home) = self.get_resource(&personal.as_str().into()).await {
+                if !subjects.contains(&personal) {
+                    subjects.push(personal);
+                }
+                if let Ok(Value::ResourceArray(listed)) = home.get(urls::DRIVES) {
+                    for subject in listed {
+                        let subject = subject.to_string();
+                        if !subjects.contains(&subject) {
+                            subjects.push(subject);
+                        }
+                    }
+                }
             }
-        } else {
-            subjects
-        };
+        }
+        if let Some(active) = self.get_active_drive() {
+            if !subjects.contains(&active) {
+                subjects.push(active);
+            }
+        }
 
         let mut drives = Vec::with_capacity(subjects.len());
         for subject in subjects {
@@ -1626,6 +1652,64 @@ impl Db {
         }
 
         Ok(usage.into_values().collect())
+    }
+
+    /// Per-resource storage of one drive: Loro snapshot bytes (history) and the
+    /// blob bytes of attached files. Same accounting as [`Db::per_drive_usage`],
+    /// kept per resource so a client can draw a size map of the drive.
+    pub async fn drive_usage_breakdown(
+        &self,
+        drive_subject: &str,
+    ) -> AtomicResult<Vec<ResourceUsage>> {
+        use std::collections::HashSet;
+
+        let ds: crate::Subject = drive_subject.into();
+        let mut subjects: Vec<String> = crate::sync::engine::collect_drive_subjects(self, &ds)
+            .await
+            .into_iter()
+            .collect();
+        subjects.sort();
+
+        let mut seen_blobs: HashSet<[u8; 32]> = HashSet::new();
+        let mut rows = Vec::new();
+
+        for subject in subjects {
+            let Ok(propvals) = self.get_propvals(&subject) else {
+                continue;
+            };
+            let loro_bytes = self
+                .get_loro_snapshot_bytes(&subject)
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
+
+            let mut blob_bytes = 0;
+            if let Some(blob_val) = propvals.get(urls::BLOB) {
+                let blob_subject = crate::Subject::from_raw(&blob_val.to_string(), None);
+                if let Some(hash_bytes) = blob_subject
+                    .blob_hash_hex()
+                    .and_then(|h| hex::decode(h).ok())
+                    .filter(|b| b.len() == 32)
+                {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&hash_bytes);
+                    if seen_blobs.insert(hash) {
+                        blob_bytes = self.blob_size(&hash).await?.unwrap_or(0);
+                    }
+                }
+            }
+
+            let text = |prop: &str| propvals.get(prop).map(|v| v.to_string());
+            rows.push(ResourceUsage {
+                name: text(urls::NAME).or_else(|| text(urls::FILENAME)),
+                parent: text(urls::PARENT),
+                is_a: text(urls::IS_A).and_then(|c| c.split(',').next().map(str::to_string)),
+                subject,
+                loro_bytes,
+                blob_bytes,
+            });
+        }
+
+        Ok(rows)
     }
 
     /// Get children of a resource, optionally filtered by class.
@@ -2466,7 +2550,7 @@ impl Db {
 
     /// Finds resource by Subject, return PropVals HashMap
     #[instrument(skip_all)]
-    fn get_propvals(&self, subject: &str) -> AtomicResult<PropVals> {
+    pub(crate) fn get_propvals(&self, subject: &str) -> AtomicResult<PropVals> {
         match self.kv.get(Tree::Resources, subject.as_bytes())? {
             Some(binpropval) => {
                 let propval: PropVals = decode_propvals(&binpropval)?;
@@ -4422,12 +4506,19 @@ impl Storelike for Db {
         // and rights/parent/destroy; drop ordinary content certificates.
         if commit_response.auth_impact().is_critical() {
             store.add_resource_tx(&commit_response.commit_resource, &mut transaction)?;
-            for atom in commit_response.commit_resource.to_atoms() {
-                store.add_atom_to_index(
-                    &atom,
-                    &commit_response.commit_resource,
-                    &mut transaction,
-                )?;
+            // A creation's commit is found by its id (it names the resource),
+            // so its atoms stay out of the indexes: five rows and about
+            // 0.5 KB for every new resource that no query asks for. Later
+            // critical commits (rights, parent, destroy) stay queryable by
+            // the subject they are about.
+            if !commit_response.creates_resource() {
+                for atom in commit_response.commit_resource.to_atoms() {
+                    store.add_atom_to_index(
+                        &atom,
+                        &commit_response.commit_resource,
+                        &mut transaction,
+                    )?;
+                }
             }
         }
 
@@ -5602,5 +5693,12 @@ mod private_drive_tests {
             listed.iter().any(|s| s == &extra),
             "private drive should list {extra}, got {listed:?}"
         );
+        store.set_active_drive(&personal).unwrap();
+        let drives = store.list_drives().await.unwrap();
+        assert_eq!(drives.len(), 2);
+        assert!(drives.iter().any(|d| d.subject == personal));
+        assert!(drives
+            .iter()
+            .any(|d| d.subject == extra && d.name == "Project"));
     }
 }

@@ -361,6 +361,61 @@ describe('resource.ts', () => {
     expect(newListId).toBe(originalListId);
   });
 
+  it('replaceListItems only rewrites the changed part of a list', async ({
+    expect,
+  }) => {
+    const prop = 'https://atomicdata.dev/ontology/canvas/strokeData';
+    const strokes = Array.from({ length: 50 }, (_, i) => ({
+      color: i,
+      width: 2,
+      path: [[i, i]],
+    }));
+    const resource = new Resource('https://example.com/patch-list');
+    const doc = resource.getLoroDoc()!;
+
+    for (const s of strokes) resource.pushListItem(prop, s);
+
+    doc.commit();
+    const before = doc.opCount();
+
+    // Undo the last stroke: one deletion, no rewrite of the other 49.
+    resource.replaceListItems(prop, strokes.slice(0, -1));
+    expect(doc.opCount() - before).toBeLessThan(5);
+    expect(resource.get(prop)).toEqual(strokes.slice(0, -1));
+
+    // Erase one in the middle, then redo it.
+    const without = strokes.filter((_, i) => i !== 20);
+    resource.replaceListItems(prop, without);
+    expect(resource.get(prop)).toEqual(without);
+
+    resource.replaceListItems(prop, strokes);
+    expect(resource.get(prop)).toEqual(strokes);
+  });
+
+  it('replaceListItems keeps unchanged strokes between two separate edits', async ({
+    expect,
+  }) => {
+    const prop = 'https://atomicdata.dev/ontology/canvas/strokeData';
+    const strokes = Array.from({ length: 40 }, (_, i) => ({
+      color: i,
+      width: 2,
+      path: [[i, i]],
+    }));
+    const resource = new Resource('https://example.com/lcs-list');
+    const doc = resource.getLoroDoc()!;
+
+    for (const s of strokes) resource.pushListItem(prop, s);
+
+    doc.commit();
+    const before = doc.opCount();
+    // Removes strokes 5 and 30: two separate hunks.
+    const target = strokes.filter((_, i) => i !== 5 && i !== 30);
+
+    resource.replaceListItems(prop, target);
+    expect(resource.get(prop)).toEqual(target);
+    expect(doc.opCount() - before).toBeLessThan(5);
+  });
+
   /**
    * Opening a filled table (and the sidebar tree) flashed as if row/column
    * order changed. OPFS cold-load hydrates JSON-AD first — which seeds a
