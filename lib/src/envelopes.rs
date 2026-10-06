@@ -140,8 +140,12 @@ pub fn record_ops(
 
     // The ops this envelope introduced, recorded beside it whatever the
     // retention. The genesis envelope's spans are kept even when the
-    // envelope itself is not (it is rebuilt from its commit row).
-    if let Some(spans) = &response.change_spans {
+    // envelope itself is not (it is rebuilt from its commit row). Only the
+    // first apply is recorded: a replay of the same envelope adds no ops,
+    // and anyone who saw a signed commit can resend it, so it must not
+    // overwrite what the first apply introduced.
+    let already_recorded = store.kv.contains_key(Tree::EnvelopeSpans, &new_key)?;
+    if let (Some(spans), false) = (&response.change_spans, already_recorded) {
         transaction.push(Operation {
             tree: Tree::EnvelopeSpans,
             method: Method::Insert,
@@ -765,7 +769,7 @@ mod tests {
         peer: u64,
         description: &str,
         message: Option<&str>,
-    ) {
+    ) -> crate::commit::Commit {
         let doc = crate::loro::AtomicLoroDoc::from_snapshot(base).unwrap();
         doc.set_peer_id(peer).unwrap();
         let base_vv = doc.oplog_vv();
@@ -780,9 +784,10 @@ mod tests {
         let mut builder = crate::commit::CommitBuilder::new(subject.clone());
         builder.set_loro_update(delta);
         let commit = builder.sign(signer, db, &resource).await.unwrap();
-        db.apply_commit(commit, &signed_opts(signer))
+        db.apply_commit(commit.clone(), &signed_opts(signer))
             .await
             .expect("a writer's commit applies");
+        commit
     }
 
     /// The changes Loro peer `peer` made, as the report attributes them.
@@ -1177,6 +1182,30 @@ mod tests {
             "the edits are concurrent"
         );
         assert_eq!(alices[0].signer.as_deref(), Some(alice.subject.as_str()));
+        assert_eq!(bobs[0].signer.as_deref(), Some(bob.subject.as_str()));
+        assert_fully_attributed(&report);
+    }
+
+    /// Re-applying an envelope this node already applied adds no ops, and
+    /// must not erase what was recorded the first time: anyone can resend a
+    /// signed commit they saw, and that must not unattribute its changes.
+    #[tokio::test]
+    async fn replaying_an_envelope_keeps_its_attribution() {
+        let db = Db::init_temp("envelopes_replay").await.unwrap();
+        db.set_envelope_retention(EnvelopeRetention::All);
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let bob = db.create_agent(Some("Bob")).await.unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
+
+        let base = snapshot(&db, &subject).await;
+        let commit = client_commit(&db, &subject, &bob, &base, 2002, "accepted", None).await;
+        db.apply_commit(commit, &signed_opts(&bob))
+            .await
+            .expect("an idempotent replay is accepted");
+
+        let report = attribute_history(&db, subject.as_str()).await.unwrap();
+        let bobs = changes_of_peer(&report, 2002);
+        assert_eq!(bobs.len(), 1, "{report:#?}");
         assert_eq!(bobs[0].signer.as_deref(), Some(bob.subject.as_str()));
         assert_fully_attributed(&report);
     }
