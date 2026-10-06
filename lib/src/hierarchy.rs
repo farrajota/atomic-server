@@ -109,6 +109,43 @@ pub fn check_read<'a>(
     Box::pin(check_rights(store, resource, for_agent, Right::Read))
 }
 
+/// May `for_agent` read the blob whose BLAKE3 hash is `hash_hex`?
+///
+/// A blob has no rights of its own; it borrows them from the resources that
+/// reference it: a File whose `internalId` is the hash, or any resource naming
+/// `atomic:blob:<hash>` as its `blob` or among its `chunks`. Read access to any
+/// one of them is enough, since the same bytes uploaded to two drives are
+/// stored once. Throws if none is readable (or none exists).
+pub async fn check_blob_read(
+    store: &impl Storelike,
+    hash_hex: &str,
+    for_agent: &ForAgent,
+) -> AtomicResult<String> {
+    if for_agent == &ForAgent::Sudo {
+        return Ok("Sudo may read any blob".into());
+    }
+    let hash_hex = hash_hex.to_ascii_lowercase();
+    let blob = crate::identifiers::blob_subject(&hash_hex);
+    let references = [
+        (urls::INTERNAL_ID, crate::Value::String(hash_hex.clone())),
+        (urls::BLOB, crate::Value::AtomicUrl(blob.as_str().into())),
+        (urls::CHUNKS, crate::Value::AtomicUrl(blob.as_str().into())),
+    ];
+    for (property, value) in references {
+        let mut query = crate::storelike::Query::new();
+        query.property = Some(property.to_string());
+        query.value = Some(value);
+        for referencing in store.query(&query).await?.resources {
+            if let Ok(explanation) = check_read(store, &referencing, for_agent).await {
+                return Ok(explanation);
+            }
+        }
+    }
+    Err(crate::errors::AtomicError::unauthorized(format!(
+        "No resource referencing blob {hash_hex} is readable by {for_agent}"
+    )))
+}
+
 /// Memo of rights outcomes for one agent, scoped to a single request/query.
 ///
 /// A collection query permission-checks every member, and every one of those

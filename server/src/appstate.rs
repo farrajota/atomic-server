@@ -225,6 +225,8 @@ impl AppState {
             }
         }
 
+        store.set_require_blob_read_auth(config.opts.require_blob_auth);
+
         let index_status_broadcast = Arc::new(IndexStatusBroadcast::new());
         let index_notifier: crate::vector_search::IndexNotifier = {
             let b = index_status_broadcast.clone();

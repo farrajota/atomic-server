@@ -575,6 +575,11 @@ Options:
 
           [env: ATOMIC_DISABLE_P2P=]
 
+      --require-blob-auth
+          Serve a file's bytes only to agents who may read the file. By default a content-addressed blob URL (`/download/files/<hash>`, `/download/atomic:blob:<hash>`) and a WebSocket or Iroh `BLOB_REQUEST` answer anyone who knows the hash: the hash is a bearer capability. With this flag they answer only an agent with read access to a resource that references the blob (a File whose `internalId` is the hash, or a resource listing it as `blob` or in `chunks`). The data browser keeps working: it loads images with the session cookie, and fetches bytes over its signed-in WebSocket. Bytes a node holds without any referencing resource are no longer served
+
+          [env: ATOMIC_REQUIRE_BLOB_AUTH=]
+
       --gpu-indexing
           Use the GPU (if available) for processing vector search embeddings
 

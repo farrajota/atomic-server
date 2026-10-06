@@ -555,13 +555,28 @@ pub async fn handle_frame_full_for_caps(
 
         protocol::tag::BLOB_REQUEST => {
             if let Some(hash) = protocol::decode_blob_request(payload) {
-                match store.get_blob(&hash).await {
-                    Ok(Some(bytes)) => vec![protocol::encode_blob_response(&hash, &bytes)],
-                    _ => vec![protocol::encode_error(
+                // Same rule as `/download/files/<hash>`: when hashes are not
+                // bearer capabilities, the bytes go only to an agent who may
+                // read a resource that references them.
+                if store.requires_blob_read_auth()
+                    && crate::hierarchy::check_blob_read(store, &hex::encode(hash), agent)
+                        .await
+                        .is_err()
+                {
+                    vec![protocol::encode_error(
                         0,
-                        protocol::error_code::UNKNOWN,
-                        "Blob not found",
-                    )],
+                        protocol::error_code::UNAUTHORIZED_READ,
+                        "Blob not readable by this agent",
+                    )]
+                } else {
+                    match store.get_blob(&hash).await {
+                        Ok(Some(bytes)) => vec![protocol::encode_blob_response(&hash, &bytes)],
+                        _ => vec![protocol::encode_error(
+                            0,
+                            protocol::error_code::UNKNOWN,
+                            "Blob not found",
+                        )],
+                    }
                 }
             } else {
                 vec![protocol::encode_error(
@@ -2163,6 +2178,69 @@ mod bootstrap_and_sub_tests {
     fn empty_push(drive: &str) -> protocol::DecodedSyncPush {
         let frame = protocol::encode_sync_push(drive, &[], true);
         protocol::decode_sync_push(&frame[1..]).unwrap()
+    }
+
+    /// With `require_blob_read_auth` on, a `BLOB_REQUEST` is answered like
+    /// `/download/files/<hash>`: only for an agent who may read a resource
+    /// that references the blob. Off (the default), the hash is the capability.
+    #[tokio::test]
+    async fn blob_request_requires_read_on_a_referencing_resource_when_enabled() {
+        let db = Db::init_temp("blob_request_read_auth").await.unwrap();
+        let (owner, drive) = db.setup("Owner").await.unwrap();
+        let bytes = b"bytes of a private file";
+        let hash = blake3::hash(bytes);
+        db.put_blob(hash.as_bytes(), bytes).await.unwrap();
+        db.create_resource(
+            crate::urls::FILE,
+            &drive,
+            "private.txt",
+            Some(vec![
+                (
+                    crate::urls::INTERNAL_ID,
+                    crate::Value::String(hash.to_hex().to_string()),
+                ),
+                (
+                    crate::urls::DOWNLOAD_URL,
+                    crate::Value::String(format!(
+                        "http://localhost/download/files/{}",
+                        hash.to_hex()
+                    )),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        let request = protocol::encode_blob_request(hash.as_bytes());
+        let served = vec![protocol::encode_blob_response(hash.as_bytes(), bytes)];
+
+        assert_eq!(
+            handle_frame(&request, &db, &mut ForAgent::Public).await,
+            served,
+            "by default the hash alone is enough"
+        );
+
+        db.set_require_blob_read_auth(true);
+        let stranger = db.create_agent(Some("Stranger")).await.unwrap();
+        for mut caller in [ForAgent::Public, ForAgent::AgentSubject(stranger.subject)] {
+            let refused = handle_frame(&request, &db, &mut caller).await;
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0][0], tag::ERROR);
+            assert_eq!(
+                protocol::decode_error(&refused[0][1..]).unwrap().code,
+                error_code::UNAUTHORIZED_READ,
+                "{caller} may read no resource referencing the blob"
+            );
+        }
+        assert_eq!(
+            handle_frame(
+                &request,
+                &db,
+                &mut ForAgent::AgentSubject(owner.subject.clone())
+            )
+            .await,
+            served,
+            "the File's reader still gets the bytes"
+        );
     }
 
     /// A pushed envelope is kept only when it is verified and names a subject

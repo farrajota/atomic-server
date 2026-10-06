@@ -1097,6 +1097,180 @@ async fn upload_download_with_backend(
     assert_eq!(downloaded_bytes, test_content.as_slice());
 }
 
+/// Server state in fresh temp dirs, started with `extra` CLI flags.
+async fn fresh_appstate(extra: &[&str]) -> AppState {
+    use clap::Parser;
+    let unique = atomic_lib::utils::random_string(10);
+    let data_dir = format!("./.temp/{unique}/db");
+    let config_dir = format!("./.temp/{unique}/config");
+    let mut args = vec![
+        "atomic-server",
+        "--initialize",
+        "--data-dir",
+        &data_dir,
+        "--config-dir",
+        &config_dir,
+    ];
+    args.extend_from_slice(extra);
+    let mut config = config::build_config(Opts::parse_from(args)).expect("failed init config");
+    config.search_index_path = format!("./.temp/{unique}/search_index").into();
+    config.vector_search_index_path = format!("./.temp/{unique}/vector_search_index").into();
+    AppState::init(config).await.expect("failed init appstate")
+}
+
+/// The `atomic_session` cookie the data browser installs for `agent`
+/// (`setCookieAuthentication`): a proof signed for the server's origin. A
+/// browser attaches it to every same-origin `<img src>` it loads.
+fn session_cookie(agent: &atomic_lib::agents::Agent, origin: &str) -> String {
+    let timestamp = atomic_lib::utils::now();
+    let signature = atomic_lib::agents::sign_message(
+        format!("{origin} {timestamp}").as_bytes(),
+        agent.private_key.as_ref().unwrap(),
+    )
+    .unwrap();
+    let proof = serde_json::json!({
+        "https://atomicdata.dev/properties/auth/agent": agent.subject.to_string(),
+        "https://atomicdata.dev/properties/auth/requestedSubject": origin,
+        "https://atomicdata.dev/properties/auth/publicKey": agent.public_key,
+        "https://atomicdata.dev/properties/auth/timestamp": timestamp,
+        "https://atomicdata.dev/properties/auth/signature": signature,
+    });
+    format!(
+        "atomic_session={}",
+        base64::engine::general_purpose::STANDARD.encode(proof.to_string())
+    )
+}
+
+/// With `--require-blob-auth`, content-addressed blob URLs
+/// (`/download/files/<hash>`, `/download/<blob DID>`) stop being bearer
+/// capabilities: the bytes belong to the resources that reference the hash,
+/// and are served to an agent who may read one of those, however the hash
+/// became known. The data browser keeps working: its `<img src>` requests
+/// carry the same-origin session cookie.
+#[actix_rt::test]
+async fn content_addressed_download_requires_read_on_a_referencing_resource() {
+    let appstate = fresh_appstate(&["--require-blob-auth"]).await;
+    let store = appstate.store.clone();
+    let owner = store.get_default_agent().unwrap();
+    let origin = appstate.config.get_origin();
+
+    let bytes = b"private bytes behind a guessable url";
+    let hash = blake3::hash(bytes);
+    let hash_hex = hash.to_hex().to_string();
+    store.put_blob(hash.as_bytes(), bytes).await.unwrap();
+
+    // A File only its owner may read.
+    let mut file = atomic_lib::Resource::new(format!(
+        "{origin}/files/private-{}",
+        atomic_lib::utils::random_string(8)
+    ));
+    file.set_unsafe(urls::IS_A.into(), vec![urls::FILE.to_string()].into())
+        .unwrap();
+    file.set_unsafe(urls::INTERNAL_ID.into(), hash_hex.clone().into())
+        .unwrap();
+    file.set_unsafe(urls::MIMETYPE.into(), "text/plain".to_string().into())
+        .unwrap();
+    let download_url = format!("{origin}/download/files/{hash_hex}");
+    file.set_unsafe(urls::DOWNLOAD_URL.into(), download_url.clone().into())
+        .unwrap();
+    file.set_unsafe(urls::READ.into(), vec![owner.subject.to_string()].into())
+        .unwrap();
+    store.add_resource(&file).await.unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let host = url::Url::parse(&origin).unwrap();
+    let host = match host.port() {
+        Some(port) => format!("{}:{port}", host.host_str().unwrap()),
+        None => host.host_str().unwrap().to_string(),
+    };
+
+    let paths = [
+        format!("/download/files/{hash_hex}"),
+        format!("/download/did:ad:blob:{hash_hex}"),
+        format!("/download/atomic:blob:{hash_hex}"),
+    ];
+    for path in &paths {
+        let anonymous = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri(path)
+                .insert_header(("Host", host.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            anonymous.status(),
+            401,
+            "{path}: a caller who may read no File with this hash gets no bytes"
+        );
+
+        // Signed headers: how an agent client asks.
+        let signed = test::call_service(
+            &app,
+            build_request_authenticated(path, &appstate).to_request(),
+        )
+        .await;
+        assert_eq!(
+            signed.status(),
+            200,
+            "{path}: the File's reader gets the bytes"
+        );
+        assert_eq!(test::read_body(signed).await.as_ref(), bytes);
+
+        // The session cookie: how the data browser's `<img src>` asks.
+        let with_cookie = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri(path)
+                .insert_header(("Host", host.as_str()))
+                .insert_header(("Cookie", session_cookie(&owner, &origin)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            with_cookie.status(),
+            200,
+            "{path}: a browser carrying the reader's session cookie gets the bytes"
+        );
+    }
+
+    // Once a File with these bytes is public, so are the bytes.
+    let mut public_copy = atomic_lib::Resource::new(format!(
+        "{origin}/files/public-{}",
+        atomic_lib::utils::random_string(8)
+    ));
+    public_copy
+        .set_unsafe(urls::IS_A.into(), vec![urls::FILE.to_string()].into())
+        .unwrap();
+    public_copy
+        .set_unsafe(urls::INTERNAL_ID.into(), hash_hex.clone().into())
+        .unwrap();
+    public_copy
+        .set_unsafe(urls::DOWNLOAD_URL.into(), download_url.into())
+        .unwrap();
+    public_copy
+        .set_unsafe(
+            urls::READ.into(),
+            vec![urls::PUBLIC_AGENT.to_string()].into(),
+        )
+        .unwrap();
+    store.add_resource(&public_copy).await.unwrap();
+    let anonymous = test::call_service(
+        &app,
+        TestRequest::get()
+            .uri(&paths[0])
+            .insert_header(("Host", host.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(anonymous.status(), 200);
+}
+
 /// `GET /drive-usage` reports a drive's resource count + blob/Loro bytes for the
 /// sync page. The frontend has shipped this UI for a while, but the endpoint was
 /// never implemented server-side (it 404'd), so the usage bar silently never

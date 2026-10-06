@@ -87,6 +87,12 @@ Three properties follow from this and should not be tangled up later:
 2. **The File resource is where read permission is enforced.** Any client that can read the File resource can read its bytes.
 3. **Blob identifiers are bearer tokens.** Treat a leaked `atomic:blob:` the same as a leaked file — equivalent to leaking an S3 presigned URL.
 
+### Opting out: `--require-blob-auth`
+
+Some deployments cannot treat a hash as a secret: download URLs end up in logs, shared links and `Referer` headers, and an agent that may no longer read a File can keep the URL it once saw. Starting the server with `--require-blob-auth` (`ATOMIC_REQUIRE_BLOB_AUTH=true`) makes the File the boundary for the bytes too: `/download/files/{blake3}`, `/download/atomic:blob:{blake3}` and a WebSocket or Iroh `BLOB_REQUEST` are answered only for an agent who may read a resource that references the blob (a File whose `internalId` is the hash, or a resource that lists `atomic:blob:{blake3}` as its `blob` or among its `chunks`). Anyone else gets `401` (HTTP) or an `UNAUTHORIZED_READ` error frame.
+
+The data browser keeps working with the flag on: it fetches bytes over its signed-in WebSocket, and an `<img>` or `<video>` that loads a download URL sends the same-origin session cookie. What stops being served is a blob this node holds without any referencing resource, and bytes behind a URL used from another origin without credentials.
+
 ### A note on existence side-channels
 
 A consequence of content-addressed storage is that an attacker who already knows the BLAKE3 hash of some specific byte-string (for example, by hashing a publicly-leaked document) can ask a server "do you have this blob?" and learn the answer from the response. This is intrinsic to any CAS system and is generally accepted; mitigations like rate-limiting unauthenticated blob fetches are orthogonal to the capability model and can be applied at the deployment layer if needed.

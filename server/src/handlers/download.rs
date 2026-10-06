@@ -51,6 +51,7 @@ pub async fn handle_download(
     // browsers refuse to render an uploaded SVG inline).
     if let Some(hash_hex) = subject_path.strip_prefix("/files/") {
         if hash_hex.len() == 64 && hex::decode(hash_hex).is_ok() {
+            authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
             let (bytes, mimetype) = match blob_by_hash_hex(hash_hex, &appstate).await? {
                 Some(bytes) => (
                     Some(bytes),
@@ -80,6 +81,7 @@ pub async fn handle_download(
     // Support did:ad:blob: subjects directly in /download
     if subject.is_blob_did() {
         if let Some(hash_hex) = subject.blob_hash_hex() {
+            authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
             if let Some(bytes) = blob_by_hash_hex(hash_hex, &appstate).await? {
                 let mimetype = mimetype_by_internal_id(hash_hex, &appstate).await;
 
@@ -99,6 +101,33 @@ pub async fn handle_download(
         .to_single();
 
     download_file_handler_partial(&resource, &req, &params, &appstate).await
+}
+
+/// With `--require-blob-auth`, a content-addressed request is answered only
+/// for an agent who may read a resource referencing the blob. The agent comes
+/// from signed headers (over the URL as requested) or, for the `<img>` and
+/// `<video>` tags the data browser points at these URLs, the same-origin
+/// session cookie. Without the flag the hash is the capability, as documented
+/// in `docs/src/files.md`.
+async fn authorize_blob_read(
+    hash_hex: &str,
+    req: &HttpRequest,
+    origin: &str,
+    appstate: &AppState,
+) -> AtomicServerResult<()> {
+    if !appstate.store.requires_blob_read_auth() {
+        return Ok(());
+    }
+    let requested = format!(
+        "{origin}{}",
+        req.uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or_else(|| req.path())
+    );
+    let for_agent = get_client_agent(req.headers(), appstate, &requested).await?;
+    atomic_lib::hierarchy::check_blob_read(&appstate.store, hash_hex, &for_agent).await?;
+    Ok(())
 }
 
 /// Serves user-uploaded blob bytes as a forced download rather than rendering

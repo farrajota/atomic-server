@@ -40,7 +40,7 @@ mod val_prop_sub_index;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     vec,
@@ -482,6 +482,10 @@ pub struct Db {
     /// blob forever, so `note_pending_blob_request` also lazily prunes
     /// anything older than `PENDING_BLOB_REQUEST_TTL`.
     pending_blob_requests: Arc<RwLock<PendingBlobRequests>>,
+    /// Whether serving blob bytes requires read access to a resource that
+    /// references them (see [`crate::hierarchy::check_blob_read`]). Off by
+    /// default: a blob hash is a bearer capability (`docs/src/files.md`).
+    require_blob_read_auth: Arc<AtomicBool>,
     /// How often the full-decode vs propvals-only fetch paths ran. Shared
     /// across clones; used by tests to pin query-path cost to call counts
     /// rather than wall clock (snapshots in a fresh store are too small
@@ -534,6 +538,7 @@ impl Db {
             sync_policy: default_sync_policy(),
             envelope_retention: Arc::new(RwLock::new(Default::default())),
             pending_blob_requests: Arc::new(RwLock::new(HashMap::new())),
+            require_blob_read_auth: Arc::new(AtomicBool::new(false)),
             fetch_counters: default_fetch_counters(),
         }
     }
@@ -811,6 +816,18 @@ impl Db {
             .read()
             .map(|g| *g)
             .unwrap_or_default()
+    }
+
+    /// Stop treating blob hashes as bearer capabilities: serve a blob's bytes
+    /// (over HTTP, WebSocket or Iroh) only to an agent who may read a resource
+    /// that references it. Shared by every clone of this `Db`.
+    pub fn set_require_blob_read_auth(&self, required: bool) {
+        self.require_blob_read_auth
+            .store(required, Ordering::Relaxed);
+    }
+
+    pub fn requires_blob_read_auth(&self) -> bool {
+        self.require_blob_read_auth.load(Ordering::Relaxed)
     }
 
     pub fn sync_policy(&self) -> Arc<dyn crate::sync::policy::SyncPolicy> {
