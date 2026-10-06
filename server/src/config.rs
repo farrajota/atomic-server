@@ -169,6 +169,10 @@ pub struct Opts {
     #[clap(long, env = "ATOMIC_CLEAR_REMOTE_CACHE")]
     pub clear_remote_cache: bool,
 
+    /// Do not start the peer-to-peer (Iroh) transport. By default the server binds an Iroh endpoint, connects to the n0 relay servers and announces its node ID for every Drive it hosts on the public pkarr relay (`dns.iroh.link`), keyed by the Drive's DID. With this flag none of that happens: no endpoint, no relay connection, no announcement. Device pairing and peer sync (`/iroh-sync`) are then unavailable; HTTP and WebSocket sync are unaffected.
+    #[clap(long, env = "ATOMIC_DISABLE_P2P")]
+    pub disable_p2p: bool,
+
     /// The base domain for multi-tenant hosting.
     /// If set, the server will allow serving subdomains of this domain (e.g. *.atomicserver.eu).
     ///

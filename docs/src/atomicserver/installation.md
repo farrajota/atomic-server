@@ -570,6 +570,11 @@ Options:
 
           [env: ATOMIC_CLEAR_REMOTE_CACHE=]
 
+      --disable-p2p
+          Do not start the peer-to-peer (Iroh) transport. By default the server binds an Iroh endpoint, connects to the n0 relay servers and announces its node ID for every Drive it hosts on the public pkarr relay (`dns.iroh.link`), keyed by the Drive's DID. With this flag none of that happens: no endpoint, no relay connection, no announcement. Device pairing and peer sync (`/iroh-sync`) are then unavailable; HTTP and WebSocket sync are unaffected
+
+          [env: ATOMIC_DISABLE_P2P=]
+
       --gpu-indexing
           Use the GPU (if available) for processing vector search embeddings
 

@@ -264,6 +264,47 @@ async fn announce_drives_pkarr(
     Ok(())
 }
 
+/// Start the Iroh peer-to-peer transport and announce this node on pkarr,
+/// unless the operator switched p2p off with `--disable-p2p`. Returns the
+/// router, which must be kept alive for incoming connections, or `None` when
+/// p2p is off or failed to start.
+async fn start_p2p(appstate: &crate::appstate::AppState) -> Option<impl Sized> {
+    if appstate.config.opts.disable_p2p {
+        // Nothing below may run: binding the endpoint already contacts the n0
+        // relays, and the announcement publishes every hosted Drive's DID.
+        tracing::info!(
+            "P2P disabled (--disable-p2p): no Iroh endpoint, relay or pkarr announcement"
+        );
+        return None;
+    }
+
+    let store = appstate.store.clone();
+    match atomic_lib::sync::peer::start(store.clone()).await {
+        Ok((node_id, router)) => {
+            tracing::info!(
+                "Iroh transport ready as \"{}\". Connect with: {}",
+                atomic_lib::sync::peer::effective_device_name(&store),
+                atomic_lib::identifiers::node_subject(&node_id.to_string())
+            );
+
+            // Announce this server's NodeID via pkarr relay, one record per
+            // drive (see `announce_drives_pkarr`).
+            let appstate_clone = appstate.clone();
+            actix_web::rt::spawn(async move {
+                if let Err(e) = announce_drives_pkarr(&appstate_clone, &node_id.to_string()).await {
+                    tracing::warn!("Pkarr announcement failed: {e}");
+                }
+            });
+
+            Some(router)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to start Iroh transport: {e}");
+            None
+        }
+    }
+}
+
 // Increase the maximum payload size (for POSTing a body, for example) to 50MB
 pub(crate) const PAYLOAD_MAX: usize = 50_242_880;
 pub(crate) const SERVER_VERSION_HEADER: &str = "X-Atomic-Server-Version";
@@ -409,35 +450,7 @@ where
     // desktop and Flutter bindings get it without remembering to.
 
     // Start Iroh peer-to-peer transport
-    let _iroh_router = {
-        let store = appstate.store.clone();
-        match atomic_lib::sync::peer::start(store.clone()).await {
-            Ok((node_id, router)) => {
-                tracing::info!(
-                    "Iroh transport ready as \"{}\". Connect with: {}",
-                    atomic_lib::sync::peer::effective_device_name(&store),
-                    atomic_lib::identifiers::node_subject(&node_id.to_string())
-                );
-
-                // Announce this server's NodeID via pkarr relay, one record per
-                // drive (see `announce_drives_pkarr`).
-                let appstate_clone = appstate.clone();
-                actix_web::rt::spawn(async move {
-                    if let Err(e) =
-                        announce_drives_pkarr(&appstate_clone, &node_id.to_string()).await
-                    {
-                        tracing::warn!("Pkarr announcement failed: {e}");
-                    }
-                });
-
-                Some(router)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start Iroh transport: {e}");
-                None
-            }
-        }
-    };
+    let _iroh_router = start_p2p(&appstate).await;
 
     // Catch up any drive the user asked us to replicate elsewhere. A target is
     // standing config, not a one-shot command, so anything committed while the
@@ -718,5 +731,37 @@ mod connection_budget_tests {
             super::process_fd_soft_limit().is_some_and(|soft| soft >= 1024),
             "the raised limit should be readable and no smaller than the stock default"
         );
+    }
+}
+
+#[cfg(test)]
+mod p2p_switch_tests {
+    /// `--disable-p2p` (`ATOMIC_DISABLE_P2P`) keeps the node off the public
+    /// p2p network: no Iroh endpoint is bound, so there is no node ID, no relay
+    /// connection, and nothing for the pkarr announcement to publish (it runs
+    /// only for a started endpoint's node ID). The node ID is process-global;
+    /// no other server unit test starts Iroh, so it is unset unless this call
+    /// set it.
+    #[actix_rt::test]
+    async fn disable_p2p_starts_no_iroh_endpoint() {
+        use clap::Parser;
+        let unique = atomic_lib::utils::random_string(10);
+        let data_dir = format!("./.temp/{unique}/db");
+        let config_dir = format!("./.temp/{unique}/config");
+        let opts = crate::config::Opts::parse_from([
+            "atomic-server",
+            "--initialize",
+            "--data-dir",
+            &data_dir,
+            "--config-dir",
+            &config_dir,
+            "--disable-p2p",
+        ]);
+        let mut config = crate::config::build_config(opts).unwrap();
+        config.search_index_path = format!("./.temp/{unique}/search_index").into();
+        let appstate = crate::appstate::AppState::init(config).await.unwrap();
+
+        assert!(super::start_p2p(&appstate).await.is_none());
+        assert!(atomic_lib::sync::peer::get_node_id().is_none());
     }
 }
