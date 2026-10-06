@@ -1065,6 +1065,23 @@ impl Commit {
                 // accept it exactly as it would a new child: `append` (or
                 // `write`) there.
                 if applied.changed_props.iter().any(|p| p == urls::PARENT) {
+                    // `check_append` stands in the resource's `drive` stamp
+                    // for a parent that is not materialized (the genesis
+                    // race). On a move that stamp is the *old* drive, so it
+                    // would approve placing the resource under a subject that
+                    // does not exist yet, and the stamp would then survive
+                    // (it is only re-derived from a parent held here). A move
+                    // must name a parent this node holds.
+                    if let Ok(parent) = applied.resource_new.get(urls::PARENT) {
+                        let parent = Subject::from(parent.to_string());
+                        if store.get_resource(&parent).await.is_err() {
+                            return Err(crate::errors::AtomicError::unauthorized(format!(
+                                "Cannot move {} under {parent}: that parent is not held here, \
+                                 so append on it cannot be checked.",
+                                commit.subject
+                            )));
+                        }
+                    }
                     crate::hierarchy::check_append(
                         store,
                         &applied.resource_new,
@@ -4058,6 +4075,41 @@ mod test {
         let to = crate::identifiers::canonicalize_scheme(&to);
         assert_eq!(canonical_prop(&stored, urls::PARENT), to);
         assert_eq!(canonical_prop(&stored, urls::DRIVE_PROP), to);
+    }
+
+    /// A move under a parent this node does not hold yet cannot be checked:
+    /// there is no parent to ask for `append`, and the resource's old `drive`
+    /// stamp says nothing about the new place. Accepting it would pre-place
+    /// the resource under a subject someone else creates later (a recipe's
+    /// deterministic folder DID), still carrying its old drive's grants.
+    #[tokio::test]
+    async fn moving_a_resource_under_a_parent_not_held_here_is_refused() {
+        let (store, _owner) = store_with_known_agent().await;
+        let mover = second_agent(&store).await;
+        let own_drive = owned_drive(&store, &mover).await;
+        let doc = child_of(&store, &mover, &own_drive).await;
+        let mut future = CommitBuilder::new("placeholder".into());
+        future.set(urls::NAME.into(), Value::String("not created yet".into()));
+        let future_parent = Commit::create_did(future, &mover, &store)
+            .await
+            .unwrap()
+            .subject
+            .to_string();
+
+        store
+            .apply_commit(
+                move_commit(&store, &mover, &doc, &future_parent).await,
+                &rights_opts(),
+            )
+            .await
+            .expect_err("a move under a parent that is not materialized must be refused");
+
+        let stored = store.get_resource(doc.get_subject()).await.unwrap();
+        assert_eq!(
+            canonical_prop(&stored, urls::PARENT),
+            crate::identifiers::canonicalize_scheme(&own_drive),
+            "the refused move must not have been applied"
+        );
     }
 
     /// The genesis cert binds the resource's original `parent` and `drive`.
