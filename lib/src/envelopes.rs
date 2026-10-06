@@ -138,6 +138,21 @@ pub fn record_ops(
     let json = response.commit_resource.to_json_ad(None)?;
     let new_key = key(subject, response.commit.created_at, signature);
 
+    // The ops this envelope introduced, recorded beside it whatever the
+    // retention. The genesis envelope's spans are kept even when the
+    // envelope itself is not (it is rebuilt from its commit row).
+    if let Some(spans) = &response.change_spans {
+        transaction.push(Operation {
+            tree: Tree::EnvelopeSpans,
+            method: Method::Insert,
+            key: new_key.clone(),
+            val: Some(serde_json::to_vec(spans)?),
+        });
+    }
+    if store.envelope_retention() == EnvelopeRetention::Latest {
+        prune_spans_except(store, subject, &new_key, transaction)?;
+    }
+
     if genesis_is_kept_as_row(response) {
         return Ok(());
     }
@@ -182,6 +197,47 @@ pub fn record_ops(
         val: Some(json.into_bytes()),
     });
     Ok(())
+}
+
+/// Queue the removal of every recorded span row of `subject` except `keep`
+/// and the genesis envelope's. Under `latest` retention only the newest
+/// envelope (and the genesis, rebuilt from its commit row) is attributable.
+fn prune_spans_except(
+    store: &Db,
+    subject: &str,
+    keep: &[u8],
+    transaction: &mut Transaction,
+) -> AtomicResult<()> {
+    let genesis = genesis_signature(subject);
+    for existing in store.kv.scan_prefix(Tree::EnvelopeSpans, &prefix(subject)) {
+        let (old_key, _) = existing?;
+        let is_genesis = decode(&old_key, Vec::new())
+            .is_some_and(|row| Some(&row.signature) == genesis.as_ref());
+        if old_key != keep && !is_genesis {
+            transaction.push(Operation {
+                tree: Tree::EnvelopeSpans,
+                method: Method::Delete,
+                key: old_key,
+                val: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The op spans recorded when this envelope was applied here. `None` for an
+/// envelope this node did not apply itself (it arrived with a bulk push or a
+/// vault pack), or one applied before spans were recorded.
+pub fn recorded_spans(store: &Db, envelope: &StoredEnvelope) -> Option<crate::loro::EnvelopeSpans> {
+    let row = store
+        .kv
+        .get(
+            Tree::EnvelopeSpans,
+            &key(&envelope.subject, envelope.created_at, &envelope.signature),
+        )
+        .ok()
+        .flatten()?;
+    serde_json::from_slice(&row).ok()
 }
 
 /// Every retained envelope of a resource, oldest first.
@@ -299,11 +355,21 @@ pub async fn import_envelope(store: &Db, expected_subject: &str, json: &str) -> 
             // history this node chose not to keep.
             return Ok(());
         }
+        let genesis = genesis_signature(commit.subject.as_str());
         for old in existing {
+            let old_key = key(&old.subject, old.created_at, &old.signature);
+            if Some(&old.signature) != genesis.as_ref() {
+                ops.push(Operation {
+                    tree: Tree::EnvelopeSpans,
+                    method: Method::Delete,
+                    key: old_key.clone(),
+                    val: None,
+                });
+            }
             ops.push(Operation {
                 tree: Tree::Envelopes,
                 method: Method::Delete,
-                key: key(&old.subject, old.created_at, &old.signature),
+                key: old_key,
                 val: None,
             });
         }
@@ -320,19 +386,11 @@ pub async fn import_envelope(store: &Db, expected_subject: &str, json: &str) -> 
 /// Drop every retained envelope of a resource. Not called on destroy: the
 /// destroy envelope is the proof a peer needs (`SYNC_DIFF.removeCommits`).
 pub fn clear_envelopes(store: &Db, subject: &str) {
-    for (k, _) in store
-        .kv
-        .scan_prefix(Tree::Envelopes, &prefix(subject))
-        .flatten()
-    {
-        let _ = store.kv.remove(Tree::Envelopes, &k);
+    for tree in [Tree::Envelopes, Tree::EnvelopeSpans] {
+        for (k, _) in store.kv.scan_prefix(tree, &prefix(subject)).flatten() {
+            let _ = store.kv.remove(tree, &k);
+        }
     }
-}
-
-/// The genesis change's message is the creator's agent subject (written by
-/// the browser and by `Commit::create_did`), which `createdBy` reads.
-fn is_genesis_carrier(token: &str) -> bool {
-    crate::identifiers::is_agent_id(token)
 }
 
 /// One signed change, as History shows it.
@@ -342,14 +400,65 @@ pub struct Attribution {
     /// Commit `createdAt`, Unix milliseconds.
     pub created_at: i64,
     pub signature: String,
+    /// `did:ad:commit:<signature>`, the value `lastCommit` stamps.
+    pub commit_id: String,
     /// The signature checks out against the signer's key on this node.
     pub verified: bool,
-    /// Loro change messages (the client's drain tokens) the envelope's update
-    /// introduced. History buckets versions by the same token, so a version
-    /// maps to its signer by lookup.
+    /// Messages of the Loro changes this envelope introduced. A display hint
+    /// kept for older readers: messages are chosen by the client, so two
+    /// envelopes can list the same one. Attribution is by [`Self::spans`]
+    /// and [`HistoryAttribution::changes`], never by message.
     pub tokens: Vec<String>,
     pub destroy: bool,
     pub genesis: bool,
+    /// The Loro op IDs this envelope's own update added to the stored
+    /// document when this node applied it. `None` when this node did not
+    /// record them (the envelope came with a bulk push or vault pack): its
+    /// ops are then unattributed here.
+    pub spans: Option<Vec<crate::loro::ChangeSpan>>,
+    /// Ops the server wrote while applying this envelope (`lastCommit`, the
+    /// derived `drive`, the creator's `write`): server bookkeeping, not the
+    /// signer's.
+    pub server_spans: Option<Vec<crate::loro::ChangeSpan>>,
+}
+
+/// Where a Loro change in the stored document came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeOrigin {
+    /// Every op was introduced by one verified envelope: its signer made it.
+    Signed,
+    /// Every op was introduced by one envelope whose signature does not
+    /// verify on this node.
+    Unverified,
+    /// Every op was written by this server while applying envelopes.
+    Server,
+    /// Some op is covered by no recorded envelope (an edit that did not come
+    /// through a signed commit here, history from before spans were
+    /// recorded, or an envelope this node did not apply itself).
+    Unattributed,
+    /// The ops are covered, but by more than one source.
+    Ambiguous,
+}
+
+/// One Loro change of the stored document and who it is attributed to.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangeAttribution {
+    #[serde(with = "crate::loro::peer_id_string")]
+    pub peer: u64,
+    pub counter: i32,
+    pub length: u32,
+    pub lamport: u32,
+    /// Change timestamp, Unix milliseconds (0 if unrecorded).
+    pub timestamp: i64,
+    /// The client-chosen change message. Not evidence of anything.
+    pub message: Option<String>,
+    pub origin: ChangeOrigin,
+    /// Index into [`HistoryAttribution::attributions`] of the envelope that
+    /// introduced the change, for `signed` and `unverified`.
+    pub attribution: Option<usize>,
+    /// The signer of that envelope, for `signed` and `unverified`.
+    pub signer: Option<String>,
 }
 
 /// What this node can say about who signed a resource's history.
@@ -359,111 +468,205 @@ pub struct HistoryAttribution {
     /// Retention this node runs; tells a reader whether missing attributions
     /// are a gap or a policy.
     pub retention: &'static str,
+    /// How changes are mapped to signers: `"change-ids"`, the Loro op IDs
+    /// each envelope introduced when it was applied here.
+    pub attribution_source: &'static str,
     /// Oldest first.
     pub attributions: Vec<Attribution>,
-    /// Every client-authored change in the stored oplog (a change carrying
-    /// a drain token) is claimed by a verified envelope. Server bookkeeping
-    /// (the `lastCommit` stamp, derived `drive`) writes untokened changes and
-    /// is not counted. `false` while the subject is destroyed or nothing is
-    /// retained.
+    /// Every change of the stored document, oldest (lowest Lamport) first.
+    pub changes: Vec<ChangeAttribution>,
+    /// Every change in the stored document is `signed` (by a verified
+    /// envelope) or `server` bookkeeping. `false` as soon as one is not, and
+    /// while the subject is destroyed or nothing is retained.
     pub complete: bool,
 }
 
 /// Verify the retained envelopes of a resource and map them onto its Loro
-/// history. Each envelope's signature is checked with the same code apply
-/// uses, and its `loroUpdate` is imported into a fresh doc to read which
-/// change tokens it introduced. `complete` is whether every tokened change
-/// in the stored oplog is claimed by a verified envelope. Anything not
-/// covered is unattributed, never a guessed signer.
+/// history by op ID.
+///
+/// When this node applies a signed commit it records which op IDs the
+/// commit's update added to the stored document and which ops the server
+/// wrote on top ([`crate::loro::EnvelopeSpans`]). Each change of the stored
+/// document is attributed to the one envelope whose recorded spans cover all
+/// of its ops; nothing a client puts in a change (its message, its peer ID)
+/// decides who made it. Each envelope's signature is checked with the same
+/// code apply uses. Anything not covered is unattributed, never a guessed
+/// signer.
 pub async fn attribute_history(store: &Db, subject: &str) -> AtomicResult<HistoryAttribution> {
     let retention = store.envelope_retention().as_str();
-    let mut attributions: Vec<Attribution> = Vec::new();
     let pure = crate::Subject::from_raw(subject, None).pure_id();
-    // The stored doc is where an update's changes can be read back with
-    // their messages: a delta carries only its own ops, and only a doc that
-    // already holds their dependencies can list them.
     let stored_doc = store
         .kv
         .get(Tree::LoroSnapshots, pure.as_bytes())
         .ok()
         .flatten()
         .and_then(|bytes| crate::loro::AtomicLoroDoc::from_snapshot(&bytes).ok());
+    let stored_changes = stored_doc
+        .as_ref()
+        .map(|doc| doc.changes())
+        .unwrap_or_default();
 
-    for envelope in envelopes(store, subject) {
+    // Under `latest` retention the genesis envelope is no longer a row once
+    // an edit replaced it, but its commit row and its spans are kept: the
+    // genesis is still attributable.
+    let mut retained = envelopes(store, subject);
+    if let Some(genesis) = genesis_envelope_from_row(store, subject) {
+        if !retained.iter().any(|e| e.signature == genesis.signature) {
+            retained.insert(0, genesis);
+        }
+    }
+
+    let mut attributions: Vec<Attribution> = Vec::new();
+    for envelope in retained {
         let resource = crate::parse::parse_json_ad_commit_resource(&envelope.json, store).await?;
         let commit = crate::commit::Commit::from_resource(resource)?;
         let verified = commit.validate_signature(store).await.is_ok();
-
-        // Tokens this envelope introduced. A genesis carries a snapshot and
-        // a browser edit only its delta, but a Rust builder commit (and a
-        // client re-exporting from an older cursor) repeats earlier changes;
-        // a token is credited to the first retained envelope that carried
-        // it, so each change has one signer. The genesis change's message is
-        // the creator's subject and is proven by the inline genesis
-        // certificate, not by whoever later shipped a snapshot containing
-        // it: only a genesis envelope may claim it.
-        let is_genesis = commit.is_genesis == Some(true);
-        let mut tokens = Vec::new();
-        if let (Some(update), Some(doc)) = (commit.loro_update.as_deref(), stored_doc.as_ref()) {
-            if let Ok((start, end)) = crate::loro::AtomicLoroDoc::update_range(update) {
-                for message in doc.change_messages_in(&start, &end) {
-                    if is_genesis_carrier(&message) && !is_genesis {
-                        continue;
-                    }
-                    let claimed = attributions.iter().any(|a| a.tokens.contains(&message));
-                    if !claimed && !tokens.contains(&message) {
-                        tokens.push(message);
-                    }
-                }
-            }
-        }
-
+        let spans = recorded_spans(store, &envelope);
+        let tokens = match &spans {
+            Some(spans) => messages_within(&stored_changes, &spans.client),
+            None => Vec::new(),
+        };
         attributions.push(Attribution {
             signer: commit.signer.to_string(),
             created_at: commit.created_at,
+            commit_id: envelope.commit_id(),
             signature: envelope.signature.clone(),
             verified,
             tokens,
             destroy: commit.destroy.unwrap_or(false),
-            genesis: is_genesis,
+            genesis: commit.is_genesis == Some(true),
+            server_spans: spans.as_ref().map(|s| s.server.clone()),
+            spans: spans.map(|s| s.client),
         });
     }
 
-    let stored_tokens: Option<Vec<String>> = stored_doc.as_ref().map(|doc| {
-        doc.get_history()
-            .into_iter()
-            .filter_map(|change| change.message)
-            .collect()
-    });
-    // The genesis change is covered by the resource's inline certificate
-    // (F1), so it is not required here; every other tokened change must be.
-    let complete = match stored_tokens {
-        Some(tokens) => {
-            !attributions.is_empty()
-                && tokens
-                    .iter()
-                    .filter(|token| !is_genesis_carrier(token))
-                    .all(|token| {
-                        attributions
-                            .iter()
-                            .any(|a| a.verified && a.tokens.contains(token))
-                    })
-        }
-        None => false,
-    };
+    let changes = classify_changes(&stored_changes, &attributions);
+    let complete = stored_doc.is_some()
+        && !attributions.is_empty()
+        && changes
+            .iter()
+            .all(|c| matches!(c.origin, ChangeOrigin::Signed | ChangeOrigin::Server));
 
     Ok(HistoryAttribution {
         subject: pure,
         retention,
+        attribution_source: "change-ids",
         attributions,
+        changes,
         complete,
     })
+}
+
+/// Who wrote a run of ops: an envelope's signer (by index) or the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Envelope(usize),
+    Server,
+}
+
+/// Attribute each change to the source whose recorded spans cover all of its
+/// ops. A change covered only in part, or by more than one source, is not
+/// attributed to anyone.
+fn classify_changes(
+    changes: &[crate::loro::ChangeInfo],
+    attributions: &[Attribution],
+) -> Vec<ChangeAttribution> {
+    let mut covering: Vec<(crate::loro::ChangeSpan, Source)> = Vec::new();
+    for (index, attribution) in attributions.iter().enumerate() {
+        for span in attribution.spans.iter().flatten() {
+            covering.push((*span, Source::Envelope(index)));
+        }
+        for span in attribution.server_spans.iter().flatten() {
+            covering.push((*span, Source::Server));
+        }
+    }
+
+    changes
+        .iter()
+        .map(|change| {
+            let start = change.counter;
+            let end = change.counter + change.len as i32;
+            let mut pieces: Vec<(i32, i32, Source)> = covering
+                .iter()
+                .filter(|(span, _)| span.peer == change.peer)
+                .filter_map(|(span, source)| {
+                    let from = span.counter.max(start);
+                    let to = span.end().min(end);
+                    (to > from).then_some((from, to, *source))
+                })
+                .collect();
+            pieces.sort_by_key(|(from, _, _)| *from);
+
+            let mut cursor = start;
+            let mut overlaps = false;
+            for (from, to, _) in &pieces {
+                if *from > cursor {
+                    break;
+                }
+                if *from < cursor {
+                    overlaps = true;
+                }
+                cursor = cursor.max(*to);
+            }
+            let covered = cursor >= end;
+            let mut sources: Vec<Source> = pieces.iter().map(|(_, _, s)| *s).collect();
+            sources.dedup();
+            let single = sources.windows(2).all(|w| w[0] == w[1]);
+
+            let (origin, attribution) = if !covered {
+                (ChangeOrigin::Unattributed, None)
+            } else if overlaps || !single {
+                (ChangeOrigin::Ambiguous, None)
+            } else {
+                match sources.first() {
+                    Some(Source::Server) => (ChangeOrigin::Server, None),
+                    Some(Source::Envelope(index)) if attributions[*index].verified => {
+                        (ChangeOrigin::Signed, Some(*index))
+                    }
+                    Some(Source::Envelope(index)) => (ChangeOrigin::Unverified, Some(*index)),
+                    None => (ChangeOrigin::Unattributed, None),
+                }
+            };
+            ChangeAttribution {
+                peer: change.peer,
+                counter: change.counter,
+                length: change.len as u32,
+                lamport: change.lamport,
+                timestamp: crate::loro::normalize_change_timestamp_ms(change.timestamp),
+                message: change.message.clone(),
+                origin,
+                signer: attribution.map(|index| attributions[index].signer.clone()),
+                attribution,
+            }
+        })
+        .collect()
+}
+
+/// Messages of the changes whose ops all lie inside `spans`.
+fn messages_within(
+    changes: &[crate::loro::ChangeInfo],
+    spans: &[crate::loro::ChangeSpan],
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    for change in changes {
+        let start = change.counter;
+        let end = change.counter + change.len as i32;
+        let inside = spans
+            .iter()
+            .any(|s| s.peer == change.peer && s.counter <= start && s.end() >= end);
+        if let (true, Some(message)) = (inside, change.message.as_ref()) {
+            if !messages.contains(message) {
+                messages.push(message.clone());
+            }
+        }
+    }
+    messages
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::ForAgent;
+    use crate::agents::{Agent, ForAgent};
     use crate::sync::engine::{ingest_commit_json, CommitIngestOpts};
     use crate::{urls, Storelike, Value};
 
@@ -493,6 +696,110 @@ mod tests {
             .await
             .unwrap();
         crate::Subject::from_raw(&subject, None)
+    }
+
+    /// A resource Alice creates in her drive with `write` for both Alice and
+    /// Bob, through a genesis commit (kept as a commit row), so its history
+    /// starts with one signed genesis and nothing else.
+    async fn shared_doc(db: &Db, drive: &str, alice: &Agent, bob: &Agent) -> crate::Subject {
+        let mut resource = crate::Resource::new("did:ad:placeholder".into());
+        resource
+            .set(urls::PARENT.into(), Value::AtomicUrl(drive.into()), db)
+            .await
+            .unwrap();
+        resource
+            .set(urls::NAME.into(), Value::String("shared".into()), db)
+            .await
+            .unwrap();
+        resource
+            .set(
+                urls::WRITE.into(),
+                Value::ResourceArray(vec![
+                    alice.subject.to_string().into(),
+                    bob.subject.to_string().into(),
+                ]),
+                db,
+            )
+            .await
+            .unwrap();
+        resource
+            .save_as_genesis(db)
+            .await
+            .unwrap()
+            .resource_new
+            .unwrap()
+            .get_subject()
+            .clone()
+    }
+
+    fn signed_opts(signer: &Agent) -> crate::commit::CommitOpts {
+        crate::commit::CommitOpts {
+            validate_signature: true,
+            validate_timestamp: false,
+            validate_rights: true,
+            validate_for_agent: Some(signer.subject.to_string()),
+            update_index: true,
+            ..crate::commit::CommitOpts::no_validations_no_index()
+        }
+    }
+
+    /// The stored Loro snapshot of `subject`: what a client holds after
+    /// fetching it.
+    async fn snapshot(db: &Db, subject: &crate::Subject) -> Vec<u8> {
+        db.get_resource(subject)
+            .await
+            .unwrap()
+            .materialized_state()
+            .expect("stored state")
+    }
+
+    /// A raw client commit by `signer`: on top of `base`, as Loro peer
+    /// `peer`, `description` is set and committed with `message` (`None`: a
+    /// change with no message at all). Only the new change is sent, and it is
+    /// applied with the signature and rights checks `/commit` uses.
+    async fn client_commit(
+        db: &Db,
+        subject: &crate::Subject,
+        signer: &Agent,
+        base: &[u8],
+        peer: u64,
+        description: &str,
+        message: Option<&str>,
+    ) {
+        let doc = crate::loro::AtomicLoroDoc::from_snapshot(base).unwrap();
+        doc.set_peer_id(peer).unwrap();
+        let base_vv = doc.oplog_vv();
+        doc.set_property(urls::DESCRIPTION, &Value::Markdown(description.into()))
+            .unwrap();
+        match message {
+            Some(message) => doc.commit_with_message(message),
+            None => doc.commit(),
+        }
+        let delta = doc.export_updates_since(&base_vv);
+        let resource = db.get_resource(subject).await.unwrap();
+        let mut builder = crate::commit::CommitBuilder::new(subject.clone());
+        builder.set_loro_update(delta);
+        let commit = builder.sign(signer, db, &resource).await.unwrap();
+        db.apply_commit(commit, &signed_opts(signer))
+            .await
+            .expect("a writer's commit applies");
+    }
+
+    /// The changes Loro peer `peer` made, as the report attributes them.
+    fn changes_of_peer(report: &HistoryAttribution, peer: u64) -> Vec<&ChangeAttribution> {
+        report.changes.iter().filter(|c| c.peer == peer).collect()
+    }
+
+    /// Every change is the verified signer's or server bookkeeping.
+    fn assert_fully_attributed(report: &HistoryAttribution) {
+        assert!(report.complete, "{report:#?}");
+        assert!(
+            report
+                .changes
+                .iter()
+                .all(|c| matches!(c.origin, ChangeOrigin::Signed | ChangeOrigin::Server)),
+            "{report:#?}"
+        );
     }
 
     #[tokio::test]
@@ -704,39 +1011,30 @@ mod tests {
         let db = Db::init_temp("envelopes_two_writers").await.unwrap();
         let (alice, drive) = db.setup("Alice").await.unwrap();
         let bob = db.create_agent(Some("Bob")).await.unwrap();
-        let subject = child(&db, &drive).await;
-        let mut resource = db.get_resource(&subject).await.unwrap();
-        resource
-            .set_unsafe(
-                urls::WRITE.into(),
-                Value::ResourceArray(vec![
-                    alice.subject.to_string().into(),
-                    bob.subject.to_string().into(),
-                ]),
-            )
-            .unwrap();
-        db.add_resource_opts(&resource, false, true, true)
-            .await
-            .unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
 
         db.set_default_agent(bob.clone());
         signed_edit(&db, &subject, "by bob").await;
         db.set_default_agent(alice.clone());
         let report = attribute_history(&db, subject.as_str()).await.unwrap();
-        assert_eq!(report.attributions.len(), 1);
-        assert_eq!(report.attributions[0].signer, bob.subject.to_string());
-        assert!(report.attributions[0].verified);
+        assert_eq!(
+            report.attributions.len(),
+            2,
+            "the newest envelope, plus the genesis rebuilt from its commit row"
+        );
+        assert!(report.attributions[0].genesis);
+        assert_eq!(report.attributions[0].signer, alice.subject.to_string());
+        let newest = report.attributions.last().unwrap();
+        assert_eq!(newest.signer, bob.subject.to_string());
+        assert!(newest.verified);
         assert!(
-            !report.attributions[0]
+            !newest
                 .tokens
                 .iter()
                 .any(|t| crate::identifiers::is_agent_id(t)),
             "a snapshot-carrying edit must not be credited with the genesis change"
         );
-        assert!(
-            report.complete,
-            "the genesis is proven by its certificate; the only other signed change is Bob's"
-        );
+        assert_fully_attributed(&report);
     }
 
     #[tokio::test]
@@ -745,20 +1043,7 @@ mod tests {
         db.set_envelope_retention(EnvelopeRetention::All);
         let (alice, drive) = db.setup("Alice").await.unwrap();
         let bob = db.create_agent(Some("Bob")).await.unwrap();
-        let subject = child(&db, &drive).await;
-        let mut resource = db.get_resource(&subject).await.unwrap();
-        resource
-            .set_unsafe(
-                urls::WRITE.into(),
-                Value::ResourceArray(vec![
-                    alice.subject.to_string().into(),
-                    bob.subject.to_string().into(),
-                ]),
-            )
-            .unwrap();
-        db.add_resource_opts(&resource, false, true, true)
-            .await
-            .unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
 
         signed_edit(&db, &subject, "by alice").await;
         db.set_default_agent(bob.clone());
@@ -766,7 +1051,7 @@ mod tests {
         db.set_default_agent(alice.clone());
 
         let report = attribute_history(&db, subject.as_str()).await.unwrap();
-        assert!(report.complete);
+        assert_fully_attributed(&report);
         let signers: Vec<&str> = report
             .attributions
             .iter()
@@ -795,6 +1080,133 @@ mod tests {
                 .count();
             assert_eq!(owners, 1, "token {token} must map to exactly one signer");
         }
+    }
+
+    /// A change's message is whatever the client wrote, including nothing.
+    /// A change without one is still the signer's: it is attributed by the
+    /// op IDs the signed envelope brought in, and it counts toward
+    /// `complete` like any other.
+    #[tokio::test]
+    async fn a_change_without_a_message_is_attributed_to_its_signer() {
+        let db = Db::init_temp("envelopes_no_message").await.unwrap();
+        db.set_envelope_retention(EnvelopeRetention::All);
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let bob = db.create_agent(Some("Bob")).await.unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
+
+        let base = snapshot(&db, &subject).await;
+        client_commit(&db, &subject, &bob, &base, 2002, "accepted", None).await;
+
+        let report = attribute_history(&db, subject.as_str()).await.unwrap();
+        let bobs = changes_of_peer(&report, 2002);
+        assert_eq!(bobs.len(), 1, "{report:#?}");
+        assert_eq!(bobs[0].message, None);
+        assert_eq!(bobs[0].origin, ChangeOrigin::Signed, "{report:#?}");
+        assert_eq!(bobs[0].signer.as_deref(), Some(bob.subject.as_str()));
+        assert_fully_attributed(&report);
+    }
+
+    /// Reusing another agent's change message (its "token") must not move
+    /// the change to that agent: the message is not what attributes it.
+    #[tokio::test]
+    async fn a_change_reusing_another_agents_message_stays_with_its_signer() {
+        let db = Db::init_temp("envelopes_reused_message").await.unwrap();
+        db.set_envelope_retention(EnvelopeRetention::All);
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let bob = db.create_agent(Some("Bob")).await.unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
+
+        let base = snapshot(&db, &subject).await;
+        client_commit(
+            &db,
+            &subject,
+            &alice,
+            &base,
+            1001,
+            "draft",
+            Some("c-alice-1"),
+        )
+        .await;
+        let base = snapshot(&db, &subject).await;
+        client_commit(
+            &db,
+            &subject,
+            &bob,
+            &base,
+            2002,
+            "accepted",
+            Some("c-alice-1"),
+        )
+        .await;
+
+        let report = attribute_history(&db, subject.as_str()).await.unwrap();
+        let alices = changes_of_peer(&report, 1001);
+        let bobs = changes_of_peer(&report, 2002);
+        assert_eq!((alices.len(), bobs.len()), (1, 1), "{report:#?}");
+        assert_eq!(alices[0].signer.as_deref(), Some(alice.subject.as_str()));
+        assert_eq!(
+            bobs[0].signer.as_deref(),
+            Some(bob.subject.as_str()),
+            "Bob's change carries Alice's message but was signed by Bob"
+        );
+        assert_eq!(bobs[0].origin, ChangeOrigin::Signed);
+        assert_fully_attributed(&report);
+    }
+
+    /// Two agents editing the same property concurrently, from the same base:
+    /// both changes stay in the document (one wins the value), and each is
+    /// attributed to the agent who signed it, whichever lands second.
+    #[tokio::test]
+    async fn concurrent_edits_are_each_attributed_to_their_signer() {
+        let db = Db::init_temp("envelopes_concurrent").await.unwrap();
+        db.set_envelope_retention(EnvelopeRetention::All);
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let bob = db.create_agent(Some("Bob")).await.unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
+
+        let base = snapshot(&db, &subject).await;
+        client_commit(&db, &subject, &alice, &base, 1001, "accepted", Some("c-a")).await;
+        client_commit(&db, &subject, &bob, &base, 2002, "rejected", Some("c-b")).await;
+
+        let report = attribute_history(&db, subject.as_str()).await.unwrap();
+        let alices = changes_of_peer(&report, 1001);
+        let bobs = changes_of_peer(&report, 2002);
+        assert_eq!((alices.len(), bobs.len()), (1, 1), "{report:#?}");
+        assert_eq!(
+            alices[0].lamport, bobs[0].lamport,
+            "the edits are concurrent"
+        );
+        assert_eq!(alices[0].signer.as_deref(), Some(alice.subject.as_str()));
+        assert_eq!(bobs[0].signer.as_deref(), Some(bob.subject.as_str()));
+        assert_fully_attributed(&report);
+    }
+
+    /// A change that reached the document without a signed commit (here a
+    /// direct store write) belongs to nobody: it is reported as unattributed
+    /// and the history is not complete.
+    #[tokio::test]
+    async fn a_change_without_an_envelope_makes_history_incomplete() {
+        let db = Db::init_temp("envelopes_unsigned_write").await.unwrap();
+        db.set_envelope_retention(EnvelopeRetention::All);
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let bob = db.create_agent(Some("Bob")).await.unwrap();
+        let subject = shared_doc(&db, &drive, &alice, &bob).await;
+        assert_fully_attributed(&attribute_history(&db, subject.as_str()).await.unwrap());
+
+        let mut resource = db.get_resource(&subject).await.unwrap();
+        resource
+            .set_unsafe(urls::DESCRIPTION.into(), Value::String("unsigned".into()))
+            .unwrap();
+        db.add_resource_opts(&resource, false, true, true)
+            .await
+            .unwrap();
+
+        let report = attribute_history(&db, subject.as_str()).await.unwrap();
+        assert!(!report.complete);
+        assert!(report
+            .changes
+            .iter()
+            .any(|c| c.origin == ChangeOrigin::Unattributed && c.signer.is_none()));
     }
 
     /// The browser signs a *delta* (ops since its last save) tagged with a

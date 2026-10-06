@@ -32,6 +32,7 @@ pub struct SledStore {
     search_docs: sled::Tree,
     search_trigrams: sled::Tree,
     envelopes: sled::Tree,
+    envelope_spans: sled::Tree,
     outbox: sled::Tree,
 }
 
@@ -64,6 +65,7 @@ impl SledStore {
         let search_docs = db.open_tree(Tree::SearchDocs)?;
         let search_trigrams = db.open_tree(Tree::SearchTrigrams)?;
         let envelopes = db.open_tree(Tree::Envelopes)?;
+        let envelope_spans = db.open_tree(Tree::EnvelopeSpans)?;
         let outbox = db.open_tree(Tree::Outbox)?;
 
         Ok(SledStore {
@@ -86,6 +88,7 @@ impl SledStore {
             search_docs,
             search_trigrams,
             envelopes,
+            envelope_spans,
             outbox,
         })
     }
@@ -115,6 +118,7 @@ impl SledStore {
             Tree::SearchDocs => &self.search_docs,
             Tree::SearchTrigrams => &self.search_trigrams,
             Tree::Envelopes => &self.envelopes,
+            Tree::EnvelopeSpans => &self.envelope_spans,
             Tree::Outbox => &self.outbox,
         }
     }
@@ -203,6 +207,7 @@ impl KvStore for SledStore {
         let mut batch_search_docs = sled::Batch::default();
         let mut batch_search_trigrams = sled::Batch::default();
         let mut batch_envelopes = sled::Batch::default();
+        let mut batch_envelope_spans = sled::Batch::default();
         let mut batch_outbox = sled::Batch::default();
 
         for op in operations {
@@ -225,6 +230,7 @@ impl KvStore for SledStore {
                 Tree::SearchDocs => &mut batch_search_docs,
                 Tree::SearchTrigrams => &mut batch_search_trigrams,
                 Tree::Envelopes => &mut batch_envelopes,
+                Tree::EnvelopeSpans => &mut batch_envelope_spans,
                 Tree::Outbox => &mut batch_outbox,
             };
             match op.method {
@@ -306,6 +312,9 @@ impl KvStore for SledStore {
         self.envelopes
             .apply_batch(batch_envelopes)
             .map_err(|e| format!("Failed to apply envelopes batch: {}", e))?;
+        self.envelope_spans
+            .apply_batch(batch_envelope_spans)
+            .map_err(|e| format!("Failed to apply envelope spans batch: {}", e))?;
         self.outbox
             .apply_batch(batch_outbox)
             .map_err(|e| format!("Failed to apply outbox batch: {}", e))?;

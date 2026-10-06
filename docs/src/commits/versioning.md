@@ -35,9 +35,13 @@ the envelope that produced the current state (`--envelope-retention latest`,
 the default) or every envelope (`all`), which turns the Loro history into a
 signed audit log.
 
-Each commit's Loro change carries a token in its message, and the envelope
-that introduced that change carries the same token inside its `loroUpdate`.
-That is how a version in History maps to its signer.
+When a node applies a signed commit, it records which Loro op IDs
+(`peer`, `counter`, `length`) the commit's `loroUpdate` added to the stored
+document, and which ops the server wrote on top while applying it (the
+`lastCommit` stamp, the derived `drive`). That is how a version in History
+maps to its signer. Change messages are chosen by the client, so they are
+never used as evidence: a change without a message, or one reusing someone
+else's message, is still attributed to the envelope that brought it in.
 
 `GET /history-attribution?subject=<subject>` returns, for a resource the
 caller may read:
@@ -46,22 +50,47 @@ caller may read:
 {
   "subject": "did:ad:…",
   "retention": "all",
+  "attribution_source": "change-ids",
   "complete": true,
   "attributions": [
     {
       "signer": "did:ad:agent:…",
       "created_at": 1757060000000,
       "signature": "…",
+      "commit_id": "did:ad:commit:…",
       "verified": true,
       "tokens": ["c-1a07140ba9b-uvdzz0"],
       "destroy": false,
-      "genesis": false
+      "genesis": false,
+      "spans": [{ "peer": "7203840239481", "counter": 3, "length": 1 }],
+      "server_spans": [{ "peer": "9930172045113", "counter": 0, "length": 1 }]
+    }
+  ],
+  "changes": [
+    {
+      "peer": "7203840239481",
+      "counter": 3,
+      "length": 1,
+      "lamport": 7,
+      "timestamp": 1757060000000,
+      "message": "c-1a07140ba9b-uvdzz0",
+      "origin": "signed",
+      "attribution": 0,
+      "signer": "did:ad:agent:…"
     }
   ]
 }
 ```
 
-`verified` means the answering node re-checked the signature with the same
-code it applies commits with. `complete` means every client-authored change
-in the oplog is claimed by a verified envelope. A version no envelope covers
-is shown as *Unattributed*; a signer is never guessed.
+Each entry in `changes` is one Loro change of the stored document, with its
+`origin`: `signed` (all its ops came in with one envelope whose signature
+verifies here), `unverified` (one envelope, signature does not verify),
+`server` (written by the node while applying envelopes), `unattributed` (some
+op came in without a signed commit recorded here) or `ambiguous` (covered by
+more than one source). `verified` means the answering node re-checked the
+signature with the same code it applies commits with. `complete` means every
+change is `signed` or `server`. `spans` is `null` for an envelope the node did
+not apply itself (it arrived with a bulk push or a vault pack); its ops are
+then unattributed on that node. `tokens` lists the messages of the changes an
+envelope introduced, for display only. A version no envelope covers is shown
+as *Unattributed*; a signer is never guessed.

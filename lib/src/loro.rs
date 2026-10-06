@@ -72,6 +72,118 @@ pub struct GenesisChange {
     pub message: Option<String>,
 }
 
+/// One change of a document's oplog: the ops `counter .. counter + len` of
+/// `peer`. See [`AtomicLoroDoc::changes`].
+#[derive(Clone, Debug)]
+pub struct ChangeInfo {
+    pub peer: u64,
+    pub counter: i32,
+    pub len: usize,
+    pub lamport: u32,
+    /// As Loro recorded it (seconds or milliseconds, see
+    /// [`normalize_change_timestamp_ms`]).
+    pub timestamp: i64,
+    pub message: Option<String>,
+}
+
+/// A run of op IDs of one Loro peer: `counter .. counter + length`. A peer ID
+/// is a `u64`, which JSON readers in JavaScript cannot hold as a number, so
+/// it is written as a decimal string (the form `loro-crdt` uses for `PeerID`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChangeSpan {
+    #[serde(with = "peer_id_string")]
+    pub peer: u64,
+    pub counter: i32,
+    pub length: u32,
+}
+
+impl ChangeSpan {
+    pub fn end(&self) -> i32 {
+        self.counter + self.length as i32
+    }
+}
+
+/// Serde for a Loro peer ID as a decimal string.
+pub mod peer_id_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(peer: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(peer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The ops one commit's apply added to a resource's stored document, split by
+/// who wrote them. Recorded per signed envelope so history can attribute each
+/// Loro op to the commit that brought it in, instead of trusting the change
+/// messages a client chooses.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EnvelopeSpans {
+    /// Ops imported from the commit's own `loroUpdate` that the stored
+    /// document did not have yet.
+    pub client: Vec<ChangeSpan>,
+    /// Ops the server wrote while applying the commit (`lastCommit`, the
+    /// derived `drive`, the creator's `write` grant).
+    pub server: Vec<ChangeSpan>,
+}
+
+impl EnvelopeSpans {
+    /// The spans between three versions of the stored document: before the
+    /// commit's update was imported, after the import, and after the server's
+    /// own writes. Client spans are limited to `update_range`, the ops the
+    /// signed update actually carries, so ops parked earlier as pending and
+    /// released by this import are not credited to this signer.
+    pub fn between(
+        before: &VersionVector,
+        after_import: &VersionVector,
+        after_apply: &VersionVector,
+        update_range: Option<&(VersionVector, VersionVector)>,
+    ) -> Self {
+        let mut client = version_diff(before, after_import);
+        if let Some((start, end)) = update_range {
+            client = client
+                .into_iter()
+                .filter_map(|span| {
+                    let from = span
+                        .counter
+                        .max(start.get(&span.peer).copied().unwrap_or(0));
+                    let to = span.end().min(end.get(&span.peer).copied().unwrap_or(0));
+                    (to > from).then(|| ChangeSpan {
+                        peer: span.peer,
+                        counter: from,
+                        length: (to - from) as u32,
+                    })
+                })
+                .collect();
+        }
+        Self {
+            client,
+            server: version_diff(after_import, after_apply),
+        }
+    }
+}
+
+/// The ops `after` has and `before` does not, per peer, in peer order.
+fn version_diff(before: &VersionVector, after: &VersionVector) -> Vec<ChangeSpan> {
+    let mut spans: Vec<ChangeSpan> = after
+        .iter()
+        .filter_map(|(peer, end)| {
+            let start = before.get(peer).copied().unwrap_or(0);
+            (*end > start).then(|| ChangeSpan {
+                peer: *peer,
+                counter: start,
+                length: (*end - start) as u32,
+            })
+        })
+        .collect();
+    spans.sort_by_key(|span| span.peer);
+    spans
+}
+
 /// Coerce a Loro change timestamp to Unix **milliseconds**. Loro's own
 /// auto-recording uses seconds, but we stamp commits with millisecond
 /// precision (Loro orders changes by lamport, not timestamp, so a finer
@@ -366,37 +478,28 @@ impl AtomicLoroDoc {
             .collect())
     }
 
-    /// Messages of the changes this doc holds inside `[start, end)` per peer,
-    /// i.e. the changes an update with that blob range introduced. Reading
-    /// them here, from a doc that already has the update's dependencies,
-    /// is what makes it work for a delta: importing a delta into an empty
-    /// doc leaves it pending (missing deps) and shows no changes at all.
-    pub fn change_messages_in(&self, start: &VersionVector, end: &VersionVector) -> Vec<String> {
-        let mut messages = Vec::new();
+    /// Every change in the oplog, oldest (lowest Lamport) first.
+    pub fn changes(&self) -> Vec<ChangeInfo> {
+        let mut changes = Vec::new();
         let frontier_ids: Vec<loro::ID> = self.doc.oplog_frontiers().iter().collect();
         if frontier_ids.is_empty() {
-            return messages;
+            return changes;
         }
         let _ = self
             .doc
             .travel_change_ancestors(&frontier_ids, &mut |change| {
-                let peer = change.id.peer;
-                let from = start.get(&peer).copied().unwrap_or(0);
-                let to = end.get(&peer).copied().unwrap_or(0);
-                let change_end = change.id.counter + change.len as i32;
-                // Overlap with [from, to): a change is one commit boundary,
-                // so any overlap means this update carried it.
-                if change.id.counter < to && change_end > from {
-                    if let Some(message) = change.message.as_ref() {
-                        let message = message.to_string();
-                        if !messages.contains(&message) {
-                            messages.push(message);
-                        }
-                    }
-                }
+                changes.push(ChangeInfo {
+                    peer: change.id.peer,
+                    counter: change.id.counter,
+                    len: change.len,
+                    lamport: change.lamport,
+                    timestamp: change.timestamp,
+                    message: change.message.map(|m| m.to_string()),
+                });
                 ControlFlow::Continue(())
             });
-        messages
+        changes.sort_by(|a, b| a.lamport.cmp(&b.lamport).then(a.peer.cmp(&b.peer)));
+        changes
     }
 
     /// The `[start, end)` version range an update or snapshot blob covers.

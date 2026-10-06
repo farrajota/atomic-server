@@ -4548,6 +4548,7 @@ async fn measure_chat_message_bytes() {
         Tree::Resources,
         Tree::LoroSnapshots,
         Tree::Envelopes,
+        Tree::EnvelopeSpans,
         Tree::PropValSub,
         Tree::ValPropSub,
         Tree::QueryMembers,

@@ -2,10 +2,12 @@
 //! history, as far as this node kept the envelopes (`atomic_lib::envelopes`).
 //!
 //! Read-gated like the resource itself: the caller must be allowed to read
-//! `subject`. The answer is the verified signer per Loro change token, plus
-//! whether every client-authored change is covered. A node on `latest`
-//! retention answers with one attribution (the current state); `all` gives
-//! one per change.
+//! `subject`. The answer is the verified signer per Loro change, matched by
+//! the op IDs each envelope introduced when this node applied it (never by
+//! the client-chosen change message), plus whether every change is covered.
+//! A node on `latest` retention answers with the genesis and the newest
+//! envelope; `all` gives one per commit. Wire format:
+//! `docs/src/commits/versioning.md`.
 
 use crate::{
     appstate::AppState, context::RequestContext, errors::AtomicServerResult,

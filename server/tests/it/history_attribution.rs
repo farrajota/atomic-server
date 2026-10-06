@@ -86,6 +86,24 @@ async fn history_attribution_names_the_verified_signer_and_gates_on_read() -> At
         last["tokens"].as_array().is_some_and(|t| !t.is_empty()),
         "the envelope names the Loro change it introduced: {last}"
     );
+    assert_eq!(report["attribution_source"], "change-ids");
+    assert!(
+        last["spans"].as_array().is_some_and(|s| !s.is_empty()),
+        "the server recorded the op IDs the envelope introduced: {last}"
+    );
+    let changes = report["changes"].as_array().expect("changes array");
+    assert!(!changes.is_empty());
+    for change in changes {
+        assert!(change["peer"].is_string(), "peer ids are strings: {change}");
+        assert!(
+            change["origin"] == "signed" || change["origin"] == "server",
+            "{change}"
+        );
+        if change["origin"] == "signed" {
+            assert_eq!(change["signer"], alice.subject.to_string());
+        }
+    }
+    assert_eq!(report["complete"], true, "{report}");
 
     // A stranger is refused, exactly like the resource itself.
     let mallory = client.new_agent("Mallory").await?;

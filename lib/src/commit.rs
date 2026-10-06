@@ -31,6 +31,12 @@ pub struct CommitResponse {
     /// stamp, `createdAt` at genesis). This, not `commit.loro_update`, is
     /// what live subscribers must receive — see [`Self::fanout_delta`].
     pub broadcast_update: Option<Vec<u8>>,
+    /// The Loro ops this apply added to the stored document, as the signed
+    /// envelope's own (imported from its update) and the server's
+    /// (bookkeeping written on top). `None` when the apply did not go through
+    /// a Loro document. Kept with the envelope, see
+    /// [`crate::envelopes::attribute_history`].
+    pub change_spans: Option<crate::loro::EnvelopeSpans>,
 }
 
 impl CommitResponse {
@@ -91,6 +97,9 @@ pub struct CommitApplied {
     /// the caller can export everything the apply added — including what
     /// the server writes afterwards — as one delta for live subscribers.
     pub vv_before: Option<loro::VersionVector>,
+    /// The doc's version right after the commit's `loroUpdate` was imported,
+    /// before the server writes anything on top.
+    pub vv_after_import: Option<loro::VersionVector>,
     /// True when the commit's `loroUpdate` carried ops whose causal
     /// dependencies are missing from the stored doc. Loro parks those ops
     /// as *pending*: they don't advance the version vector and contribute
@@ -1229,6 +1238,31 @@ impl Commit {
             .as_ref()
             .and_then(|vv| applied.resource_new.export_updates_since(vv));
 
+        // Which ops this envelope brought in, and which the server wrote on
+        // top: the version vector before the import, after it, and after the
+        // stamps above. History attributes ops by these spans, not by the
+        // change messages a client chooses. A destroy adds no ops.
+        let change_spans = match (&applied.vv_before, &applied.vv_after_import) {
+            (Some(before), Some(after_import)) => {
+                let after_apply = applied
+                    .resource_new
+                    .committed_oplog_vv()
+                    .unwrap_or_else(|| after_import.clone());
+                let update_range = commit
+                    .loro_update
+                    .as_deref()
+                    .and_then(|update| crate::loro::AtomicLoroDoc::update_range(update).ok());
+                Some(crate::loro::EnvelopeSpans::between(
+                    before,
+                    after_import,
+                    &after_apply,
+                    update_range.as_ref(),
+                ))
+            }
+            _ if destroyed => Some(crate::loro::EnvelopeSpans::default()),
+            _ => None,
+        };
+
         Ok(CommitResponse {
             commit,
             add_atoms: applied.add_atoms,
@@ -1247,6 +1281,7 @@ impl Commit {
             changed_props: applied.changed_props,
             source_id: opts.source_id.clone(),
             broadcast_update,
+            change_spans,
         })
     }
 
@@ -1287,6 +1322,7 @@ impl Commit {
         let mut changed_props: HashSet<String> = HashSet::new();
         let mut imported_new_ops = false;
         let mut vv_before: Option<loro::VersionVector> = None;
+        let mut vv_after_import: Option<loro::VersionVector> = None;
         let mut imported_pending_ops = false;
 
         if let Some(loro_update_bytes) = &self.loro_update {
@@ -1305,6 +1341,7 @@ impl Commit {
                 .import_update_with_diff(loro_update_bytes, &resource.get_subject().to_string())?;
             imported_new_ops = loro_doc.oplog_vv_map() != vv_map_before;
             imported_pending_ops = diff.imported_pending_ops;
+            vv_after_import = Some(loro_doc.oplog_vv());
 
             // Validate the author's state as well as the merged state. Concurrent
             // LWW decisions may retain our baseline while accepting a stale value.
@@ -1372,6 +1409,7 @@ impl Commit {
             changed_props,
             imported_new_ops,
             vv_before,
+            vv_after_import,
             imported_pending_ops,
         })
     }

@@ -55,6 +55,7 @@ pub fn migrate_if_needed(store: &Db) -> AtomicResult<()> {
     let mut other = 0u64;
     other += rewrite_subject_keys(store, Tree::DidMapping, ValueRewrite::Identifier)?;
     other += rewrite_prefixed_keys(store, Tree::Envelopes, b"", 0)?;
+    other += rewrite_prefixed_keys(store, Tree::EnvelopeSpans, b"", 0)?;
     other += rewrite_prefixed_keys(store, Tree::PluginMeta, TOMBSTONE_PREFIX, 0)?;
     other += rewrite_outbox_keys(store)?;
 

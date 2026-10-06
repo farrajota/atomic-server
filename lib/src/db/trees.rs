@@ -48,6 +48,11 @@ pub enum Tree {
     /// commit's JSON-AD exactly as accepted. Not a resource, not indexed, so
     /// it never shows up in queries or `all_resources`. See `crate::envelopes`.
     Envelopes,
+    /// Per signed envelope, the Loro op spans its apply added to the
+    /// resource's document ([`crate::loro::EnvelopeSpans`], JSON). Same key
+    /// as [`Tree::Envelopes`]. Lets history attribute each op to the envelope
+    /// that introduced it rather than to a client-chosen change message.
+    EnvelopeSpans,
     /// The durable outbox: subjects with local writes a hub has not
     /// acknowledged, per signing agent. Key `agent_pure_id || 0x00 ||
     /// subject_pure_id`, value a JSON [`crate::sync::outbox::OutboxEntry`].
@@ -83,11 +88,12 @@ const SEARCH_POSTINGS: &str = "search_postings_v2";
 const SEARCH_DOCS: &str = "search_docs_v2";
 const SEARCH_TRIGRAMS: &str = "search_trigrams_v2";
 const ENVELOPES: &str = "envelopes_v1";
+const ENVELOPE_SPANS: &str = "envelope_spans_v1";
 const OUTBOX: &str = "outbox_v1";
 
 impl Tree {
     /// Every tree, in the order backends create them.
-    pub const ALL: [Tree; 19] = [
+    pub const ALL: [Tree; 20] = [
         Tree::Resources,
         Tree::WatchedQueries,
         Tree::PropValSub,
@@ -106,6 +112,7 @@ impl Tree {
         Tree::SearchDocs,
         Tree::SearchTrigrams,
         Tree::Envelopes,
+        Tree::EnvelopeSpans,
         Tree::Outbox,
     ];
 
@@ -132,6 +139,7 @@ impl Tree {
             Tree::SearchDocs => SEARCH_DOCS,
             Tree::SearchTrigrams => SEARCH_TRIGRAMS,
             Tree::Envelopes => ENVELOPES,
+            Tree::EnvelopeSpans => ENVELOPE_SPANS,
             Tree::Outbox => OUTBOX,
         }
     }

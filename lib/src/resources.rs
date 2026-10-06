@@ -303,6 +303,15 @@ impl Resource {
     /// Every op the live doc gained since `since`, or `None` when this
     /// resource has no materialized doc. Used to fan out a commit together
     /// with what the server wrote on top of it.
+    /// The version of this resource's Loro document, with any pending edits
+    /// committed first so they are counted. `None` without a document.
+    pub fn committed_oplog_vv(&self) -> Option<loro::VersionVector> {
+        self.loro.as_ref().map(|doc| {
+            doc.commit();
+            doc.oplog_vv()
+        })
+    }
+
     pub fn export_updates_since(&self, since: &loro::VersionVector) -> Option<Vec<u8>> {
         self.loro
             .as_ref()
@@ -1260,6 +1269,7 @@ impl Resource {
             changed_props: std::collections::HashSet::new(),
             source_id: None,
             broadcast_update: None,
+            change_spans: None,
         }
     }
 

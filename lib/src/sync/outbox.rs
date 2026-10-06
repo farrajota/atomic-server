@@ -696,6 +696,7 @@ mod tests {
                 changed_props: Default::default(),
                 source_id: None,
                 broadcast_update: None,
+                change_spans: None,
             };
             outbox.mark_dirty(&response).await.unwrap();
         }
