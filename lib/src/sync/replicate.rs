@@ -250,6 +250,20 @@ async fn drive_exchange(
                 // The remote imported a resource referencing a blob it lacks.
                 // Blobs are only ever served on request — it will not accept an
                 // unsolicited one.
+                //
+                // With blob read auth on, the hash is not a capability here
+                // either: the bytes leave only when `export_as` may read a
+                // resource that references them, as for every other route.
+                if store.requires_blob_read_auth()
+                    && crate::hierarchy::check_blob_read(store, &hex::encode(hash), export_as)
+                        .await
+                        .is_err()
+                {
+                    tracing::warn!(
+                        "[replicate] remote asked for a blob {export_as:?} may not read; not sent"
+                    );
+                    continue;
+                }
                 match store.get_blob(&hash).await {
                     Ok(Some(bytes)) => {
                         client
@@ -510,6 +524,105 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("Blob storage failed"));
+    }
+
+    /// What a remote asking for the bytes of a private File gets back from a
+    /// replicator exporting as the drive owner or as the public, with the
+    /// node's blob read auth on or off. `None` when no bytes came.
+    async fn blob_answer(require_blob_auth: bool, export_as_owner: bool) -> Option<Vec<u8>> {
+        let (db, drive) = source().await;
+        let bytes = b"bytes of a private attachment";
+        let hash = blake3::hash(bytes);
+        db.put_blob(hash.as_bytes(), bytes).await.unwrap();
+        db.create_resource(
+            crate::urls::FILE,
+            &drive,
+            "attachment.txt",
+            Some(vec![
+                (
+                    crate::urls::INTERNAL_ID,
+                    crate::Value::String(hash.to_hex().to_string()),
+                ),
+                (
+                    crate::urls::DOWNLOAD_URL,
+                    crate::Value::String(format!(
+                        "https://localhost/download/files/{}",
+                        hash.to_hex()
+                    )),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        db.set_require_blob_read_auth(require_blob_auth);
+        let export_as = if export_as_owner {
+            ForAgent::AgentSubject(db.get_default_agent().unwrap().subject)
+        } else {
+            ForAgent::Public
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let hash = *hash.as_bytes();
+        let peer =
+            tokio::spawn(async move {
+                let mut peer = accept_peer(listener, &["keepalive"]).await;
+                send(&mut peer, protocol::encode_blob_request(&hash)).await;
+                let answer =
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), peer.next())
+                        .await
+                    {
+                        Ok(Some(Ok(frame))) => {
+                            let frame = frame.into_data().to_vec();
+                            (frame.first() == Some(&protocol::tag::BLOB_RESPONSE))
+                                .then(|| protocol::decode_blob_response(&frame[1..]).unwrap())
+                                .map(|response| response.bytes.to_vec())
+                        }
+                        _ => None,
+                    };
+                send(
+                    &mut peer,
+                    protocol::encode_error(0, protocol::error_code::UNKNOWN, "done"),
+                )
+                .await;
+                answer
+            });
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            replicate_drive_to_remote(
+                &db,
+                &drive,
+                &url,
+                &export_as,
+                ReplicateAuth::PreSigned(vec![protocol::tag::AUTH]),
+            ),
+        )
+        .await
+        .expect("the scripted remote ends the exchange");
+        peer.await.unwrap()
+    }
+
+    /// With blob read auth on, a replication target is answered like any
+    /// other blob request: only when the agent we export as may read a
+    /// resource referencing the bytes. Off, the hash is the capability.
+    #[tokio::test]
+    async fn blob_request_is_answered_only_for_a_reader_when_blob_auth_is_on() {
+        let bytes = b"bytes of a private attachment".to_vec();
+        assert_eq!(
+            blob_answer(true, false).await,
+            None,
+            "exporting as the public must not hand out a private file's bytes"
+        );
+        assert_eq!(
+            blob_answer(true, true).await,
+            Some(bytes.clone()),
+            "exporting as the File's reader serves its bytes"
+        );
+        assert_eq!(
+            blob_answer(false, false).await,
+            Some(bytes),
+            "without the flag a hash is a bearer capability"
+        );
     }
 
     #[tokio::test]
