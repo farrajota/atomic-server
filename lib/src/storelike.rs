@@ -225,6 +225,19 @@ pub trait Storelike: Sized + Send + Sync {
         std::sync::Arc::new(crate::sync::policy::OpenPolicy)
     }
 
+    /// Whether blob bytes are served only to an agent who may read a resource
+    /// referencing them ([`crate::hierarchy::check_blob_read`]). `false` for
+    /// every store without blob storage; `Db` reports its setting.
+    fn requires_blob_read_auth(&self) -> bool {
+        false
+    }
+
+    /// Whether this store holds the bytes of the blob with this BLAKE3 hash.
+    /// `false` for every store without blob storage.
+    async fn has_blob_bytes(&self, _hash: &[u8]) -> AtomicResult<bool> {
+        Ok(false)
+    }
+
     /// Get the active drive subject, if one is set.
     fn get_active_drive(&self) -> Option<String> {
         None

@@ -1271,6 +1271,300 @@ async fn content_addressed_download_requires_read_on_a_referencing_resource() {
     assert_eq!(anonymous.status(), 200);
 }
 
+/// The `Host` header value (`host[:port]`) of the server's origin.
+fn origin_authority(origin: &str) -> String {
+    let url = url::Url::parse(origin).unwrap();
+    match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap()),
+        None => url.host_str().unwrap().to_string(),
+    }
+}
+
+/// A request for `path` signed by `agent` over `signed_for` (the URL or
+/// subject the handler checks the signature against).
+fn request_signed_by(
+    method: actix_web::http::Method,
+    path: &str,
+    signed_for: &str,
+    agent: &atomic_lib::agents::Agent,
+    origin: &str,
+) -> actix_http::Request {
+    let mut req = TestRequest::default()
+        .method(method)
+        .uri(path)
+        .insert_header(("Host", origin_authority(origin)));
+    for header in atomic_lib::client::get_authentication_headers(signed_for, agent).unwrap() {
+        req = req.insert_header(header);
+    }
+    req.to_request()
+}
+
+/// Commit options for a commit signed by `agent` arriving from outside: the
+/// signature and the signer's rights are checked.
+fn signed_commit_opts(agent: &atomic_lib::agents::Agent) -> atomic_lib::commit::CommitOpts {
+    atomic_lib::commit::CommitOpts {
+        validate_signature: true,
+        validate_timestamp: false,
+        validate_rights: true,
+        validate_for_agent: Some(agent.subject.to_string()),
+        update_index: true,
+        ..atomic_lib::commit::CommitOpts::no_validations_no_index()
+    }
+}
+
+/// A genesis by `signer` of a child of `parent` (or a drive when `None`),
+/// carrying `props`.
+async fn signed_genesis(
+    store: &atomic_lib::Db,
+    signer: &atomic_lib::agents::Agent,
+    parent: Option<&str>,
+    props: Vec<(&str, atomic_lib::Value)>,
+) -> atomic_lib::errors::AtomicResult<String> {
+    let mut builder = atomic_lib::commit::CommitBuilder::new("placeholder".into());
+    match parent {
+        Some(parent) => builder.set(
+            urls::PARENT.into(),
+            atomic_lib::Value::AtomicUrl(parent.into()),
+        ),
+        None => builder.set(
+            urls::IS_A.into(),
+            atomic_lib::Value::ResourceArray(vec![urls::DRIVE.to_string().into()]),
+        ),
+    }
+    for (property, value) in props {
+        builder.set(property.into(), value);
+    }
+    let commit = atomic_lib::Commit::create_did(builder, signer, store).await?;
+    let response = store
+        .apply_commit(commit, &signed_commit_opts(signer))
+        .await?;
+    Ok(response.resource_new.unwrap().get_subject().to_string())
+}
+
+/// With `--require-blob-auth`, the bytes behind a hash go to readers of a
+/// resource that references it. A registered agent who learned the hash of a
+/// private file must not get its bytes by minting a reference of their own:
+/// not through `/download/files/<hash>` (GET or HEAD), not through the
+/// chunked-file fallback for a whole-file hash, and not through
+/// `/download/<their resource>`. Readers keep access through `internalId`,
+/// `blob` and `chunks` references alike.
+#[actix_rt::test]
+async fn a_forged_hash_reference_does_not_unlock_blob_bytes() {
+    let appstate = fresh_appstate(&["--require-blob-auth"]).await;
+    let store = appstate.store.clone();
+    let owner = store.get_default_agent().unwrap();
+    let origin = appstate.config.get_origin();
+    let stranger = store.create_agent(Some("Stranger")).await.unwrap();
+
+    // The owner's private chunked file: two stored chunks; the whole-file
+    // hash is never stored as a blob of its own.
+    let (chunk_a, chunk_b) = (b"first private chunk ".as_slice(), b"second".as_slice());
+    let mut whole = chunk_a.to_vec();
+    whole.extend_from_slice(chunk_b);
+    let whole_hash = blake3::hash(&whole).to_hex().to_string();
+    let mut chunk_refs = Vec::new();
+    for chunk in [chunk_a, chunk_b] {
+        let hash = blake3::hash(chunk);
+        store.put_blob(hash.as_bytes(), chunk).await.unwrap();
+        chunk_refs.push(atomic_lib::identifiers::blob_subject(&hash.to_hex()));
+    }
+    let chunk_a_hash = blake3::hash(chunk_a).to_hex().to_string();
+    let private_read = vec![owner.subject.to_string()];
+    let mut chunked = atomic_lib::Resource::new(format!(
+        "{origin}/files/chunked-{}",
+        atomic_lib::utils::random_string(8)
+    ));
+    chunked
+        .set_unsafe(urls::IS_A.into(), vec![urls::FILE.to_string()].into())
+        .unwrap();
+    chunked
+        .set_unsafe(urls::INTERNAL_ID.into(), whole_hash.clone().into())
+        .unwrap();
+    chunked
+        .set_unsafe(
+            urls::DOWNLOAD_URL.into(),
+            format!("{origin}/download/files/{whole_hash}").into(),
+        )
+        .unwrap();
+    chunked
+        .set_unsafe(
+            urls::CHUNKS.into(),
+            atomic_lib::Value::ResourceArray(
+                chunk_refs.iter().map(|c| c.as_str().into()).collect(),
+            ),
+        )
+        .unwrap();
+    chunked
+        .set_unsafe(urls::READ.into(), private_read.clone().into())
+        .unwrap();
+    store.add_resource(&chunked).await.unwrap();
+
+    // A private resource naming its bytes through `blob`.
+    let blob_bytes = b"bytes named through the blob property";
+    let blob_hash = blake3::hash(blob_bytes);
+    store
+        .put_blob(blob_hash.as_bytes(), blob_bytes)
+        .await
+        .unwrap();
+    let blob_hash = blob_hash.to_hex().to_string();
+    let mut by_blob = atomic_lib::Resource::new(format!(
+        "{origin}/files/by-blob-{}",
+        atomic_lib::utils::random_string(8)
+    ));
+    by_blob
+        .set_unsafe(
+            urls::BLOB.into(),
+            atomic_lib::Value::AtomicUrl(
+                atomic_lib::identifiers::blob_subject(&blob_hash)
+                    .as_str()
+                    .into(),
+            ),
+        )
+        .unwrap();
+    by_blob
+        .set_unsafe(urls::READ.into(), private_read.into())
+        .unwrap();
+    store.add_resource(&by_blob).await.unwrap();
+
+    // The stranger's own drive, where they may write anything.
+    let stranger_drive = signed_genesis(&store, &stranger, None, vec![])
+        .await
+        .expect("anyone may mint a drive of their own");
+
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let get = actix_web::http::Method::GET;
+    let head = actix_web::http::Method::HEAD;
+    let as_agent =
+        |method: &actix_web::http::Method, path: &str, agent: &atomic_lib::agents::Agent| {
+            request_signed_by(
+                method.clone(),
+                path,
+                &format!("{origin}{path}"),
+                agent,
+                &origin,
+            )
+        };
+
+    // Readers get the bytes through each kind of reference.
+    for (path, expected) in [
+        (format!("/download/files/{whole_hash}"), whole.as_slice()),
+        (format!("/download/files/{chunk_a_hash}"), chunk_a),
+        (
+            format!("/download/files/{blob_hash}"),
+            blob_bytes.as_slice(),
+        ),
+    ] {
+        let resp = test::call_service(&app, as_agent(&get, &path, &owner)).await;
+        assert_eq!(resp.status(), 200, "{path}: the owner reads their bytes");
+        assert_eq!(test::read_body(resp).await.as_ref(), expected, "{path}");
+        let resp = test::call_service(&app, as_agent(&get, &path, &stranger)).await;
+        assert_eq!(
+            resp.status(),
+            401,
+            "{path}: a stranger who may read no reference gets nothing"
+        );
+    }
+
+    // References to bytes held here, by `chunks` or `blob`, are refused.
+    for (property, value) in [
+        (
+            urls::CHUNKS,
+            atomic_lib::Value::ResourceArray(vec![chunk_refs[0].as_str().into()]),
+        ),
+        (
+            urls::BLOB,
+            atomic_lib::Value::AtomicUrl(
+                atomic_lib::identifiers::blob_subject(&blob_hash)
+                    .as_str()
+                    .into(),
+            ),
+        ),
+    ] {
+        let refused = signed_genesis(
+            &store,
+            &stranger,
+            Some(&stranger_drive),
+            vec![(property, value)],
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "{property}: referencing held bytes the stranger may not read is refused"
+        );
+    }
+
+    // `/download/<resource>` serves what the stranger's own resource names:
+    // a blob the stranger referenced before uploading it works...
+    let own_bytes = b"the stranger's own upload";
+    let own_hash = blake3::hash(own_bytes);
+    let own = signed_genesis(
+        &store,
+        &stranger,
+        Some(&stranger_drive),
+        vec![(
+            urls::INTERNAL_ID,
+            atomic_lib::Value::String(own_hash.to_hex().to_string()),
+        )],
+    )
+    .await
+    .expect("referencing bytes this node does not hold yet is the upload order");
+    store
+        .put_blob(own_hash.as_bytes(), own_bytes)
+        .await
+        .unwrap();
+    let own_path = format!("/download/{own}");
+    let resp = test::call_service(
+        &app,
+        request_signed_by(get.clone(), &own_path, &own, &stranger, &origin),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "the stranger downloads their own file");
+    assert_eq!(test::read_body(resp).await.as_ref(), own_bytes);
+
+    // ...but a resource naming only the private file's whole-file hash, which
+    // is never stored as a blob, yields nothing: not by its subject, and not
+    // through the chunked-file fallback of `/download/files/<hash>`.
+    let forged = signed_genesis(
+        &store,
+        &stranger,
+        Some(&stranger_drive),
+        vec![(
+            urls::INTERNAL_ID,
+            atomic_lib::Value::String(whole_hash.clone()),
+        )],
+    )
+    .await
+    .expect("no bytes are held under the whole-file hash, so the reference is allowed");
+    let forged_path = format!("/download/{forged}");
+    let resp = test::call_service(
+        &app,
+        request_signed_by(get.clone(), &forged_path, &forged, &stranger, &origin),
+    )
+    .await;
+    assert_ne!(resp.status(), 200, "{forged_path} must not serve the file");
+    let whole_path = format!("/download/files/{whole_hash}");
+    for method in [&get, &head] {
+        let resp = test::call_service(&app, as_agent(method, &whole_path, &stranger)).await;
+        assert_ne!(
+            resp.status(),
+            200,
+            "{method} {whole_path}: the chunked fallback may only use a File the caller can read"
+        );
+        assert_ne!(
+            test::read_body(resp).await.as_ref(),
+            whole.as_slice(),
+            "{method} {whole_path}"
+        );
+    }
+    let resp = test::call_service(&app, as_agent(&get, &whole_path, &owner)).await;
+    assert_eq!(resp.status(), 200, "the owner still gets the chunked file");
+}
+
 /// `--served-domain-suffix` (`ATOMIC_SERVED_DOMAIN_SUFFIX`) lets a node answer
 /// under a second hostname. A GET signed for a URL on that hostname must
 /// authenticate there: the request origin follows the `Host` the client used,

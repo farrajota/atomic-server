@@ -99,6 +99,75 @@ pub struct CommitApplied {
     pub imported_pending_ops: bool,
 }
 
+/// The BLAKE3 hashes (lowercase hex) of the blob bytes `resource` names: its
+/// `internalId` when that is a hash, its `blob`, and each of its `chunks`.
+fn referenced_blob_hashes(resource: &Resource) -> std::collections::BTreeSet<String> {
+    let mut hashes = std::collections::BTreeSet::new();
+    if let Ok(id) = resource.get(urls::INTERNAL_ID) {
+        let id = id.to_string().to_ascii_lowercase();
+        if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            hashes.insert(id);
+        }
+    }
+    let mut add_blob_ref = |reference: String| {
+        if let Some(hash) = crate::identifiers::blob_hash_hex(&reference) {
+            hashes.insert(hash.to_ascii_lowercase());
+        }
+    };
+    if let Ok(blob) = resource.get(urls::BLOB) {
+        add_blob_ref(blob.to_string());
+    }
+    if let Ok(chunks) = resource.get(urls::CHUNKS).and_then(|v| v.to_subjects(None)) {
+        for chunk in chunks {
+            add_blob_ref(chunk);
+        }
+    }
+    hashes
+}
+
+/// With blob read auth on, a resource that references a blob makes its
+/// readers readers of the bytes. So a commit may only point a resource at
+/// bytes this node already holds when the signer could already read them
+/// through some *other* reference; otherwise knowing a hash (from a pasted
+/// `downloadURL`, a log) and having write access anywhere would be enough to
+/// read the bytes. References to bytes not held here yet are the normal
+/// upload order (commit, then `PUT /blob`) and stay allowed. Without the
+/// flag the hash itself is the capability, so a reference grants nothing.
+async fn check_new_blob_references(
+    store: &impl Storelike,
+    resource_old: Option<&Resource>,
+    resource_new: &Resource,
+    for_agent: &crate::agents::ForAgent,
+) -> AtomicResult<()> {
+    if !store.requires_blob_read_auth() {
+        return Ok(());
+    }
+    let before = resource_old.map(referenced_blob_hashes).unwrap_or_default();
+    for hash in referenced_blob_hashes(resource_new).difference(&before) {
+        let Ok(hash_bytes) = hex::decode(hash) else {
+            continue;
+        };
+        if !store.has_blob_bytes(&hash_bytes).await? {
+            continue;
+        }
+        crate::hierarchy::check_blob_read_excluding(
+            store,
+            hash,
+            for_agent,
+            Some(resource_new.get_subject()),
+        )
+        .await
+        .map_err(|_| {
+            crate::errors::AtomicError::unauthorized(format!(
+                "{} references blob {hash}, whose bytes this node already holds, but \
+                 {for_agent} may not read any other resource that references them.",
+                resource_new.get_subject()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 /// Describes options for applying a Commit.
 /// Skip the checks you don't need to get better performance, or if you want to break the rules a little.
@@ -1004,6 +1073,14 @@ impl Commit {
                     .await?;
                 }
             }
+
+            check_new_blob_references(
+                store,
+                (!is_new).then_some(&resource_old),
+                &applied.resource_new,
+                &validate_for.into(),
+            )
+            .await?;
 
             if commit.destroy.unwrap_or(false) && !is_new {
                 commit.reject_destroy_older_than_genesis(&resource_old)?;
@@ -4143,5 +4220,232 @@ mod owner_mode_tests {
         db.apply_commit(commit, &signed_opts(&stranger))
             .await
             .expect("an open node must behave exactly as it did before host mode existed");
+    }
+}
+
+/// With `require_blob_read_auth` on, blob bytes are served to whoever may read
+/// a resource that references their hash (`hierarchy::check_blob_read`). A
+/// commit is what creates such a reference, so it must not be the way in:
+/// pointing `internalId`, `blob` or `chunks` at bytes this node already holds
+/// requires that the signer can already read them through another reference.
+#[cfg(all(test, feature = "db"))]
+mod blob_reference_tests {
+    use super::*;
+    use crate::Value;
+
+    fn signed_opts(agent: &crate::agents::Agent) -> CommitOpts {
+        CommitOpts {
+            validate_signature: true,
+            validate_timestamp: false,
+            validate_rights: true,
+            validate_for_agent: Some(agent.subject.to_string()),
+            update_index: true,
+            ..CommitOpts::no_validations_no_index()
+        }
+    }
+
+    struct Fixture {
+        db: crate::Db,
+        owner: crate::agents::Agent,
+        owner_drive: String,
+        stranger: crate::agents::Agent,
+        stranger_drive: String,
+        /// Bytes this node holds, referenced only by the owner's private File.
+        held: String,
+    }
+
+    /// A node holding a private file's bytes, plus a registered stranger with
+    /// a drive of their own (where they may write anything).
+    async fn fixture(name: &str, require_blob_auth: bool) -> Fixture {
+        let db = crate::Db::init_temp(name).await.unwrap();
+        let (owner, owner_drive) = db.setup("Owner").await.unwrap();
+        db.set_require_blob_read_auth(require_blob_auth);
+
+        let bytes = format!("private bytes of {name}");
+        let hash = blake3::hash(bytes.as_bytes());
+        db.put_blob(hash.as_bytes(), bytes.as_bytes())
+            .await
+            .unwrap();
+        let held = hash.to_hex().to_string();
+        db.create_resource(
+            urls::FILE,
+            &owner_drive,
+            "private.txt",
+            Some(vec![
+                (urls::INTERNAL_ID, Value::String(held.clone())),
+                (
+                    urls::DOWNLOAD_URL,
+                    Value::String(format!("http://localhost/download/files/{held}")),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        let stranger = db.create_agent(Some("Stranger")).await.unwrap();
+        let mut b = CommitBuilder::new("placeholder".into());
+        b.set(
+            urls::IS_A.into(),
+            Value::ResourceArray(vec![urls::DRIVE.to_string().into()]),
+        );
+        let commit = Commit::create_did(b, &stranger, &db).await.unwrap();
+        let stranger_drive = db
+            .apply_commit(commit, &signed_opts(&stranger))
+            .await
+            .expect("anyone may mint a drive of their own")
+            .resource_new
+            .unwrap()
+            .get_subject()
+            .to_string();
+
+        Fixture {
+            db,
+            owner,
+            owner_drive,
+            stranger,
+            stranger_drive,
+            held,
+        }
+    }
+
+    /// The three ways a resource names blob bytes.
+    fn references(hash_hex: &str) -> [(&'static str, Value); 3] {
+        let blob = crate::identifiers::blob_subject(hash_hex);
+        [
+            (urls::INTERNAL_ID, Value::String(hash_hex.to_string())),
+            (urls::BLOB, Value::AtomicUrl(blob.as_str().into())),
+            (
+                urls::CHUNKS,
+                Value::ResourceArray(vec![blob.as_str().into()]),
+            ),
+        ]
+    }
+
+    /// A genesis by `signer` of a child of `parent` carrying `property: value`.
+    async fn referencing_genesis(
+        db: &crate::Db,
+        signer: &crate::agents::Agent,
+        parent: &str,
+        property: &str,
+        value: Value,
+    ) -> Commit {
+        let mut b = CommitBuilder::new("placeholder".into());
+        b.set(urls::PARENT.into(), Value::AtomicUrl(parent.into()));
+        b.set(property.into(), value);
+        Commit::create_did(b, signer, db).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn referencing_held_bytes_requires_read_through_an_existing_reference() {
+        let f = fixture("blob_ref_genesis", true).await;
+        for (property, value) in references(&f.held) {
+            let commit =
+                referencing_genesis(&f.db, &f.stranger, &f.stranger_drive, property, value).await;
+            let subject = commit.subject.clone();
+            let err =
+                f.db.apply_commit(commit, &signed_opts(&f.stranger))
+                    .await
+                    .expect_err("a stranger must not reference bytes only the owner may read");
+            assert!(
+                matches!(
+                    err.error_type,
+                    crate::errors::AtomicErrorType::UnauthorizedError
+                ),
+                "{property}: a refused reference is an authorization error, got: {err}"
+            );
+            assert!(
+                !f.db.has_resource_locally(&subject.pure_id()),
+                "{property}: the refused resource must not have been stored"
+            );
+        }
+        assert!(
+            crate::hierarchy::check_blob_read(
+                &f.db,
+                &f.held,
+                &crate::agents::ForAgent::AgentSubject(f.stranger.subject.clone())
+            )
+            .await
+            .is_err(),
+            "the stranger still may not read the bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_a_reference_to_held_bytes_is_checked_like_creating_one() {
+        let f = fixture("blob_ref_edit", true).await;
+        let unheld = blake3::hash(b"bytes this node has never seen")
+            .to_hex()
+            .to_string();
+        let commit = referencing_genesis(
+            &f.db,
+            &f.stranger,
+            &f.stranger_drive,
+            urls::INTERNAL_ID,
+            Value::String(unheld),
+        )
+        .await;
+        let mut resource =
+            f.db.apply_commit(commit, &signed_opts(&f.stranger))
+                .await
+                .expect("bytes not held here yet can be referenced (commit before upload)")
+                .resource_new
+                .unwrap();
+
+        resource
+            .set_unsafe(urls::INTERNAL_ID.into(), Value::String(f.held.clone()))
+            .unwrap();
+        let edit = resource
+            .get_commit_builder()
+            .clone()
+            .sign(&f.stranger, &f.db, &resource)
+            .await
+            .unwrap();
+        let err =
+            f.db.apply_commit(edit, &signed_opts(&f.stranger))
+                .await
+                .expect_err("re-pointing a reference at held bytes is checked too");
+        assert!(
+            matches!(
+                err.error_type,
+                crate::errors::AtomicErrorType::UnauthorizedError
+            ),
+            "got: {err}"
+        );
+        let stored = f.db.get_resource(resource.get_subject()).await.unwrap();
+        assert_ne!(
+            stored.get(urls::INTERNAL_ID).unwrap().to_string(),
+            f.held,
+            "the refused edit must not have been applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_of_the_bytes_may_reference_them_again() {
+        let f = fixture("blob_ref_reader", true).await;
+        for (property, value) in references(&f.held) {
+            let commit =
+                referencing_genesis(&f.db, &f.owner, &f.owner_drive, property, value).await;
+            f.db.apply_commit(commit, &signed_opts(&f.owner))
+                .await
+                .unwrap_or_else(|e| panic!("{property}: the owner may reference their bytes: {e}"));
+        }
+    }
+
+    /// Without the flag the hash is the capability (`docs/src/files.md`), so a
+    /// reference grants nothing the hash did not, and is not checked.
+    #[tokio::test]
+    async fn without_blob_auth_references_are_not_checked() {
+        let f = fixture("blob_ref_flag_off", false).await;
+        let commit = referencing_genesis(
+            &f.db,
+            &f.stranger,
+            &f.stranger_drive,
+            urls::INTERNAL_ID,
+            Value::String(f.held.clone()),
+        )
+        .await;
+        f.db.apply_commit(commit, &signed_opts(&f.stranger))
+            .await
+            .expect("with hashes as bearer capabilities, referencing one is unchecked");
     }
 }

@@ -4,6 +4,7 @@ use crate::{
 };
 use actix_web::http::header::{ContentDisposition, DispositionType};
 use actix_web::{web, HttpRequest, HttpResponse};
+use atomic_lib::agents::ForAgent;
 use atomic_lib::storelike::Query;
 use atomic_lib::{urls, Resource, Storelike, Subject, Value};
 
@@ -51,19 +52,21 @@ pub async fn handle_download(
     // browsers refuse to render an uploaded SVG inline).
     if let Some(hash_hex) = subject_path.strip_prefix("/files/") {
         if hash_hex.len() == 64 && hex::decode(hash_hex).is_ok() {
-            authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
+            let reader = authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
             let (bytes, mimetype) = match blob_by_hash_hex(hash_hex, &appstate).await? {
                 Some(bytes) => (
                     Some(bytes),
                     mimetype_by_internal_id(hash_hex, &appstate).await,
                 ),
-                None => match chunked_file_by_internal_id(hash_hex, &appstate).await? {
-                    Some(file) => (
-                        Some(reconstruct_file_bytes(&file, &appstate).await?),
-                        mimetype_of(&file),
-                    ),
-                    None => (None, DEFAULT_MIMETYPE.to_string()),
-                },
+                None => {
+                    match chunked_file_by_internal_id(hash_hex, reader.as_ref(), &appstate).await? {
+                        Some(file) => (
+                            Some(reconstruct_file_bytes(&file, &appstate).await?),
+                            mimetype_of(&file),
+                        ),
+                        None => (None, DEFAULT_MIMETYPE.to_string()),
+                    }
+                }
             };
             let bytes = bytes.ok_or_else(|| {
                 atomic_lib::errors::AtomicError::not_found(format!("Blob not found: {hash_hex}"))
@@ -108,15 +111,16 @@ pub async fn handle_download(
 /// from signed headers (over the URL as requested) or, for the `<img>` and
 /// `<video>` tags the data browser points at these URLs, the same-origin
 /// session cookie. Without the flag the hash is the capability, as documented
-/// in `docs/src/files.md`.
+/// in `docs/src/files.md`. Returns the authorized agent when the flag is on,
+/// so later lookups by hash can be limited to what that agent may read.
 async fn authorize_blob_read(
     hash_hex: &str,
     req: &HttpRequest,
     origin: &str,
     appstate: &AppState,
-) -> AtomicServerResult<()> {
+) -> AtomicServerResult<Option<ForAgent>> {
     if !appstate.store.requires_blob_read_auth() {
-        return Ok(());
+        return Ok(None);
     }
     let requested = format!(
         "{origin}{}",
@@ -127,7 +131,7 @@ async fn authorize_blob_read(
     );
     let for_agent = get_client_agent(req.headers(), appstate, &requested).await?;
     atomic_lib::hierarchy::check_blob_read(&appstate.store, hash_hex, &for_agent).await?;
-    Ok(())
+    Ok(Some(for_agent))
 }
 
 /// Serves user-uploaded blob bytes as a forced download rather than rendering
@@ -238,14 +242,31 @@ async fn files_by_internal_id(
 /// Find a chunked File by its whole-file `internalId`, so the content-addressed
 /// URL works for chunked files (whose whole-file blob is never stored).
 /// `None` if no such chunked File.
+///
+/// With `reader` (blob read auth on), only a File that agent may read counts.
+/// The whole-file hash has no bytes of its own, so anyone may reference it
+/// from a resource they write; that reference passes `check_blob_read`, and
+/// must not then unlock somebody else's chunks.
 async fn chunked_file_by_internal_id(
     hash_hex: &str,
+    reader: Option<&ForAgent>,
     appstate: &AppState,
 ) -> AtomicServerResult<Option<Resource>> {
-    Ok(files_by_internal_id(hash_hex, appstate)
-        .await?
-        .into_iter()
-        .find(|r| matches!(r.get(urls::CHUNKS), Ok(Value::ResourceArray(c)) if !c.is_empty())))
+    for file in files_by_internal_id(hash_hex, appstate).await? {
+        if !matches!(file.get(urls::CHUNKS), Ok(Value::ResourceArray(c)) if !c.is_empty()) {
+            continue;
+        }
+        if let Some(reader) = reader {
+            if atomic_lib::hierarchy::check_read(&appstate.store, &file, reader)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+        }
+        return Ok(Some(file));
+    }
+    Ok(None)
 }
 
 /// The File's stored `mimetype`, or `application/octet-stream` when it has none.

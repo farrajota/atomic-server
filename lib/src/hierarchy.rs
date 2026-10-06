@@ -121,9 +121,22 @@ pub async fn check_blob_read(
     hash_hex: &str,
     for_agent: &ForAgent,
 ) -> AtomicResult<String> {
+    check_blob_read_excluding(store, hash_hex, for_agent, None).await
+}
+
+/// [`check_blob_read`], ignoring the resource `exclude`. A commit that makes
+/// a resource reference a blob asks whether the signer could already read the
+/// bytes elsewhere: the resource under change must not vouch for itself.
+pub async fn check_blob_read_excluding(
+    store: &impl Storelike,
+    hash_hex: &str,
+    for_agent: &ForAgent,
+    exclude: Option<&crate::Subject>,
+) -> AtomicResult<String> {
     if for_agent == &ForAgent::Sudo {
         return Ok("Sudo may read any blob".into());
     }
+    let excluded = exclude.map(|s| s.pure_id());
     let hash_hex = hash_hex.to_ascii_lowercase();
     let blob = crate::identifiers::blob_subject(&hash_hex);
     let references = [
@@ -136,6 +149,9 @@ pub async fn check_blob_read(
         query.property = Some(property.to_string());
         query.value = Some(value);
         for referencing in store.query(&query).await?.resources {
+            if excluded.as_deref() == Some(referencing.get_subject().pure_id().as_str()) {
+                continue;
+            }
             if let Ok(explanation) = check_read(store, &referencing, for_agent).await {
                 return Ok(explanation);
             }

@@ -4271,6 +4271,14 @@ impl Storelike for Db {
         self.get_active_drive()
     }
 
+    fn requires_blob_read_auth(&self) -> bool {
+        Db::requires_blob_read_auth(self)
+    }
+
+    async fn has_blob_bytes(&self, hash: &[u8]) -> AtomicResult<bool> {
+        self.has_blob(hash).await
+    }
+
     fn set_active_drive(&self, drive: &str) -> AtomicResult<()> {
         self.set_active_drive(drive)
     }
