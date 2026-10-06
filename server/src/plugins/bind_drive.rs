@@ -1,6 +1,6 @@
 use atomic_lib::{
     endpoints::{BoxFuture, Endpoint, HandlePostContext},
-    errors::AtomicResult,
+    errors::{AtomicError, AtomicResult},
     hierarchy::check_write,
     storelike::ResourceResponse,
     urls, Resource, Storelike, Value,
@@ -34,11 +34,25 @@ fn handle_bind_drive_request<'a>(
 
         let host = subject.host_str().unwrap_or("localhost");
 
-        // ?reset clears the drive mapping for this host. Intended for development use only.
+        // ?reset clears the drive mapping for this host. Unbinding takes the
+        // drive off this host just as surely as rebinding does, so it needs
+        // the same right: write on the drive currently bound. With nothing
+        // bound there is nothing to protect, and reset is a no-op.
         let is_reset = subject.query_pairs().any(|(k, _)| k == "reset");
 
         if is_reset {
-            store.remove_drive_mapping(host)?;
+            if let Some(current_drive) = store.get_drive_did(host).await? {
+                let drive_resource = store.get_resource(&current_drive).await?;
+                check_write(store, &drive_resource, for_agent)
+                    .await
+                    .map_err(|_| {
+                        AtomicError::unauthorized(
+                            "Only agents with write access to the drive bound to this host can unbind it."
+                                .into(),
+                        )
+                    })?;
+                store.remove_drive_mapping(host)?;
+            }
             let root = store
                 .get_resource(&"internal:/".into())
                 .await
@@ -158,5 +172,84 @@ mod tests {
         .await
         .unwrap();
         assert!(store.get_drive_did("example.com").await.unwrap().is_none());
+    }
+
+    /// `?reset` unbinds a host, which is as consequential as rebinding it:
+    /// the host stops serving the drive. It needs the same right, write on
+    /// the drive currently bound, and a refusal is an authorization error.
+    #[tokio::test]
+    async fn reset_requires_write_on_the_bound_drive() {
+        let store = Db::init_temp("bind_drive_reset_rights").await.unwrap();
+        let (owner, drive) = store.setup("Owner").await.unwrap();
+        let owner = ForAgent::AgentSubject(owner.subject.clone());
+        call(
+            &store,
+            "http://example.com/bind-drive",
+            bind_body(&drive),
+            &owner,
+        )
+        .await
+        .unwrap();
+
+        let stranger = store.create_agent(Some("Stranger")).await.unwrap();
+        for caller in [ForAgent::Public, ForAgent::AgentSubject(stranger.subject)] {
+            let err = call(
+                &store,
+                "http://example.com/bind-drive?reset=true",
+                Vec::new(),
+                &caller,
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{caller} must not unbind the host"));
+            assert!(
+                matches!(
+                    err.error_type,
+                    atomic_lib::AtomicErrorType::UnauthorizedError
+                ),
+                "a refused reset is an authorization error, got: {err}"
+            );
+            assert_eq!(
+                store
+                    .get_drive_did("example.com")
+                    .await
+                    .unwrap()
+                    .map(|d| d.to_string()),
+                Some(drive.clone()),
+                "a refused reset must leave the binding in place"
+            );
+        }
+
+        call(
+            &store,
+            "http://example.com/bind-drive?reset=true",
+            Vec::new(),
+            &owner,
+        )
+        .await
+        .expect("a writer of the bound drive may unbind the host");
+        assert!(store.get_drive_did("example.com").await.unwrap().is_none());
+    }
+
+    /// With nothing bound there is nothing to protect: reset is a no-op that
+    /// succeeds for anyone and binds nothing.
+    #[tokio::test]
+    async fn reset_on_an_unbound_host_is_a_no_op() {
+        let store = Db::init_temp("bind_drive_reset_unbound").await.unwrap();
+        store.setup("Owner").await.unwrap();
+
+        call(
+            &store,
+            "http://unbound.example/bind-drive?reset=true",
+            Vec::new(),
+            &ForAgent::Public,
+        )
+        .await
+        .expect("resetting an unbound host is a no-op");
+        assert!(store
+            .get_drive_did("unbound.example")
+            .await
+            .unwrap()
+            .is_none());
     }
 }
