@@ -1271,6 +1271,65 @@ async fn content_addressed_download_requires_read_on_a_referencing_resource() {
     assert_eq!(anonymous.status(), 200);
 }
 
+/// `--served-domain-suffix` (`ATOMIC_SERVED_DOMAIN_SUFFIX`) lets a node answer
+/// under a second hostname. A GET signed for a URL on that hostname must
+/// authenticate there: the request origin follows the `Host` the client used,
+/// so the signature's subject matches. A `Host` outside every configured name
+/// is not trusted, so the very same signature is refused.
+#[actix_rt::test]
+async fn signed_get_on_a_served_domain_suffix_host_is_accepted() {
+    let appstate = fresh_appstate(&[
+        "--domain",
+        "atomic.example",
+        "--served-domain-suffix",
+        "second.example",
+    ])
+    .await;
+    let agent = appstate.store.get_default_agent().unwrap();
+    let drive = appstate.store.ensure_private_drive().await.unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    let path = format!("/{drive}");
+    let signed_for = format!("http://kb.second.example{path}");
+    let get = |host: &'static str, signed: bool| {
+        let mut req = TestRequest::get()
+            .uri(&path)
+            .insert_header(("Host", host))
+            .insert_header(("Accept", "application/ad+json"));
+        if signed {
+            for header in
+                atomic_lib::client::get_authentication_headers(&signed_for, &agent).unwrap()
+            {
+                req = req.insert_header(header);
+            }
+        }
+        req.to_request()
+    };
+
+    let anonymous = test::call_service(&app, get("kb.second.example", false)).await;
+    assert_eq!(anonymous.status(), 401, "the private drive is not public");
+
+    let on_suffix_host = test::call_service(&app, get("kb.second.example", true)).await;
+    assert_eq!(
+        on_suffix_host.status(),
+        200,
+        "a GET signed for the served-suffix host authenticates there: {}",
+        get_body(on_suffix_host)
+    );
+
+    let on_unserved_host = test::call_service(&app, get("kb.unserved.example", true)).await;
+    assert_eq!(
+        on_unserved_host.status(),
+        401,
+        "an unserved Host must not decide which origin a signature is checked against"
+    );
+}
+
 /// `GET /drive-usage` reports a drive's resource count + blob/Loro bytes for the
 /// sync page. The frontend has shipped this UI for a while, but the endpoint was
 /// never implemented server-side (it 404'd), so the usage bar silently never
