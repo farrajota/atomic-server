@@ -2,10 +2,10 @@ import {
   core,
   dataBrowser,
   JSONValue,
-  Store,
+  Resource,
   useArray,
   useResource,
-  useStore,
+  useResources,
 } from '@tomic/react';
 import { useRef, useState, type JSX } from 'react';
 import { styled } from 'styled-components';
@@ -26,14 +26,14 @@ const TAG_SPACING = '0.5rem';
 const emptyArray: string[] = [];
 
 function buildListWithTitles(
-  store: Store,
+  tags: Map<string, Resource>,
   subjects: string[],
   ignore: string[],
 ): { subject: string; title: string }[] {
   return subjects
     .filter(v => !ignore.includes(v))
     .map(subject => {
-      const resource = store.getResourceLoading(subject);
+      const resource = tags.get(subject);
       // Same precedence as `useTitle`: the free-text name, else the slug.
       const title =
         resource?.get(core.properties.name) ??
@@ -51,9 +51,11 @@ function SelectCellEdit({
 }: EditCellProps<JSONValue>): JSX.Element {
   const inputRef = useRef<HTMLInputElement>(null);
   const val = (value as string[]) ?? emptyArray;
-  const store = useStore();
   const propertyResource = useResource(property);
   const [allowsOnly] = useArray(propertyResource, core.properties.allowsOnly);
+  // Subscribed, so a tag's title is matched as soon as the tag loads; a tag
+  // still loading has no name to match yet.
+  const tagResources = useResources(allowsOnly);
   const [query, setQuery] = useState('');
 
   // `max` on a SelectProperty caps how many tags may be picked at once — it is
@@ -63,7 +65,7 @@ function SelectCellEdit({
     | number
     | undefined;
 
-  const filteredTags = buildListWithTitles(store, allowsOnly, val)
+  const filteredTags = buildListWithTitles(tagResources, allowsOnly, val)
     .filter(v => v.title.toLowerCase().includes(query.toLowerCase()))
     .map(ft => ft.subject);
 
@@ -101,6 +103,16 @@ function SelectCellEdit({
     onChange(val.filter(tagSubject => tagSubject !== subject));
   };
 
+  const addSelectedTag = () => {
+    const subject = filteredTags[selectedIndex];
+
+    // Nothing matches: there is no tag to add, and the cell keeps its value
+    // rather than being saved with an empty pick.
+    if (subject !== undefined) {
+      handleAddTag(subject);
+    }
+  };
+
   const changeSelection = (mod: number) => {
     setSelectedIndex(prev => loopingIndex(prev + mod, filteredTags.length));
   };
@@ -117,7 +129,7 @@ function SelectCellEdit({
         break;
       case 'Enter':
         e.preventDefault();
-        handleAddTag(filteredTags[selectedIndex]);
+        addSelectedTag();
         break;
     }
   };

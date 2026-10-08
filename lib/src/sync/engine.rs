@@ -1694,6 +1694,103 @@ pub(crate) async fn may_accept_drive_write(
     false
 }
 
+/// Whether a replicated write keeps `merged` where its admission put it:
+/// under `admitted_drive`, the stored drive of an existing resource or the
+/// drive a new one resolves to. `Err` says why not.
+///
+/// `drive` travels in the replicated state like any other property, while
+/// rights, commit fan-out and drive-scoped features (a Form's scope) trust
+/// it. So the merged state may name no other drive. A changed `parent` is a
+/// move, held to what `/commit` demands of one: the new parent is held here,
+/// lies in the admitted drive, and accepts the resource (`append`). The new
+/// parent's drive is the one `/commit` would stamp on the moved resource,
+/// from the parent's whole lineage. Drives compare by `pure_id`, which reads
+/// `did:ad:` and `atomic:` as one spelling.
+pub(crate) async fn check_replicated_placement(
+    store: &Db,
+    existing: Option<&crate::Resource>,
+    merged: &crate::Resource,
+    admitted_drive: &str,
+    for_agent: &crate::agents::ForAgent,
+    trust_owned: bool,
+) -> Result<(), String> {
+    let base_domain = store.get_base_domain();
+    let normalize = |s: &str| crate::Subject::from_raw(s, base_domain.as_deref()).pure_id();
+    let admitted = normalize(admitted_drive);
+    if let Ok(drive) = merged.get(crate::urls::DRIVE_PROP) {
+        if normalize(&drive.to_string()) != admitted {
+            return Err(format!(
+                "{} names drive {drive}, not {admitted_drive} it was admitted for",
+                merged.get_subject()
+            ));
+        }
+    }
+
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    // Detaching keeps the resource in the admitted drive; only a new parent
+    // can place it elsewhere.
+    let Ok(new_parent) = merged.get(crate::urls::PARENT) else {
+        return Ok(());
+    };
+    let new_parent = new_parent.to_string();
+    let old_parent = existing
+        .get(crate::urls::PARENT)
+        .ok()
+        .map(|parent| normalize(&parent.to_string()));
+    if old_parent.as_deref() == Some(normalize(&new_parent).as_str()) {
+        return Ok(());
+    }
+
+    let parent_subject = crate::Subject::from(new_parent.as_str());
+    if store.normalize_subject(&parent_subject).is_external() {
+        return Err(format!(
+            "{} moves under {new_parent}, which is on another server",
+            merged.get_subject()
+        ));
+    }
+    if store.get_resource(&parent_subject).await.is_err() {
+        return Err(format!(
+            "{} moves under {new_parent}, which is not held here",
+            merged.get_subject()
+        ));
+    }
+    // What `/commit` stamps on a resource moved under this parent.
+    let parent_drive = match crate::commit::drive_from_lineage(store, &parent_subject).await {
+        crate::commit::DriveLineage::Drive(drive) => drive,
+        crate::commit::DriveLineage::NoDrive(root) => root,
+        crate::commit::DriveLineage::Unresolved => new_parent.clone(),
+    };
+    if normalize(&parent_drive) != admitted {
+        return Err(format!(
+            "{} moves under {new_parent}, in drive {parent_drive}, not {admitted_drive}",
+            merged.get_subject()
+        ));
+    }
+    if crate::hierarchy::check_append(store, merged, for_agent)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    if trust_owned {
+        if let Ok(own) = store.get_default_agent() {
+            let own_agent = crate::agents::ForAgent::from(own);
+            if crate::hierarchy::check_append(store, merged, &own_agent)
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "{for_agent} may not append to {new_parent}, so cannot move {} under it",
+        merged.get_subject()
+    ))
+}
+
 /// Why a `SYNC_PUSH` was refused as a whole. Distinct from "imported zero
 /// entries" (every entry tombstoned or malformed), which is still a
 /// successful import from the protocol's point of view.
@@ -1987,6 +2084,35 @@ pub async fn import_sync_push(
                 );
                 continue;
             }
+        }
+
+        if let Err(reason) = check_replicated_placement(
+            store,
+            existing_resource.as_ref(),
+            &resource,
+            &push.drive,
+            for_agent,
+            trust_owned,
+        )
+        .await
+        {
+            tracing::warn!("import_sync_push: {reason}; skipped");
+            continue;
+        }
+
+        // An entry is a write like a commit, so it gets the commit path's
+        // blob reference refusal: without it, knowing a hash and having
+        // write on any admitted drive would be enough to read held bytes.
+        if let Err(error) = crate::commit::check_new_blob_references(
+            store,
+            existing_resource.as_ref(),
+            &resource,
+            for_agent,
+        )
+        .await
+        {
+            tracing::warn!("import_sync_push: {error}; skipped");
+            continue;
         }
 
         // Only persist after every scope check succeeds. In particular, a
@@ -2360,6 +2486,650 @@ mod bootstrap_and_sub_tests {
             .get(Tree::LoroSnapshots, subject.as_bytes())
             .unwrap()
             .is_some());
+    }
+
+    const HELD_BYTES: &[u8] = b"alice's private attachment";
+
+    /// Alice's private File references bytes this node holds. Mallory may
+    /// write (and read) only her own drive, which this node admits, and has a
+    /// note there to edit. Blob read auth is on. The node's own agent stays
+    /// the default agent, since that one has root access.
+    struct HeldBytes {
+        db: Db,
+        alice: crate::agents::Agent,
+        alice_drive: String,
+        mallory: crate::agents::Agent,
+        mallory_drive: String,
+        mallory_note: String,
+        hash: [u8; 32],
+        hash_hex: String,
+    }
+
+    async fn held_bytes(id: &str) -> HeldBytes {
+        let db = Db::init_temp(id).await.unwrap();
+        let node_agent = db.get_default_agent().unwrap();
+        let (alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let hash = blake3::hash(HELD_BYTES);
+        let hash_hex = hash.to_hex().to_string();
+        db.put_blob(hash.as_bytes(), HELD_BYTES).await.unwrap();
+        db.create_resource(
+            crate::urls::FILE,
+            &alice_drive,
+            "private.txt",
+            Some(vec![(
+                crate::urls::INTERNAL_ID,
+                crate::Value::String(hash_hex.clone()),
+            )]),
+        )
+        .await
+        .unwrap();
+        let (mallory, mallory_drive) = db.setup("Mallory").await.unwrap();
+        let mallory_note = db
+            .create_resource(crate::urls::FOLDER, &mallory_drive, "note", None)
+            .await
+            .unwrap();
+        db.set_default_agent(node_agent);
+        db.set_require_blob_read_auth(true);
+
+        assert!(
+            crate::hierarchy::check_blob_read(&db, &hash_hex, &ForAgent::from(alice.clone()))
+                .await
+                .is_ok(),
+            "fixture: Alice reads her File's bytes"
+        );
+        assert!(
+            crate::hierarchy::check_blob_read(&db, &hash_hex, &ForAgent::from(mallory.clone()))
+                .await
+                .is_err(),
+            "fixture: Mallory starts without read on the bytes"
+        );
+        HeldBytes {
+            db,
+            alice,
+            alice_drive,
+            mallory,
+            mallory_drive,
+            mallory_note,
+            hash: *hash.as_bytes(),
+            hash_hex,
+        }
+    }
+
+    /// Each way a resource can name blob bytes: `internalId`, `blob`, `chunks`.
+    fn blob_references(hash_hex: &str) -> [(&'static str, &'static str, crate::Value); 3] {
+        let blob = crate::identifiers::blob_subject(hash_hex);
+        [
+            (
+                "internalId",
+                crate::urls::INTERNAL_ID,
+                crate::Value::String(hash_hex.into()),
+            ),
+            (
+                "blob",
+                crate::urls::BLOB,
+                crate::Value::AtomicUrl(blob.as_str().into()),
+            ),
+            (
+                "chunks",
+                crate::urls::CHUNKS,
+                crate::Value::ResourceArray(vec![blob.into()]),
+            ),
+        ]
+    }
+
+    /// Loro snapshot of a new resource directly under `drive`.
+    fn new_entry_in(drive: &str, name: &str, properties: &[(&str, crate::Value)]) -> Vec<u8> {
+        let doc = AtomicLoroDoc::new();
+        doc.set_property(crate::urls::PARENT, &crate::Value::AtomicUrl(drive.into()))
+            .unwrap();
+        doc.set_property(
+            crate::urls::DRIVE_PROP,
+            &crate::Value::AtomicUrl(drive.into()),
+        )
+        .unwrap();
+        doc.set_property(crate::urls::NAME, &crate::Value::String(name.into()))
+            .unwrap();
+        for (property, value) in properties {
+            doc.set_property(property, value).unwrap();
+        }
+        doc.export_snapshot()
+    }
+
+    fn push_of(drive: &str, entries: &[(String, Vec<u8>)]) -> protocol::DecodedSyncPush {
+        let entries: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(subject, bytes)| (subject.as_str(), bytes.as_slice()))
+            .collect();
+        let frame = protocol::encode_sync_push(drive, &entries, true);
+        protocol::decode_sync_push(&frame[1..]).unwrap()
+    }
+
+    /// `/commit` refuses a reference to held bytes its signer cannot read
+    /// (`commit::check_new_blob_references`); a `SYNC_PUSH` entry is the same
+    /// write and must be refused the same way, or knowing a hash plus write
+    /// on any admitted drive is enough to download the bytes. Only the
+    /// offending entry is skipped; the rest of the push still lands.
+    #[tokio::test]
+    async fn sync_push_cannot_reference_held_bytes_the_pusher_cannot_read() {
+        let mut failures = Vec::new();
+        for variant in ["internalId", "blob", "chunks", "edit"] {
+            let f = held_bytes(&format!("sync_push_held_bytes_{variant}")).await;
+            let as_mallory = ForAgent::from(f.mallory.clone());
+            let references = blob_references(&f.hash_hex);
+            let (minted, minted_bytes) = if variant == "edit" {
+                let stored =
+                    f.db.kv
+                        .get(Tree::LoroSnapshots, f.mallory_note.as_bytes())
+                        .unwrap()
+                        .expect("the note has a stored snapshot");
+                let doc = AtomicLoroDoc::from_snapshot(&stored).unwrap();
+                doc.set_property(crate::urls::BLOB, &references[1].2)
+                    .unwrap();
+                (f.mallory_note.clone(), doc.export_snapshot())
+            } else {
+                let (_, property, value) = references
+                    .iter()
+                    .find(|(name, ..)| *name == variant)
+                    .unwrap();
+                (
+                    format!("atomic:sync-push-minted-{variant}"),
+                    new_entry_in(&f.mallory_drive, variant, &[(*property, value.clone())]),
+                )
+            };
+            let companion = "atomic:sync-push-companion".to_string();
+            let snapshot_before = f.db.kv.get(Tree::LoroSnapshots, minted.as_bytes()).unwrap();
+            let push = push_of(
+                &f.mallory_drive,
+                &[
+                    (
+                        companion.clone(),
+                        new_entry_in(&f.mallory_drive, "companion", &[]),
+                    ),
+                    (minted.clone(), minted_bytes),
+                ],
+            );
+
+            let (count, _) = import_sync_push(&push, &f.db, &as_mallory, false)
+                .await
+                .unwrap();
+
+            if count != 1 {
+                failures.push(format!(
+                    "{variant}: imported {count} entries, expected only the companion"
+                ));
+            }
+            if f.db.get_resource(&companion.as_str().into()).await.is_err() {
+                failures.push(format!("{variant}: the harmless companion entry was lost"));
+            }
+            if f.db.kv.get(Tree::LoroSnapshots, minted.as_bytes()).unwrap() != snapshot_before {
+                failures.push(format!(
+                    "{variant}: the refused entry changed the stored snapshot"
+                ));
+            }
+            let stored = f.db.get_resource(&minted.as_str().into()).await.ok();
+            let persisted = match (&stored, variant) {
+                (Some(note), "edit") => note.get(crate::urls::BLOB).is_ok(),
+                (stored, _) => stored.is_some() && variant != "edit",
+            };
+            if persisted {
+                failures.push(format!("{variant}: the minted reference was persisted"));
+            }
+            if let Ok(why) =
+                crate::hierarchy::check_blob_read(&f.db, &f.hash_hex, &as_mallory).await
+            {
+                failures.push(format!(
+                    "{variant}: Mallory may now read the held bytes ({why})"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The download side of the same hole: a reference minted over
+    /// `SYNC_PUSH` must not turn into a `BLOB_REQUEST` answer.
+    #[tokio::test]
+    async fn blob_request_refuses_bytes_reached_through_a_sync_pushed_reference() {
+        let f = held_bytes("blob_request_sync_pushed_reference").await;
+        let entries: Vec<(String, Vec<u8>)> = blob_references(&f.hash_hex)
+            .into_iter()
+            .map(|(name, property, value)| {
+                (
+                    format!("atomic:sync-push-minted-{name}"),
+                    new_entry_in(&f.mallory_drive, name, &[(property, value)]),
+                )
+            })
+            .collect();
+        let push = push_of(&f.mallory_drive, &entries);
+        import_sync_push(&push, &f.db, &ForAgent::from(f.mallory.clone()), false)
+            .await
+            .unwrap();
+
+        let request = protocol::encode_blob_request(&f.hash);
+        let refused = handle_frame(&request, &f.db, &mut ForAgent::from(f.mallory.clone())).await;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0][0],
+            tag::ERROR,
+            "a reference minted over SYNC_PUSH must not grant the bytes"
+        );
+        assert_eq!(
+            protocol::decode_error(&refused[0][1..]).unwrap().code,
+            error_code::UNAUTHORIZED_READ
+        );
+        assert_eq!(
+            handle_frame(&request, &f.db, &mut ForAgent::from(f.alice.clone())).await,
+            vec![protocol::encode_blob_response(&f.hash, HELD_BYTES)],
+            "the File's reader still gets the bytes"
+        );
+    }
+
+    async fn import_count(
+        f: &HeldBytes,
+        drive: &str,
+        entries: &[(String, Vec<u8>)],
+        agent: &ForAgent,
+    ) -> usize {
+        import_sync_push(&push_of(drive, entries), &f.db, agent, false)
+            .await
+            .unwrap()
+            .0
+    }
+
+    fn all_references_entry(drive: &str, hash_hex: &str) -> Vec<(String, Vec<u8>)> {
+        let properties: Vec<(&str, crate::Value)> = blob_references(hash_hex)
+            .into_iter()
+            .map(|(_, property, value)| (property, value))
+            .collect();
+        vec![(
+            "atomic:sync-push-reference".to_string(),
+            new_entry_in(drive, "reference", &properties),
+        )]
+    }
+
+    #[tokio::test]
+    async fn sync_push_lets_a_reader_of_held_bytes_reference_them() {
+        let f = held_bytes("sync_push_reader_references_held_bytes").await;
+        let entries = all_references_entry(&f.alice_drive, &f.hash_hex);
+        let as_alice = ForAgent::from(f.alice.clone());
+        assert_eq!(
+            import_count(&f, &f.alice_drive, &entries, &as_alice).await,
+            1
+        );
+        assert!(f
+            .db
+            .get_resource(&"atomic:sync-push-reference".into())
+            .await
+            .is_ok());
+    }
+
+    /// Bytes not held here yet are the normal upload order (resource first,
+    /// bytes after): such a reference grants nothing and stays allowed.
+    #[tokio::test]
+    async fn sync_push_may_reference_bytes_this_node_does_not_hold() {
+        let f = held_bytes("sync_push_references_unheld_bytes").await;
+        let unheld = blake3::hash(b"bytes this node never received")
+            .to_hex()
+            .to_string();
+        let entries = all_references_entry(&f.mallory_drive, &unheld);
+        let as_mallory = ForAgent::from(f.mallory.clone());
+        assert_eq!(
+            import_count(&f, &f.mallory_drive, &entries, &as_mallory).await,
+            1
+        );
+    }
+
+    /// Without blob read auth the hash itself is the capability.
+    #[tokio::test]
+    async fn sync_push_blob_references_are_unchecked_without_blob_read_auth() {
+        let f = held_bytes("sync_push_references_without_blob_auth").await;
+        f.db.set_require_blob_read_auth(false);
+        let entries = all_references_entry(&f.mallory_drive, &f.hash_hex);
+        let as_mallory = ForAgent::from(f.mallory.clone());
+        assert_eq!(
+            import_count(&f, &f.mallory_drive, &entries, &as_mallory).await,
+            1
+        );
+    }
+
+    /// A list that names the held blob beside another one is matched by the
+    /// read grant member by member, so `SYNC_PUSH` must refuse it like a
+    /// single reference.
+    #[tokio::test]
+    async fn sync_push_cannot_reference_held_bytes_from_a_listed_reference() {
+        let f = held_bytes("sync_push_listed_held_bytes").await;
+        let as_mallory = ForAgent::from(f.mallory.clone());
+        let unheld = blake3::hash(b"listed beside the held bytes")
+            .to_hex()
+            .to_string();
+        let held_blob = crate::identifiers::blob_subject(&f.hash_hex);
+        let unheld_blob = crate::identifiers::blob_subject(&unheld);
+        let cases = [
+            (
+                "blobJsonList",
+                crate::urls::BLOB,
+                crate::Value::String(format!("[\"{unheld_blob}\",\"{held_blob}\"]")),
+            ),
+            (
+                "blobList",
+                crate::urls::BLOB,
+                crate::Value::ResourceArray(vec![
+                    unheld_blob.as_str().into(),
+                    held_blob.as_str().into(),
+                ]),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, property, value) in cases {
+            let minted = format!("atomic:sync-push-listed-{case}");
+            let entries = vec![(
+                minted.clone(),
+                new_entry_in(&f.mallory_drive, case, &[(property, value)]),
+            )];
+            let count = import_count(&f, &f.mallory_drive, &entries, &as_mallory).await;
+            if count != 0 {
+                failures.push(format!("{case}: imported {count} entries"));
+            }
+            if f.db.get_resource(&minted.as_str().into()).await.is_ok() {
+                failures.push(format!("{case}: the listed reference was persisted"));
+            }
+        }
+        if let Ok(why) = crate::hierarchy::check_blob_read(&f.db, &f.hash_hex, &as_mallory).await {
+            failures.push(format!("Mallory may now read the held bytes ({why})"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Mallory's note, edited on top of its stored state.
+    fn mallory_note_edit(f: &HeldBytes, property: &str, value: crate::Value) -> Vec<u8> {
+        let stored =
+            f.db.kv
+                .get(Tree::LoroSnapshots, f.mallory_note.as_bytes())
+                .unwrap()
+                .expect("the note has a stored snapshot");
+        let doc = AtomicLoroDoc::from_snapshot(&stored).unwrap();
+        doc.set_property(property, &value).unwrap();
+        doc.export_snapshot()
+    }
+
+    async fn stored_value(f: &HeldBytes, subject: &str, property: &str) -> Option<String> {
+        f.db.get_resource(&subject.into())
+            .await
+            .ok()?
+            .get(property)
+            .ok()
+            .map(|value| value.to_string())
+    }
+
+    /// Rights, commit fan-out and drive-scoped features (a Form's scope)
+    /// trust a resource's `drive`. A new entry carries it in its state, so
+    /// that state must name the drive the push was admitted for, whatever its
+    /// parent resolves to.
+    #[tokio::test]
+    async fn sync_push_new_entry_cannot_name_another_drive() {
+        let f = held_bytes("sync_push_new_entry_foreign_drive").await;
+        let doc = AtomicLoroDoc::new();
+        doc.set_property(
+            crate::urls::PARENT,
+            &crate::Value::AtomicUrl(f.mallory_drive.as_str().into()),
+        )
+        .unwrap();
+        doc.set_property(
+            crate::urls::DRIVE_PROP,
+            &crate::Value::AtomicUrl(f.alice_drive.as_str().into()),
+        )
+        .unwrap();
+        let forged = "atomic:sync-push-forged-drive".to_string();
+        let entries = vec![(forged.clone(), doc.export_snapshot())];
+
+        let count = import_count(
+            &f,
+            &f.mallory_drive,
+            &entries,
+            &ForAgent::from(f.mallory.clone()),
+        )
+        .await;
+
+        assert_eq!(count, 0, "an entry naming another drive is skipped");
+        assert!(f.db.get_resource(&forged.as_str().into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_push_edit_cannot_restamp_an_entry_into_another_drive() {
+        let f = held_bytes("sync_push_edit_foreign_drive").await;
+        let entries = vec![(
+            f.mallory_note.clone(),
+            mallory_note_edit(
+                &f,
+                crate::urls::DRIVE_PROP,
+                crate::Value::AtomicUrl(f.alice_drive.as_str().into()),
+            ),
+        )];
+
+        let count = import_count(
+            &f,
+            &f.mallory_drive,
+            &entries,
+            &ForAgent::from(f.mallory.clone()),
+        )
+        .await;
+
+        assert_eq!(count, 0, "an edit naming another drive is skipped");
+        assert_eq!(
+            stored_value(&f, &f.mallory_note, crate::urls::DRIVE_PROP)
+                .await
+                .as_deref(),
+            Some(f.mallory_drive.as_str())
+        );
+    }
+
+    /// A changed `parent` is a move. `/commit` demands `append` on the new
+    /// parent for one; a `SYNC_PUSH` edit must not be a way around that.
+    #[tokio::test]
+    async fn sync_push_cannot_move_an_entry_under_a_parent_the_pusher_may_not_append_to() {
+        let f = held_bytes("sync_push_move_without_append").await;
+        let entries = vec![(
+            f.mallory_note.clone(),
+            mallory_note_edit(
+                &f,
+                crate::urls::PARENT,
+                crate::Value::AtomicUrl(f.alice_drive.as_str().into()),
+            ),
+        )];
+
+        let count = import_count(
+            &f,
+            &f.mallory_drive,
+            &entries,
+            &ForAgent::from(f.mallory.clone()),
+        )
+        .await;
+
+        assert_eq!(count, 0, "the move is skipped");
+        assert_eq!(
+            stored_value(&f, &f.mallory_note, crate::urls::PARENT)
+                .await
+                .as_deref(),
+            Some(f.mallory_drive.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_push_may_move_an_entry_within_its_drive() {
+        let f = held_bytes("sync_push_move_within_drive").await;
+        let folder =
+            f.db.create_resource(crate::urls::FOLDER, &f.mallory_drive, "elsewhere", None)
+                .await
+                .unwrap();
+        let entries = vec![(
+            f.mallory_note.clone(),
+            mallory_note_edit(
+                &f,
+                crate::urls::PARENT,
+                crate::Value::AtomicUrl(folder.as_str().into()),
+            ),
+        )];
+
+        let count = import_count(
+            &f,
+            &f.mallory_drive,
+            &entries,
+            &ForAgent::from(f.mallory.clone()),
+        )
+        .await;
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            stored_value(&f, &f.mallory_note, crate::urls::PARENT)
+                .await
+                .as_deref(),
+            Some(folder.as_str())
+        );
+    }
+
+    /// A v1 genesis certificate carries `drive` as it was signed, `did:ad:`
+    /// for every pre-rename resource, and a resource whose drive is only in
+    /// its certificate materializes that spelling. It names the same drive as
+    /// the `atomic:` one a push is admitted for, as `/commit` already treats
+    /// it, so an edit of that resource is not refused for the spelling
+    /// (`Subject::pure_id`, which both drive checks compare by, reads the two
+    /// spellings as one).
+    #[tokio::test]
+    async fn sync_push_edit_keeps_a_drive_named_only_by_a_legacy_certificate() {
+        let f = held_bytes("sync_push_legacy_certificate_drive").await;
+        let legacy = crate::identifiers::to_legacy_scheme(
+            &crate::identifiers::canonicalize_scheme(&f.mallory_drive),
+        );
+        let signer_pubkey: [u8; 32] = crate::agents::decode_base64(&f.mallory.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let cert = crate::genesis::GenesisCert {
+            signer_pubkey,
+            created_at: 1,
+            nonce: [7u8; 16],
+            state_hash: None,
+            parent: legacy.clone(),
+            drive: legacy.clone(),
+        };
+        let signature = cert
+            .sign(f.mallory.private_key.as_deref().unwrap())
+            .unwrap();
+        let subject = crate::genesis::GenesisCert::subject_for_signature(&signature);
+        let doc = AtomicLoroDoc::new();
+        doc.set_property(
+            crate::urls::GENESIS,
+            &crate::Value::String(crate::agents::encode_base64(&cert.encode())),
+        )
+        .unwrap();
+        doc.set_property(crate::urls::NAME, &crate::Value::String("Legacy".into()))
+            .unwrap();
+        let mut stored = crate::Resource::new(subject.clone());
+        stored.apply_state_doc(doc).unwrap();
+        f.db.add_resource_opts(&stored, false, true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_value(&f, &subject, crate::urls::DRIVE_PROP)
+                .await
+                .as_deref(),
+            Some(legacy.as_str()),
+            "fixture: the drive comes from the certificate, in its legacy spelling"
+        );
+
+        let snapshot =
+            f.db.kv
+                .get(Tree::LoroSnapshots, subject.as_bytes())
+                .unwrap()
+                .expect("fixture: the resource has a stored snapshot");
+        let edit = AtomicLoroDoc::from_snapshot(&snapshot).unwrap();
+        edit.set_property(crate::urls::NAME, &crate::Value::String("Renamed".into()))
+            .unwrap();
+        let entries = vec![(subject.clone(), edit.export_snapshot())];
+
+        let count = import_count(
+            &f,
+            &f.mallory_drive,
+            &entries,
+            &ForAgent::from(f.mallory.clone()),
+        )
+        .await;
+
+        assert_eq!(count, 1, "the same drive, spelled the legacy way, is kept");
+        assert_eq!(
+            stored_value(&f, &subject, crate::urls::NAME)
+                .await
+                .as_deref(),
+            Some("Renamed")
+        );
+    }
+
+    /// `/commit` derives a moved resource's drive from the new parent's whole
+    /// lineage, so a folder without a `drive` stamp of its own is in the drive
+    /// its ancestors name. A `SYNC_PUSH` move into it must be judged the same.
+    #[tokio::test]
+    async fn sync_push_may_move_an_entry_into_an_unstamped_folder_of_its_drive() {
+        let f = held_bytes("sync_push_move_into_unstamped_folder").await;
+        let stamped =
+            f.db.create_resource(crate::urls::FOLDER, &f.mallory_drive, "stamped", None)
+                .await
+                .unwrap();
+        let unstamped = "atomic:sync-push-unstamped-folder";
+        let mut folder = crate::Resource::new(unstamped.into());
+        folder
+            .set_unsafe(
+                crate::urls::PARENT.into(),
+                crate::Value::AtomicUrl(stamped.as_str().into()),
+            )
+            .unwrap();
+        folder
+            .set_unsafe(
+                crate::urls::IS_A.into(),
+                crate::Value::ResourceArray(vec![crate::urls::FOLDER.into()]),
+            )
+            .unwrap();
+        f.db.add_resource_opts(&folder, false, true, true)
+            .await
+            .unwrap();
+        assert!(
+            stored_value(&f, unstamped, crate::urls::DRIVE_PROP)
+                .await
+                .is_none(),
+            "fixture: the folder carries no drive stamp"
+        );
+        let entries = vec![(
+            f.mallory_note.clone(),
+            mallory_note_edit(
+                &f,
+                crate::urls::PARENT,
+                crate::Value::AtomicUrl(unstamped.into()),
+            ),
+        )];
+
+        let count = import_count(
+            &f,
+            &f.mallory_drive,
+            &entries,
+            &ForAgent::from(f.mallory.clone()),
+        )
+        .await;
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            stored_value(&f, &f.mallory_note, crate::urls::PARENT)
+                .await
+                .as_deref(),
+            Some(unstamped)
+        );
+    }
+
+    #[tokio::test]
+    async fn sudo_sync_push_may_reference_held_bytes() {
+        let f = held_bytes("sync_push_sudo_references_held_bytes").await;
+        let entries = all_references_entry(&f.mallory_drive, &f.hash_hex);
+        assert_eq!(
+            import_count(&f, &f.mallory_drive, &entries, &ForAgent::Sudo).await,
+            1
+        );
     }
 
     #[tokio::test]

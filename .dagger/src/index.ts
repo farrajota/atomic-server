@@ -2058,6 +2058,9 @@ export class AtomicServer {
 
     if (e2e)
       runtime = runtime
+        // Specs run against the blob policy production uses: download URLs
+        // are answered only for a reader of a referencing resource.
+        .withEnvVariable('ATOMIC_REQUIRE_BLOB_AUTH', 'true')
         // Website publishing is off until the server is given a site origin,
         // and the website specs then get a "hosting is disabled" toast that
         // also sits over the preview and swallows clicks meant for it. The

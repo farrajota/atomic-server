@@ -108,27 +108,25 @@ pub struct CommitApplied {
     pub imported_pending_ops: bool,
 }
 
-/// The BLAKE3 hashes (lowercase hex) of the blob bytes `resource` names: its
-/// `internalId` when that is a hash, its `blob`, and each of its `chunks`.
+/// The blob hashes (lowercased) `resource` names through `internalId`, `blob`
+/// or `chunks`. Read from exactly the strings the read grant
+/// ([`crate::hierarchy::check_blob_read`]) matches a reference by, the
+/// property's reference index strings, so every member of a list counts: any
+/// one of them grants read of the bytes it names. A member is a reference when
+/// it is a bare 64-character hex hash or an `atomic:blob:` identifier. A hash
+/// that does not decode is kept, so the caller can refuse it.
 fn referenced_blob_hashes(resource: &Resource) -> std::collections::BTreeSet<String> {
     let mut hashes = std::collections::BTreeSet::new();
-    if let Ok(id) = resource.get(urls::INTERNAL_ID) {
-        let id = id.to_string().to_ascii_lowercase();
-        if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            hashes.insert(id);
-        }
-    }
-    let mut add_blob_ref = |reference: String| {
-        if let Some(hash) = crate::identifiers::blob_hash_hex(&reference) {
-            hashes.insert(hash.to_ascii_lowercase());
-        }
-    };
-    if let Ok(blob) = resource.get(urls::BLOB) {
-        add_blob_ref(blob.to_string());
-    }
-    if let Ok(chunks) = resource.get(urls::CHUNKS).and_then(|v| v.to_subjects(None)) {
-        for chunk in chunks {
-            add_blob_ref(chunk);
+    for property in [urls::INTERNAL_ID, urls::BLOB, urls::CHUNKS] {
+        let Ok(value) = resource.get(property) else {
+            continue;
+        };
+        for reference in value.to_reference_index_strings().unwrap_or_default() {
+            if let Some(hash) = crate::identifiers::blob_hash_hex(&reference) {
+                hashes.insert(hash.to_ascii_lowercase());
+            } else if reference.len() == 64 && reference.bytes().all(|b| b.is_ascii_hexdigit()) {
+                hashes.insert(reference.to_ascii_lowercase());
+            }
         }
     }
     hashes
@@ -142,7 +140,7 @@ fn referenced_blob_hashes(resource: &Resource) -> std::collections::BTreeSet<Str
 /// read the bytes. References to bytes not held here yet are the normal
 /// upload order (commit, then `PUT /blob`) and stay allowed. Without the
 /// flag the hash itself is the capability, so a reference grants nothing.
-async fn check_new_blob_references(
+pub(crate) async fn check_new_blob_references(
     store: &impl Storelike,
     resource_old: Option<&Resource>,
     resource_new: &Resource,
@@ -153,8 +151,16 @@ async fn check_new_blob_references(
     }
     let before = resource_old.map(referenced_blob_hashes).unwrap_or_default();
     for hash in referenced_blob_hashes(resource_new).difference(&before) {
-        let Ok(hash_bytes) = hex::decode(hash) else {
-            continue;
+        // A reference that cannot be decoded cannot be checked against the
+        // bytes it might name, so it is refused rather than let through.
+        let hash_bytes = match hex::decode(hash) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            _ => {
+                return Err(crate::errors::AtomicError::unauthorized(format!(
+                    "{} references blob {hash}, which is not a BLAKE3 hash.",
+                    resource_new.get_subject()
+                )))
+            }
         };
         if !store.has_blob_bytes(&hash_bytes).await? {
             continue;
@@ -326,17 +332,15 @@ impl Commit {
         // Race-free rights: stamp the resource's `drive` at genesis so a child's
         // rights check can consult the (stable) drive grant directly instead of
         // walking a parent chain that may not be materialized yet under
-        // concurrent creation (the parent-before-child 401 race). The drive is
-        // the parent's drive, or the parent itself when the parent is a drive
-        // root. Top-level resources (no parent) ARE their own drive — skip.
+        // concurrent creation (the parent-before-child 401 race). The drive
+        // comes from the parent's lineage; when that names none, `drive` stays
+        // unset and rights walk the parent chain. Top-level resources (no
+        // parent) ARE their own drive — skip.
         if !commit_builder.set.contains_key(urls::DRIVE_PROP) {
             if let Some(parent_val) = commit_builder.set.get(urls::PARENT).cloned() {
                 let parent_subject = crate::Subject::from(parent_val.to_string());
-                if let Ok(parent_res) = store.get_resource(&parent_subject).await {
-                    let drive = match parent_res.get(urls::DRIVE_PROP) {
-                        Ok(d) => d.to_string(),
-                        Err(_) => parent_subject.to_string(),
-                    };
+                if let DriveLineage::Drive(drive) = drive_from_lineage(store, &parent_subject).await
+                {
                     commit_builder.set.insert(
                         urls::DRIVE_PROP.into(),
                         crate::values::Value::AtomicUrl(drive.into()),
@@ -1125,22 +1129,101 @@ impl Commit {
             // needs in order to route to the owning drive's subscribers. See
             // planning/commit-fanout-drive-isolation.md.
             let parent_changed = applied.changed_props.iter().any(|p| p == urls::PARENT);
+            // A commit that rewrites `drive` itself gets it re-derived too:
+            // otherwise an edit could stamp a resource into any drive, and
+            // whatever trusts the stamp (the rights shortcut, fan-out, a
+            // Form's scope) would treat it as that drive's.
+            let stamp_of = |resource: &Resource| {
+                resource
+                    .get(urls::DRIVE_PROP)
+                    .ok()
+                    .map(|drive| crate::identifiers::canonicalize_scheme(&drive.to_string()))
+            };
+            let drive_changed =
+                !is_new && stamp_of(&resource_old) != stamp_of(&applied.resource_new);
 
-            if is_new || parent_changed {
+            if is_new || parent_changed || drive_changed {
+                // No parent, no lineage: the resource is its own drive. A
+                // stamp naming another one stands only when the signer may
+                // append to that drive, the test `check_append` applies to a
+                // claimed drive when the parent is missing.
+                if applied.resource_new.get(urls::PARENT).is_err() {
+                    if let Some(claimed) = stamp_of(&applied.resource_new) {
+                        let own =
+                            crate::identifiers::canonicalize_scheme(&commit.subject.to_string());
+                        if claimed != own
+                            && !claimed_drive_is_appendable(
+                                store,
+                                &applied.resource_new,
+                                &validate_for.into(),
+                            )
+                            .await
+                        {
+                            applied.resource_new.set_unsafe(
+                                urls::DRIVE_PROP.into(),
+                                crate::values::Value::AtomicUrl(commit.subject.to_string().into()),
+                            )?;
+                        }
+                    }
+                }
                 if let Ok(parent_val) = applied.resource_new.get(urls::PARENT) {
                     let parent_subject = crate::Subject::from(parent_val.to_string());
 
-                    // If the parent isn't materialized here we cannot derive the
-                    // drive. Leave whatever was stamped rather than clearing it.
-                    if let Ok(parent_res) = store.get_resource(&parent_subject).await {
-                        let drive = match parent_res.get(urls::DRIVE_PROP) {
-                            Ok(d) => d.to_string(),
-                            Err(_) => parent_subject.to_string(),
-                        };
-                        applied.resource_new.set_unsafe(
-                            urls::DRIVE_PROP.into(),
-                            crate::values::Value::AtomicUrl(drive.into()),
-                        )?;
+                    // What replaces a stamp the lineage does not back. Replaced,
+                    // not removed: a genesis certificate's `drive` is
+                    // materialized again whenever no stored value overrides it.
+                    let replacement = match drive_from_lineage(store, &parent_subject).await {
+                        DriveLineage::Drive(drive) => {
+                            applied.resource_new.set_unsafe(
+                                urls::DRIVE_PROP.into(),
+                                crate::values::Value::AtomicUrl(drive.into()),
+                            )?;
+                            None
+                        }
+                        // The whole chain is here and names no drive. A stamp
+                        // from a previous home (or a claimed one) would keep
+                        // that drive's grants; the root is what such a tree was
+                        // stamped with before roots had to be Drives.
+                        DriveLineage::NoDrive(root) => Some(root),
+                        // The lineage is not all here, so the drive cannot be
+                        // derived. A claimed stamp (a new resource's, or one an
+                        // edit wrote) stands in for it only when the signer may
+                        // append to that drive, the test `check_append` applies
+                        // when the parent itself is missing. Otherwise an edit
+                        // keeps the stamp it had, and a new resource or a move
+                        // gets the parent, as before lineage was followed.
+                        DriveLineage::Unresolved => {
+                            let claim_holds = (is_new || !parent_changed)
+                                && claimed_drive_is_appendable(
+                                    store,
+                                    &applied.resource_new,
+                                    &validate_for.into(),
+                                )
+                                .await;
+                            if claim_holds {
+                                None
+                            } else if !is_new && !parent_changed {
+                                // Only `drive` changed: it keeps the stamp it
+                                // had, as nothing new can be derived.
+                                match resource_old.get(urls::DRIVE_PROP) {
+                                    Ok(old) => Some(old.to_string()),
+                                    Err(_) => {
+                                        applied.resource_new.remove_propval(urls::DRIVE_PROP)?;
+                                        None
+                                    }
+                                }
+                            } else {
+                                Some(parent_subject.to_string())
+                            }
+                        }
+                    };
+                    if let Some(replacement) = replacement {
+                        if applied.resource_new.get(urls::DRIVE_PROP).is_ok() {
+                            applied.resource_new.set_unsafe(
+                                urls::DRIVE_PROP.into(),
+                                crate::values::Value::AtomicUrl(replacement.into()),
+                            )?;
+                        }
                     }
                 }
             }
@@ -1162,12 +1245,7 @@ impl Commit {
                 let res = &applied.resource_new;
                 let is_agent = commit.subject.is_agent_did();
                 if !is_agent {
-                    // The drive this resource belongs to: its `drive` stamp, or
-                    // (a drive root / top-level resource) its own subject.
-                    let drive_subject = res
-                        .get(urls::DRIVE_PROP)
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|_| res.get_subject().to_string());
+                    let drive_subject = admission_drive(store, res).await;
                     match store.sync_policy().admit_decision(&drive_subject) {
                         crate::sync::policy::AdmitDecision::Admitted => {}
                         crate::sync::policy::AdmitDecision::NotEnrolled => {
@@ -1824,6 +1902,102 @@ pub fn sign_message(message: &str, private_key: &str, public_key: &str) -> Atomi
 
 /// The amount of milliseconds that a Commit signature is valid for.
 const ACCEPTABLE_TIME_DIFFERENCE: i64 = 10000;
+
+/// Longest `parent` chain followed when deriving a resource's drive.
+const MAX_DRIVE_LINEAGE: usize = 32;
+
+/// What a resource's `parent` chain says about its drive.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DriveLineage {
+    /// The nearest ancestor's explicit `drive`, or the nearest ancestor that
+    /// is itself a Drive.
+    Drive(String),
+    /// Every ancestor resolved and the chain ended, at this parentless root,
+    /// without naming a drive.
+    NoDrive(String),
+    /// An ancestor is not materialized here or lives on another server, or
+    /// the chain loops or runs past [`MAX_DRIVE_LINEAGE`]: nothing can be
+    /// concluded.
+    Unresolved,
+}
+
+/// The drive a child of `parent` belongs to, from real lineage. An ancestor
+/// that is neither a Drive nor carries a `drive` is never promoted to one: that
+/// would hand its grants to everything created under it.
+pub(crate) async fn drive_from_lineage(store: &impl Storelike, parent: &Subject) -> DriveLineage {
+    let mut current = parent.clone();
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_DRIVE_LINEAGE {
+        let normalized = store.normalize_subject(&current);
+        // A resource on another server says what it likes about its drive and
+        // grants, so no lineage through one is vouched for here.
+        if normalized.is_external() || !seen.insert(normalized.pure_id()) {
+            return DriveLineage::Unresolved;
+        }
+        let Ok(resource) = store.get_resource(&current).await else {
+            return DriveLineage::Unresolved;
+        };
+        if let Ok(drive) = resource.get(urls::DRIVE_PROP) {
+            return DriveLineage::Drive(drive.to_string());
+        }
+        let is_drive = resource
+            .get(urls::IS_A)
+            .ok()
+            .and_then(|classes| classes.to_subjects(None).ok())
+            .is_some_and(|classes| classes.iter().any(|c| c == urls::DRIVE));
+        if is_drive {
+            return DriveLineage::Drive(current.to_string());
+        }
+        let Ok(next) = resource.get(urls::PARENT) else {
+            return DriveLineage::NoDrive(current.to_string());
+        };
+        current = Subject::from(next.to_string());
+    }
+    DriveLineage::Unresolved
+}
+
+/// Whether `resource`'s claimed `drive` is one `agent` may append to. A
+/// stamp naming the resource itself, a drive not on this node, or one on
+/// another server proves nothing.
+async fn claimed_drive_is_appendable(
+    store: &impl Storelike,
+    resource: &Resource,
+    agent: &crate::agents::ForAgent,
+) -> bool {
+    let Ok(claimed) = resource.get(urls::DRIVE_PROP) else {
+        return false;
+    };
+    let drive_subject = Subject::from(claimed.to_string());
+    if &drive_subject == resource.get_subject()
+        || store.normalize_subject(&drive_subject).is_external()
+    {
+        return false;
+    }
+    let Ok(drive) = store.get_resource(&drive_subject).await else {
+        return false;
+    };
+    crate::hierarchy::check_rights(store, &drive, agent, crate::hierarchy::Right::Append)
+        .await
+        .is_ok()
+}
+
+/// The drive a write is admitted under: its `drive` stamp; else the drive its
+/// lineage names, or the root that lineage ends at when no Drive is on it (the
+/// unit such a tree was enrolled and accounted as back when that root was
+/// stamped as its drive); else (a drive root / top-level resource) its own
+/// subject.
+async fn admission_drive(store: &impl Storelike, resource: &Resource) -> String {
+    if let Ok(drive) = resource.get(urls::DRIVE_PROP) {
+        return drive.to_string();
+    }
+    if let Ok(parent) = resource.get(urls::PARENT) {
+        match drive_from_lineage(store, &Subject::from(parent.to_string())).await {
+            DriveLineage::Drive(drive) | DriveLineage::NoDrive(drive) => return drive,
+            DriveLineage::Unresolved => {}
+        }
+    }
+    resource.get_subject().to_string()
+}
 
 #[cfg(test)]
 mod test {
@@ -2879,6 +3053,519 @@ mod test {
         assert!(
             result.is_err(),
             "a spoofed IS_A: [Agent] tag must not bypass the drive-enrollment gate"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    fn rights_checked(agent: &crate::agents::Agent) -> CommitOpts {
+        CommitOpts {
+            validate_signature: true,
+            validate_timestamp: false,
+            validate_rights: true,
+            validate_for_agent: Some(agent.subject.to_string()),
+            update_index: true,
+            ..CommitOpts::no_validations_no_index()
+        }
+    }
+
+    /// A folder `owner` may write whose lineage cannot be resolved here: its
+    /// parent is not on this node.
+    #[cfg(feature = "db")]
+    async fn folder_with_missing_ancestor(db: &crate::Db, subject: &str, owner: &str) {
+        let mut folder = Resource::new(subject.into());
+        folder
+            .set_unsafe(
+                urls::IS_A.into(),
+                Value::ResourceArray(vec![urls::FOLDER.to_string().into()]),
+            )
+            .unwrap();
+        folder
+            .set_unsafe(
+                urls::PARENT.into(),
+                Value::AtomicUrl("internal:/not-on-this-node".into()),
+            )
+            .unwrap();
+        folder
+            .set_unsafe(
+                urls::WRITE.into(),
+                Value::ResourceArray(vec![owner.to_string().into()]),
+            )
+            .unwrap();
+        db.add_resource_opts(&folder, false, true, true)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "db")]
+    async fn genesis_under(
+        db: &crate::Db,
+        agent: &crate::agents::Agent,
+        parent: &str,
+        claimed_drive: &str,
+    ) -> AtomicResult<String> {
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(urls::PARENT.into(), Value::AtomicUrl(parent.into()));
+        builder.set(
+            urls::DRIVE_PROP.into(),
+            Value::AtomicUrl(claimed_drive.into()),
+        );
+        let commit = Commit::create_did(builder, agent, db).await?;
+        let subject = commit.subject.to_string();
+        db.apply_commit(commit, &rights_checked(agent)).await?;
+        Ok(subject)
+    }
+
+    #[cfg(feature = "db")]
+    async fn stored_drive(db: &crate::Db, subject: &str) -> Option<String> {
+        db.get_resource(&subject.into())
+            .await
+            .unwrap()
+            .get(urls::DRIVE_PROP)
+            .ok()
+            .map(|drive| drive.to_string())
+    }
+
+    /// With the lineage unresolvable, a claimed `drive` is only kept when the
+    /// signer may append to that drive, as `check_append` demands when the
+    /// parent itself is missing. Otherwise anyone could place a resource in
+    /// someone else's drive for drive-scoped logic.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn unresolved_lineage_keeps_a_claimed_drive_only_for_its_appenders() {
+        let db = crate::Db::init_temp("unresolved_lineage_claim")
+            .await
+            .unwrap();
+        let (alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let mallory = db.create_agent(Some("Mallory")).await.unwrap();
+
+        let mallory_folder = "internal:/mallory-unresolved";
+        folder_with_missing_ancestor(&db, mallory_folder, &mallory.subject.to_string()).await;
+        let forged = genesis_under(&db, &mallory, mallory_folder, &alice_drive)
+            .await
+            .unwrap();
+        assert_ne!(
+            stored_drive(&db, &forged).await.as_deref(),
+            Some(alice_drive.as_str()),
+            "a drive the signer cannot append to is not kept"
+        );
+
+        let alice_folder = "internal:/alice-unresolved";
+        folder_with_missing_ancestor(&db, alice_folder, &alice.subject.to_string()).await;
+        let own = genesis_under(&db, &alice, alice_folder, &alice_drive)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_drive(&db, &own).await.as_deref(),
+            Some(alice_drive.as_str()),
+            "the drive's own appender keeps the stamp"
+        );
+    }
+
+    /// A DID resource `alice` creates in her drive, with the drive stamped.
+    #[cfg(feature = "db")]
+    async fn in_drive(db: &crate::Db, alice: &crate::agents::Agent, drive: &str) -> String {
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(urls::PARENT.into(), Value::AtomicUrl(drive.into()));
+        let commit = Commit::create_did(builder, alice, db).await.unwrap();
+        let subject = commit.subject.to_string();
+        db.apply_commit(commit, &rights_checked(alice))
+            .await
+            .unwrap();
+        assert_eq!(stored_drive(db, &subject).await.as_deref(), Some(drive));
+        subject
+    }
+
+    #[cfg(feature = "db")]
+    async fn move_under(
+        db: &crate::Db,
+        agent: &crate::agents::Agent,
+        subject: &str,
+        new_parent: &str,
+    ) {
+        let mut resource = db.get_resource(&subject.into()).await.unwrap();
+        resource
+            .set_unsafe(urls::PARENT.into(), Value::AtomicUrl(new_parent.into()))
+            .unwrap();
+        let commit = resource
+            .get_commit_builder()
+            .clone()
+            .sign(agent, db, &resource)
+            .await
+            .unwrap();
+        db.apply_commit(commit, &rights_checked(agent))
+            .await
+            .unwrap();
+    }
+
+    /// Moving a resource under a lineage that does not resolve here drops the
+    /// stamp of the drive it left, so it does not keep that drive's grants.
+    /// The genesis certificate still names the old drive, so the stamp is
+    /// replaced (by the new parent) rather than removed.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn moving_into_an_unresolved_lineage_drops_the_old_drive() {
+        let db = crate::Db::init_temp("unresolved_lineage_move")
+            .await
+            .unwrap();
+        let (alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let moved = in_drive(&db, &alice, &alice_drive).await;
+
+        let elsewhere = "internal:/alice-elsewhere";
+        folder_with_missing_ancestor(&db, elsewhere, &alice.subject.to_string()).await;
+        move_under(&db, &alice, &moved, elsewhere).await;
+
+        assert_eq!(stored_drive(&db, &moved).await.as_deref(), Some(elsewhere));
+    }
+
+    /// The same for a lineage that is all here but ends at a root that is not
+    /// a Drive: the stamp becomes that root, never the drive it left.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn moving_into_an_undriven_lineage_drops_the_old_drive() {
+        let db = crate::Db::init_temp("undriven_lineage_move").await.unwrap();
+        let (alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let moved = in_drive(&db, &alice, &alice_drive).await;
+
+        let root = "internal:/alice-untyped-root";
+        let mut root_resource = Resource::new(root.into());
+        root_resource
+            .set_unsafe(
+                urls::WRITE.into(),
+                Value::ResourceArray(vec![alice.subject.to_string().into()]),
+            )
+            .unwrap();
+        db.add_resource_opts(&root_resource, false, true, true)
+            .await
+            .unwrap();
+        move_under(&db, &alice, &moved, root).await;
+
+        assert_eq!(stored_drive(&db, &moved).await.as_deref(), Some(root));
+    }
+
+    /// `drive` is derived from the lineage, never taken from a commit. Rights,
+    /// fan-out and drive-scoped features (a Form's scope) trust it, so an edit
+    /// that only rewrites it must not place the resource in another drive.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn an_edit_cannot_restamp_a_resource_into_another_drive() {
+        let db = crate::Db::init_temp("edit_restamps_drive").await.unwrap();
+        let (_alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let (mallory, mallory_drive) = db.setup("Mallory").await.unwrap();
+        let note = in_drive(&db, &mallory, &mallory_drive).await;
+
+        let mut resource = db.get_resource(&note.as_str().into()).await.unwrap();
+        resource
+            .set_unsafe(
+                urls::DRIVE_PROP.into(),
+                Value::AtomicUrl(alice_drive.as_str().into()),
+            )
+            .unwrap();
+        let commit = resource
+            .get_commit_builder()
+            .clone()
+            .sign(&mallory, &db, &resource)
+            .await
+            .unwrap();
+        db.apply_commit(commit, &rights_checked(&mallory))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_drive(&db, &note).await.as_deref(),
+            Some(mallory_drive.as_str())
+        );
+    }
+
+    /// Without a parent there is no lineage to derive a drive from: the
+    /// resource is its own, unless the signer may append to the drive it names.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_parentless_resource_cannot_claim_another_drive() {
+        let db = crate::Db::init_temp("parentless_drive_claim")
+            .await
+            .unwrap();
+        let (_alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let mallory = db.create_agent(Some("Mallory")).await.unwrap();
+
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(
+            urls::DRIVE_PROP.into(),
+            Value::AtomicUrl(alice_drive.as_str().into()),
+        );
+        builder.set(urls::NAME.into(), Value::String("orphan".into()));
+        let commit = Commit::create_did(builder, &mallory, &db).await.unwrap();
+        let subject = commit.subject.to_string();
+        db.apply_commit(commit, &rights_checked(&mallory))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            stored_drive(&db, &subject).await.as_deref(),
+            Some(alice_drive.as_str())
+        );
+    }
+
+    /// A resource on another server says whatever it likes about its drive,
+    /// so a lineage through one is not a lineage this node can vouch for.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn an_external_parent_does_not_lend_its_drive() {
+        let db = crate::Db::init_temp("external_parent_drive").await.unwrap();
+        let (_alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let mallory = db.create_agent(Some("Mallory")).await.unwrap();
+
+        let external = "https://elsewhere.example/folder";
+        let mut parent = Resource::new(external.into());
+        parent
+            .set_unsafe(
+                urls::DRIVE_PROP.into(),
+                Value::AtomicUrl(alice_drive.as_str().into()),
+            )
+            .unwrap();
+        parent
+            .set_unsafe(
+                urls::WRITE.into(),
+                Value::ResourceArray(vec![mallory.subject.to_string().into()]),
+            )
+            .unwrap();
+        db.add_resource_opts(&parent, false, true, true)
+            .await
+            .unwrap();
+
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(urls::PARENT.into(), Value::AtomicUrl(external.into()));
+        let commit = Commit::create_did(builder, &mallory, &db).await.unwrap();
+        let subject = commit.subject.to_string();
+        db.apply_commit(commit, &rights_checked(&mallory))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            stored_drive(&db, &subject).await.as_deref(),
+            Some(alice_drive.as_str())
+        );
+    }
+
+    /// A genesis whose certificate names `cert_drive` while the document
+    /// carries no `drive` value; reads fill `drive` in from the certificate.
+    #[cfg(feature = "db")]
+    async fn genesis_with_cert_drive(
+        db: &crate::Db,
+        agent: &crate::agents::Agent,
+        parent: &str,
+        cert_drive: &str,
+    ) -> AtomicResult<String> {
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(urls::PARENT.into(), Value::AtomicUrl(parent.into()));
+        let signer_pubkey: [u8; 32] = decode_base64(&agent.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let cert = crate::genesis::GenesisCert::new_v2(
+            signer_pubkey,
+            crate::utils::now(),
+            rand::random(),
+            None,
+            parent,
+            cert_drive,
+        );
+        let commit = Commit::create_did_with_cert(builder, agent, db, Some(cert)).await?;
+        let signed_doc =
+            crate::loro::AtomicLoroDoc::from_snapshot(commit.loro_update.as_ref().unwrap())?;
+        assert!(
+            !signed_doc
+                .get_all_properties()
+                .contains_key(urls::DRIVE_PROP),
+            "precondition: only the certificate names a drive"
+        );
+        let subject = commit.subject.to_string();
+        db.apply_commit(commit, &rights_checked(agent)).await?;
+        Ok(subject)
+    }
+
+    /// The claim may also sit only in the genesis certificate. It is held to
+    /// the same test as a stored one, whether the lineage is unresolved or
+    /// ends without a Drive; an empty certificate drive stays accepted.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_drive_claimed_only_by_the_certificate_needs_append_on_it() {
+        let db = crate::Db::init_temp("cert_only_drive_claim").await.unwrap();
+        let (alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let mallory = db.create_agent(Some("Mallory")).await.unwrap();
+        let mallory_subject = mallory.subject.to_string();
+
+        let unresolved = "internal:/mallory-cert-unresolved";
+        folder_with_missing_ancestor(&db, unresolved, &mallory_subject).await;
+        let undriven = "internal:/mallory-cert-root";
+        let mut root = Resource::new(undriven.into());
+        root.set_unsafe(
+            urls::WRITE.into(),
+            Value::ResourceArray(vec![mallory_subject.clone().into()]),
+        )
+        .unwrap();
+        db.add_resource_opts(&root, false, true, true)
+            .await
+            .unwrap();
+
+        for parent in [unresolved, undriven] {
+            let forged = genesis_with_cert_drive(&db, &mallory, parent, &alice_drive)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored_drive(&db, &forged).await.as_deref(),
+                Some(parent),
+                "under {parent}, the certificate's drive is not taken"
+            );
+            let unclaimed = genesis_with_cert_drive(&db, &mallory, parent, "")
+                .await
+                .expect("an empty certificate drive is accepted");
+            assert_ne!(
+                stored_drive(&db, &unclaimed).await.as_deref(),
+                Some(alice_drive.as_str())
+            );
+        }
+
+        let alice_folder = "internal:/alice-cert-unresolved";
+        folder_with_missing_ancestor(&db, alice_folder, &alice.subject.to_string()).await;
+        let own = genesis_with_cert_drive(&db, &alice, alice_folder, &alice_drive)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_drive(&db, &own).await.as_deref(),
+            Some(alice_drive.as_str()),
+            "the drive's own appender keeps the certificate's drive"
+        );
+    }
+
+    /// On a managed node, a resource whose lineage ends at an enrolled root
+    /// that is not a Drive is admitted under that root, as it was when the
+    /// root was stamped as its drive, while no `drive` grant is stamped.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn managed_admission_keys_an_undriven_lineage_on_its_root() {
+        use crate::sync::policy::AllowlistPolicy;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let db = crate::Db::init_temp("managed_untyped_root").await.unwrap();
+        let (alice, _drive) = db.setup("Alice").await.unwrap();
+        let root = "internal:/managed-root";
+        let mut root_resource = Resource::new(root.into());
+        root_resource
+            .set_unsafe(
+                urls::WRITE.into(),
+                Value::ResourceArray(vec![alice.subject.to_string().into()]),
+            )
+            .unwrap();
+        db.add_resource_opts(&root_resource, false, true, true)
+            .await
+            .unwrap();
+
+        let policy = Arc::new(AllowlistPolicy::new());
+        policy.set_grace(Duration::ZERO);
+        policy.set_drive_policies([(root, None)]);
+        db.set_sync_policy(policy);
+
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(urls::PARENT.into(), Value::AtomicUrl(root.into()));
+        let commit = Commit::create_did(builder, &alice, &db).await.unwrap();
+        let child = commit.subject.to_string();
+        db.apply_commit(commit, &rights_checked(&alice))
+            .await
+            .expect("a child of an enrolled root is admitted");
+        assert_eq!(stored_drive(&db, &child).await, None);
+
+        let mut resource = db.get_resource(&child.as_str().into()).await.unwrap();
+        resource
+            .set_unsafe(urls::NAME.into(), Value::String("edited".into()))
+            .unwrap();
+        let commit = resource
+            .get_commit_builder()
+            .clone()
+            .sign(&alice, &db, &resource)
+            .await
+            .unwrap();
+        db.apply_commit(commit, &rights_checked(&alice))
+            .await
+            .expect("a later edit is admitted under the same root");
+    }
+
+    /// Creates a DID child of `parent` through `create_did` + `apply_commit`,
+    /// the way a client's genesis lands, and returns its stored `drive`.
+    #[cfg(feature = "db")]
+    async fn genesis_child_drive(db: &crate::Db, parent: &str) -> Option<String> {
+        let agent = db.get_default_agent().unwrap();
+        let mut builder = CommitBuilder::new("placeholder".into());
+        builder.set(urls::PARENT.into(), Value::AtomicUrl(parent.into()));
+        builder.set(urls::NAME.into(), Value::String("lineage child".into()));
+        let commit = Commit::create_did(builder, &agent, db).await.unwrap();
+        let subject = commit.subject.to_string();
+        let opts = CommitOpts {
+            validate_signature: true,
+            validate_timestamp: false,
+            validate_rights: false,
+            update_index: true,
+            ..CommitOpts::no_validations_no_index()
+        };
+        db.apply_commit(commit, &opts).await.unwrap();
+        stored_drive(db, &subject).await
+    }
+
+    #[cfg(feature = "db")]
+    async fn add_lineage_resource(
+        db: &crate::Db,
+        subject: &str,
+        class: &str,
+        parent: Option<&str>,
+    ) {
+        let mut resource = Resource::new(subject.into());
+        resource
+            .set_unsafe(
+                urls::IS_A.into(),
+                Value::ResourceArray(vec![class.to_string().into()]),
+            )
+            .unwrap();
+        if let Some(parent) = parent {
+            resource
+                .set_unsafe(urls::PARENT.into(), Value::AtomicUrl(parent.into()))
+                .unwrap();
+        }
+        db.add_resource_opts(&resource, false, true, true)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn genesis_drive_follows_lineage_past_a_folder_without_drive_metadata() {
+        let db = crate::Db::init_temp("genesis_drive_lineage").await.unwrap();
+        let drive = "internal:/lineage-drive";
+        let folder = "internal:/lineage-drive/folder";
+        add_lineage_resource(&db, drive, urls::DRIVE, None).await;
+        add_lineage_resource(&db, folder, urls::FOLDER, Some(drive)).await;
+
+        assert_eq!(
+            genesis_child_drive(&db, folder).await.as_deref(),
+            Some(drive),
+            "the drive is the Drive the lineage reaches, not the immediate folder"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn genesis_drive_stays_unset_when_lineage_names_no_drive() {
+        let db = crate::Db::init_temp("genesis_drive_unresolved")
+            .await
+            .unwrap();
+        let root = "internal:/untyped-root";
+        let folder = "internal:/untyped-root/folder";
+        add_lineage_resource(&db, root, urls::FOLDER, None).await;
+        add_lineage_resource(&db, folder, urls::FOLDER, Some(root)).await;
+
+        assert_eq!(
+            genesis_child_drive(&db, folder).await,
+            None,
+            "an arbitrary ancestor is never promoted to drive"
         );
     }
 
@@ -4506,6 +5193,106 @@ mod blob_reference_tests {
             stored.get(urls::INTERNAL_ID).unwrap().to_string(),
             f.held,
             "the refused edit must not have been applied"
+        );
+    }
+
+    /// The read grant matches a reference by any member of a list-valued
+    /// property (`Value::to_reference_index_strings`), so a held blob listed
+    /// beside another one is as much a reference as one on its own.
+    #[tokio::test]
+    async fn a_listed_reference_to_held_bytes_is_checked_member_by_member() {
+        let f = fixture("blob_ref_listed", true).await;
+        let unheld = blake3::hash(b"listed beside the held bytes")
+            .to_hex()
+            .to_string();
+        let held_blob = crate::identifiers::blob_subject(&f.held);
+        let unheld_blob = crate::identifiers::blob_subject(&unheld);
+        let cases = [
+            (
+                "blob list",
+                Value::ResourceArray(vec![unheld_blob.as_str().into(), held_blob.as_str().into()]),
+            ),
+            (
+                "blob JSON list",
+                Value::String(format!("[\"{unheld_blob}\",\"{held_blob}\"]")),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, value) in cases {
+            let commit =
+                referencing_genesis(&f.db, &f.stranger, &f.stranger_drive, urls::BLOB, value).await;
+            let subject = commit.subject.clone();
+            match f.db.apply_commit(commit, &signed_opts(&f.stranger)).await {
+                Ok(_) => failures.push(format!("{case}: accepted")),
+                Err(err)
+                    if !matches!(
+                        err.error_type,
+                        crate::errors::AtomicErrorType::UnauthorizedError
+                    ) =>
+                {
+                    failures.push(format!("{case}: refused for another reason: {err}"))
+                }
+                Err(_) => {}
+            }
+            if f.db.has_resource_locally(&subject.pure_id()) {
+                failures.push(format!("{case}: the resource was stored"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Whatever shape a list-valued `internalId` takes, it may not end up
+    /// granting the bytes to someone the check let through: the check reads
+    /// the same strings the grant matches.
+    #[tokio::test]
+    async fn a_listed_internal_id_never_lends_held_bytes() {
+        let f = fixture("blob_ref_listed_internal_id", true).await;
+        let stranger = crate::agents::ForAgent::AgentSubject(f.stranger.subject.clone());
+        for value in [
+            Value::ResourceArray(vec!["not-a-hash".into(), f.held.as_str().into()]),
+            Value::String(format!("[\"not-a-hash\",\"{}\"]", f.held)),
+        ] {
+            let commit = referencing_genesis(
+                &f.db,
+                &f.stranger,
+                &f.stranger_drive,
+                urls::INTERNAL_ID,
+                value,
+            )
+            .await;
+            let _ = f.db.apply_commit(commit, &signed_opts(&f.stranger)).await;
+            assert!(
+                crate::hierarchy::check_blob_read(&f.db, &f.held, &stranger)
+                    .await
+                    .is_err(),
+                "a listed internalId lent the stranger the held bytes"
+            );
+        }
+    }
+
+    /// A reference that names a blob but whose hash does not decode cannot
+    /// be checked against the bytes, so it is refused rather than skipped.
+    #[tokio::test]
+    async fn a_blob_reference_whose_hash_does_not_decode_is_refused() {
+        let f = fixture("blob_ref_undecodable", true).await;
+        let commit = referencing_genesis(
+            &f.db,
+            &f.stranger,
+            &f.stranger_drive,
+            urls::BLOB,
+            Value::AtomicUrl(crate::identifiers::blob_subject("not-hex").into()),
+        )
+        .await;
+        let err =
+            f.db.apply_commit(commit, &signed_opts(&f.stranger))
+                .await
+                .expect_err("an undecodable blob reference is refused");
+        assert!(
+            matches!(
+                err.error_type,
+                crate::errors::AtomicErrorType::UnauthorizedError
+            ),
+            "got: {err}"
         );
     }
 

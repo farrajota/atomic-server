@@ -93,6 +93,18 @@ Some deployments cannot treat a hash as a secret: download URLs end up in logs, 
 
 The data browser keeps working with the flag on: it fetches bytes over its signed-in WebSocket, and an `<img>` or `<video>` that loads a download URL sends the same-origin session cookie. What stops being served is a blob this node holds without any referencing resource, and bytes behind a URL used from another origin without credentials.
 
+A reference is checked when it is written: a signed commit, a WebSocket `SYNC_PUSH` entry or an Iroh live update that adds an `internalId`, `blob` or `chunks` entry naming bytes this node already holds is refused unless the signer may already read a resource referencing them. The check reads every member of a list value, the same way the read grant does, and refuses a reference that does not decode to a hash. Bytes served for `/download/files/{blake3}` must hash to that address, and their media type comes only from a File the reader may read whose bytes they are: one naming the blob by `internalId` or `blob`, without `chunks`. Responses served to a signed-in reader carry `Cache-Control: private, no-store`.
+
+Known limits of this model, accepted for now:
+
+- A reference to bytes this node does not hold yet is accepted, so someone who learns a hash before its bytes arrive can reference it first.
+- A client answers a peer's blob request from its local store by hash and pushes the bytes of resources it saves, so an honest co-writer can deliver bytes that a reference created by someone else then points at.
+- The read check considers a bounded number of referencing resources per hash, so a reader who may already see the bytes can crowd out other references.
+- The whole-file hash of a chunked file is never stored, so anyone may claim it. `/download/files/{blake3}` rebuilds at most 8 readable chunked Files claiming it per request, each up to its declared `filesize` and the upload limit; whoever creates more claimants than that can make the address answer `404`, while each File's own `/download/{subject}` keeps working.
+- When several readable Files hold the same bytes, which one's media type is served depends on query order.
+- A user cannot reference bytes this node already holds unless they may read a resource that references them, so uploading a file whose exact bytes someone else already uploaded is refused with this flag on; the second user has to be given read access to an existing copy first.
+- A plugin's commits are judged as the plugin's own agent, not the user who triggered them, so a plugin that copies a hash from user input into a blob reference can lend bytes its agent may read.
+
 ### A note on existence side-channels
 
 A consequence of content-addressed storage is that an attacker who already knows the BLAKE3 hash of some specific byte-string (for example, by hashing a publicly-leaked document) can ask a server "do you have this blob?" and learn the answer from the response. This is intrinsic to any CAS system and is generally accepted; mitigations like rate-limiting unauthenticated blob fetches are orthogonal to the capability model and can be applied at the deployment layer if needed.

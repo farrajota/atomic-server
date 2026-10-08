@@ -839,6 +839,18 @@ fn assert_cache_control_no_store(resp: &ServiceResponse, what: &str) {
     );
 }
 
+/// Bytes served to a signed-in reader must stay out of shared caches, which
+/// would hand them to the next visitor of the same URL.
+fn assert_private_no_store(resp: &ServiceResponse, what: &str) {
+    assert_eq!(
+        resp.headers()
+            .get(actix_web::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, no-store"),
+        "{what}: bytes served to a signed-in reader must not land in shared caches"
+    );
+}
+
 fn get_body(resp: ServiceResponse) -> String {
     let boxbody = resp.into_body();
     let bytes = boxbody.try_into_bytes().unwrap();
@@ -1220,6 +1232,7 @@ async fn content_addressed_download_requires_read_on_a_referencing_resource() {
             200,
             "{path}: the File's reader gets the bytes"
         );
+        assert_private_no_store(&signed, path);
         assert_eq!(test::read_body(signed).await.as_ref(), bytes);
 
         // The session cookie: how the data browser's `<img src>` asks.
@@ -1237,7 +1250,31 @@ async fn content_addressed_download_requires_read_on_a_referencing_resource() {
             200,
             "{path}: a browser carrying the reader's session cookie gets the bytes"
         );
+        assert_private_no_store(&with_cookie, path);
     }
+
+    // The File by its own URL: the same bytes, the same caching rule.
+    let file_path = format!(
+        "/download{}",
+        file.get_subject()
+            .to_string()
+            .strip_prefix(&origin)
+            .unwrap()
+    );
+    let by_subject = test::call_service(
+        &app,
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &file_path,
+            &file.get_subject().to_string(),
+            &owner,
+            &origin,
+        ),
+    )
+    .await;
+    assert_eq!(by_subject.status(), 200, "{file_path}: the owner reads it");
+    assert_private_no_store(&by_subject, &file_path);
+    assert_eq!(test::read_body(by_subject).await.as_ref(), bytes);
 
     // Once a File with these bytes is public, so are the bytes.
     let mut public_copy = atomic_lib::Resource::new(format!(
@@ -1563,6 +1600,915 @@ async fn a_forged_hash_reference_does_not_unlock_blob_bytes() {
     }
     let resp = test::call_service(&app, as_agent(&get, &whole_path, &owner)).await;
     assert_eq!(resp.status(), 200, "the owner still gets the chunked file");
+}
+
+/// `POST /upload?parent=<parent>` of one file, signed by `agent`.
+fn upload_request(
+    agent: &atomic_lib::agents::Agent,
+    parent: &str,
+    filename: &str,
+    bytes: &[u8],
+    origin: &str,
+) -> actix_http::Request {
+    let path = format!("/upload?parent={}", urlencoding::encode(parent));
+    let body = [
+        format!(
+            "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+        bytes,
+        b"\r\n--boundary--\r\n",
+    ]
+    .concat();
+    let mut req = TestRequest::post()
+        .uri(&path)
+        .insert_header(("Host", origin_authority(origin)))
+        .insert_header(("Content-Type", "multipart/form-data; boundary=boundary"))
+        .set_payload(body);
+    for header in
+        atomic_lib::client::get_authentication_headers(&format!("{origin}{path}"), agent).unwrap()
+    {
+        req = req.insert_header(header);
+    }
+    req.to_request()
+}
+
+/// Every resource whose `internalId` is `hash_hex`.
+async fn files_with_internal_id(
+    store: &atomic_lib::Db,
+    hash_hex: &str,
+) -> Vec<atomic_lib::Resource> {
+    store
+        .query(&atomic_lib::storelike::Query::new_prop_val(
+            urls::INTERNAL_ID,
+            hash_hex,
+        ))
+        .await
+        .unwrap()
+        .resources
+}
+
+/// Two users who upload identical bytes each get a File of their own. The
+/// bytes are stored once, but the second upload neither replaces the first
+/// File nor moves it into the second uploader's drive; both keep the same
+/// content-addressed download URL.
+#[actix_rt::test]
+async fn identical_uploads_by_different_users_keep_separate_files() {
+    let appstate = fresh_appstate(&["--require-blob-auth"]).await;
+    let store = appstate.store.clone();
+    let origin = appstate.config.get_origin();
+    let alice = store.create_agent(Some("Alice")).await.unwrap();
+    let bob = store.create_agent(Some("Bob")).await.unwrap();
+    let outsider = store.create_agent(Some("Outsider")).await.unwrap();
+    let alice_drive = signed_genesis(&store, &alice, None, vec![]).await.unwrap();
+    let bob_drive = signed_genesis(&store, &bob, None, vec![]).await.unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    let bytes = b"identical bytes uploaded by two people";
+    let hash_hex = blake3::hash(bytes).to_hex().to_string();
+
+    let resp = test::call_service(
+        &app,
+        upload_request(&alice, &alice_drive, "same.txt", bytes, &origin),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "alice's upload: {}", get_body(resp));
+    let alice_files = files_with_internal_id(&store, &hash_hex).await;
+    assert_eq!(alice_files.len(), 1, "alice's upload made one File");
+    let alice_file = alice_files[0].get_subject().clone();
+
+    let resp = test::call_service(
+        &app,
+        upload_request(&bob, &bob_drive, "same.txt", bytes, &origin),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "bob's upload: {}", get_body(resp));
+
+    let files = files_with_internal_id(&store, &hash_hex).await;
+    assert_eq!(
+        files.len(),
+        2,
+        "each upload is a File of its own: {:?}",
+        files
+            .iter()
+            .map(|f| f.get_subject().to_string())
+            .collect::<Vec<_>>()
+    );
+    let first = files
+        .iter()
+        .find(|f| f.get_subject() == &alice_file)
+        .expect("alice's File still exists under its own subject");
+    assert_eq!(
+        first.get(urls::PARENT).unwrap().to_string(),
+        alice_drive,
+        "bob's upload must not move alice's File into bob's drive"
+    );
+    let second = files
+        .iter()
+        .find(|f| f.get_subject() != &alice_file)
+        .unwrap();
+    assert_eq!(second.get(urls::PARENT).unwrap().to_string(), bob_drive);
+    for file in &files {
+        assert_eq!(
+            file.get(urls::DOWNLOAD_URL).unwrap().to_string(),
+            format!("{origin}/download/files/{hash_hex}"),
+            "the download URL stays content-addressed"
+        );
+    }
+    assert_eq!(
+        store.kv.len(atomic_lib::db::trees::Tree::Blobs).unwrap(),
+        1,
+        "the bytes are stored once"
+    );
+
+    let path = format!("/download/files/{hash_hex}");
+    let download = |agent: &atomic_lib::agents::Agent| {
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &path,
+            &format!("{origin}{path}"),
+            agent,
+            &origin,
+        )
+    };
+    for uploader in [&alice, &bob] {
+        let resp = test::call_service(&app, download(uploader)).await;
+        assert_eq!(resp.status(), 200, "each uploader reads their bytes");
+        assert_eq!(test::read_body(resp).await.as_ref(), bytes);
+    }
+    let resp = test::call_service(&app, download(&outsider)).await;
+    assert_eq!(resp.status(), 401, "a reader of neither drive gets nothing");
+}
+
+/// Two agents with drives of their own and image Files that share a claimed
+/// hash: alice's private picture is chunked (so its whole-file hash is never
+/// stored as a blob and anyone may reference it), and mallory's File claims
+/// that hash next to a chunk of her own, created through a signed commit like
+/// any client's.
+#[cfg(feature = "img")]
+struct RenditionFixture {
+    appstate: AppState,
+    origin: String,
+    alice: atomic_lib::agents::Agent,
+    mallory: atomic_lib::agents::Agent,
+    mallory_drive: String,
+    mallory_file: String,
+    red: Vec<u8>,
+    green: Vec<u8>,
+    hash_hex: String,
+}
+
+#[cfg(feature = "img")]
+impl RenditionFixture {
+    async fn new() -> Self {
+        let appstate = fresh_appstate(&["--require-blob-auth"]).await;
+        let store = appstate.store.clone();
+        let origin = appstate.config.get_origin();
+        let alice = store.create_agent(Some("Alice")).await.unwrap();
+        let mallory = store.create_agent(Some("Mallory")).await.unwrap();
+        let alice_drive = signed_genesis(&store, &alice, None, vec![]).await.unwrap();
+        let mallory_drive = signed_genesis(&store, &mallory, None, vec![])
+            .await
+            .unwrap();
+        let blob_did = |bytes: &[u8]| atomic_lib::identifiers::blob_subject(&blob_hex(bytes));
+
+        let red = solid_png([200, 10, 10, 255]);
+        let hash_hex = blob_hex(&red);
+        let (red_a, red_b) = red.split_at(red.len() / 2);
+        signed_genesis(
+            &store,
+            &alice,
+            Some(&alice_drive),
+            vec![
+                (
+                    urls::INTERNAL_ID,
+                    atomic_lib::Value::String(hash_hex.clone()),
+                ),
+                (
+                    urls::MIMETYPE,
+                    atomic_lib::Value::String("image/png".into()),
+                ),
+                (
+                    urls::CHUNKS,
+                    atomic_lib::Value::ResourceArray(vec![
+                        blob_did(red_a).as_str().into(),
+                        blob_did(red_b).as_str().into(),
+                    ]),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        for chunk in [red_a, red_b] {
+            store
+                .put_blob(blake3::hash(chunk).as_bytes(), chunk)
+                .await
+                .unwrap();
+        }
+
+        let green = solid_png([10, 200, 10, 255]);
+        let mallory_file = signed_genesis(
+            &store,
+            &mallory,
+            Some(&mallory_drive),
+            vec![
+                (
+                    urls::INTERNAL_ID,
+                    atomic_lib::Value::String(hash_hex.clone()),
+                ),
+                (
+                    urls::CHUNKS,
+                    atomic_lib::Value::ResourceArray(vec![blob_did(&green).as_str().into()]),
+                ),
+            ],
+        )
+        .await
+        .expect("referencing a hash whose bytes are not held is allowed");
+        store
+            .put_blob(blake3::hash(&green).as_bytes(), &green)
+            .await
+            .unwrap();
+
+        Self {
+            appstate,
+            origin,
+            alice,
+            mallory,
+            mallory_drive,
+            mallory_file,
+            red,
+            green,
+            hash_hex,
+        }
+    }
+
+    /// Alice asks for a webp rendition through `/download/files/<hash>`.
+    fn alice_rendition(&self, w: u32, q: u32) -> actix_http::Request {
+        let path = format!("/download/files/{}?f=webp&w={w}&q={q}", self.hash_hex);
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &path,
+            &format!("{}{path}", self.origin),
+            &self.alice,
+            &self.origin,
+        )
+    }
+
+    /// Mallory asks for a webp rendition of her File by its subject.
+    fn mallory_rendition(&self, w: u32, q: u32) -> actix_http::Request {
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &format!("/download/{}?f=webp&w={w}&q={q}", self.mallory_file),
+            &self.mallory_file,
+            &self.mallory,
+            &self.origin,
+        )
+    }
+}
+
+/// An 8x8 PNG of one colour.
+#[cfg(feature = "img")]
+fn solid_png(rgba: [u8; 4]) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba(rgba)))
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+/// The webp rendition the server makes of `bytes` (parameters already on
+/// its grid).
+#[cfg(feature = "img")]
+fn webp_rendition_of(bytes: &[u8], w: u32, q: u32) -> Vec<u8> {
+    crate::handlers::image::process_image_bytes(
+        bytes,
+        &crate::handlers::download::DownloadParams {
+            q: Some(q as f32),
+            w: Some(w),
+            f: Some("webp".into()),
+        },
+        "webp",
+    )
+    .unwrap()
+}
+
+/// C2: an image rendition is cached under the bytes it was made from. A File
+/// that claims another user's whole-file hash next to chunks of its own
+/// neither poisons nor reads that user's cached renditions.
+#[cfg(feature = "img")]
+#[actix_rt::test]
+async fn renditions_follow_the_bytes_actually_served() {
+    let fx = RenditionFixture::new().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(fx.appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    assert_ne!(
+        webp_rendition_of(&fx.red, 64, 60),
+        webp_rendition_of(&fx.green, 64, 60)
+    );
+
+    // Poisoning: mallory renders first, alice must still get her own picture.
+    let resp = test::call_service(&app, fx.mallory_rendition(64, 60)).await;
+    assert_eq!(resp.status(), 200, "mallory renders her own File");
+    assert_eq!(
+        test::read_body(resp).await,
+        webp_rendition_of(&fx.green, 64, 60)
+    );
+    let resp = test::call_service(&app, fx.alice_rendition(64, 60)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        test::read_body(resp).await,
+        webp_rendition_of(&fx.red, 64, 60),
+        "alice's thumbnail was poisoned by a File claiming her hash"
+    );
+
+    // Reading: alice renders first, mallory must not get alice's picture.
+    let resp = test::call_service(&app, fx.alice_rendition(128, 70)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        test::read_body(resp).await,
+        webp_rendition_of(&fx.red, 128, 70)
+    );
+    let resp = test::call_service(&app, fx.mallory_rendition(128, 70)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        test::read_body(resp).await,
+        webp_rendition_of(&fx.green, 128, 70),
+        "mallory read alice's cached thumbnail through a File claiming her hash"
+    );
+}
+
+/// C2: a rendition cache key computable from a public hash, referenced before
+/// the rendition exists, must not hand out the rendition once it is made:
+/// neither through `/download/files/<key>` nor through the referencing File.
+#[cfg(feature = "img")]
+#[actix_rt::test]
+async fn a_rendition_cache_key_cannot_be_referenced_before_it_is_rendered() {
+    let fx = RenditionFixture::new().await;
+    let store = fx.appstate.store.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(fx.appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    // The 32-byte key renditions used to be cached under, from the hash
+    // alone.
+    let old_key =
+        blake3::hash(format!("processed|hash={}|f=webp|q=50|w=256", fx.hash_hex).as_bytes())
+            .to_hex()
+            .to_string();
+    let key_file = signed_genesis(
+        &store,
+        &fx.mallory,
+        Some(&fx.mallory_drive),
+        vec![(
+            urls::INTERNAL_ID,
+            atomic_lib::Value::String(old_key.clone()),
+        )],
+    )
+    .await
+    .expect("nothing is held under the key yet");
+
+    let resp = test::call_service(&app, fx.alice_rendition(256, 50)).await;
+    assert_eq!(resp.status(), 200);
+    let alice_thumbnail = test::read_body(resp).await;
+    assert_eq!(alice_thumbnail, webp_rendition_of(&fx.red, 256, 50));
+
+    let key_path = format!("/download/files/{old_key}");
+    let resp = test::call_service(
+        &app,
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &key_path,
+            &format!("{}{key_path}", fx.origin),
+            &fx.mallory,
+            &fx.origin,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 404, "{key_path} reached a cached rendition");
+    let key_file_path = format!("/download/{key_file}");
+    let resp = test::call_service(
+        &app,
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &key_file_path,
+            &key_file,
+            &fx.mallory,
+            &fx.origin,
+        ),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        200,
+        "{key_file_path} reached a cached rendition"
+    );
+    assert_ne!(test::read_body(resp).await, alice_thumbnail);
+}
+
+/// M1: `/download/files/<hash>` answers only with bytes that hash to it. A
+/// public chunked File claiming alice's whole-file hash next to chunks of its
+/// own may be readable by everyone, but neither its bytes nor its mimetype
+/// are served under her content address.
+#[cfg(feature = "img")]
+#[actix_rt::test]
+async fn a_spoofed_chunked_file_cannot_serve_other_bytes_under_a_hash() {
+    let fx = RenditionFixture::new().await;
+    let store = fx.appstate.store.clone();
+    let green_did = atomic_lib::identifiers::blob_subject(&blob_hex(&fx.green));
+    // Several, so that some sort before alice's File whatever the query order.
+    for i in 0..4 {
+        signed_genesis(
+            &store,
+            &fx.mallory,
+            Some(&fx.mallory_drive),
+            vec![
+                (urls::NAME, atomic_lib::Value::String(format!("spoof {i}"))),
+                (
+                    urls::INTERNAL_ID,
+                    atomic_lib::Value::String(fx.hash_hex.clone()),
+                ),
+                (
+                    urls::MIMETYPE,
+                    atomic_lib::Value::String("application/octet-stream".into()),
+                ),
+                (
+                    urls::CHUNKS,
+                    atomic_lib::Value::ResourceArray(vec![green_did.as_str().into()]),
+                ),
+                (
+                    urls::READ,
+                    atomic_lib::Value::ResourceArray(vec![urls::PUBLIC_AGENT.into()]),
+                ),
+            ],
+        )
+        .await
+        .expect("mallory may publish a File of bytes she can read");
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(fx.appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    // Everyone may read the spoofs; only alice may read her File.
+    let path = format!("/download/files/{}", fx.hash_hex);
+    for path in [path.clone(), format!("{path}?f=webp&w=64&q=60")] {
+        let resp = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri(&path)
+                .insert_header(("Host", origin_authority(&fx.origin)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            404,
+            "{path}: a File whose bytes do not hash to the address must not answer for it"
+        );
+        let body = test::read_body(resp).await;
+        assert_ne!(body, fx.green, "{path}");
+        assert_ne!(body, webp_rendition_of(&fx.green, 64, 60), "{path}");
+    }
+
+    let resp = test::call_service(
+        &app,
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &path,
+            &format!("{}{path}", fx.origin),
+            &fx.alice,
+            &fx.origin,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "alice reads her picture");
+    assert_eq!(
+        resp.headers()
+            .get(actix_web::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png"),
+        "the mimetype comes from the File whose bytes are served"
+    );
+    assert_eq!(test::read_body(resp).await, fx.red);
+    let resp = test::call_service(&app, fx.alice_rendition(64, 60)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        test::read_body(resp).await,
+        webp_rendition_of(&fx.red, 64, 60)
+    );
+}
+
+/// M1: the mimetype served for a stored blob comes only from a File the
+/// reader may read whose bytes are that blob. Under `nosniff` a wrong type
+/// breaks the picture for its readers, so neither a File the reader may not
+/// read nor one naming the hash next to chunks of other bytes chooses it.
+#[actix_rt::test]
+async fn a_blobs_mimetype_comes_from_a_readable_file_of_its_bytes() {
+    let appstate = fresh_appstate(&["--require-blob-auth"]).await;
+    let store = appstate.store.clone();
+    let origin = appstate.config.get_origin();
+    let alice = store.create_agent(Some("Alice")).await.unwrap();
+    let mallory = store.create_agent(Some("Mallory")).await.unwrap();
+    let bob = store.create_agent(Some("Bob")).await.unwrap();
+    let alice_drive = signed_genesis(&store, &alice, None, vec![]).await.unwrap();
+    let mallory_drive = signed_genesis(&store, &mallory, None, vec![])
+        .await
+        .unwrap();
+    let public_read = || atomic_lib::Value::ResourceArray(vec![urls::PUBLIC_AGENT.into()]);
+    let internal_id = |hash: &str| (urls::INTERNAL_ID, atomic_lib::Value::String(hash.into()));
+    let mimetype = |m: &str| (urls::MIMETYPE, atomic_lib::Value::String(m.into()));
+
+    let bytes = b"alice's picture, stored whole".as_slice();
+    let hash_hex = blake3::hash(bytes).to_hex().to_string();
+    let other = b"mallory's own bytes".as_slice();
+    let other_hash = blake3::hash(other);
+
+    // Mallory names the hash before it is uploaded, as the upload order
+    // allows: privately, and publicly next to chunks of other bytes.
+    signed_genesis(
+        &store,
+        &mallory,
+        Some(&mallory_drive),
+        vec![internal_id(&hash_hex), mimetype("text/html")],
+    )
+    .await
+    .unwrap();
+    signed_genesis(
+        &store,
+        &mallory,
+        Some(&mallory_drive),
+        vec![
+            internal_id(&hash_hex),
+            mimetype("application/x-spoof"),
+            (
+                urls::CHUNKS,
+                atomic_lib::Value::ResourceArray(vec![atomic_lib::identifiers::blob_subject(
+                    &other_hash.to_hex(),
+                )
+                .as_str()
+                .into()]),
+            ),
+            (urls::READ, public_read()),
+        ],
+    )
+    .await
+    .unwrap();
+    // Alice's File with the real type, readable by her, and a public File of
+    // the same bytes with none.
+    signed_genesis(
+        &store,
+        &alice,
+        Some(&alice_drive),
+        vec![internal_id(&hash_hex), mimetype("image/png")],
+    )
+    .await
+    .unwrap();
+    signed_genesis(
+        &store,
+        &alice,
+        Some(&alice_drive),
+        vec![internal_id(&hash_hex), (urls::READ, public_read())],
+    )
+    .await
+    .unwrap();
+    store.put_blob(other_hash.as_bytes(), other).await.unwrap();
+    store
+        .put_blob(blake3::hash(bytes).as_bytes(), bytes)
+        .await
+        .unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    for path in [
+        format!("/download/files/{hash_hex}"),
+        format!("/download/did:ad:blob:{hash_hex}"),
+    ] {
+        for (agent, expected) in [
+            (&alice, "image/png"),
+            // Bob reads the public copy, which has no type, and the spoof.
+            (&bob, "application/octet-stream"),
+        ] {
+            let resp = test::call_service(
+                &app,
+                request_signed_by(
+                    actix_web::http::Method::GET,
+                    &path,
+                    &format!("{origin}{path}"),
+                    agent,
+                    &origin,
+                ),
+            )
+            .await;
+            assert_eq!(resp.status(), 200, "{path} as {}", agent.subject);
+            assert_eq!(
+                resp.headers()
+                    .get(actix_web::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected),
+                "{path} as {}: the mimetype of a readable File of these bytes",
+                agent.subject
+            );
+            assert_eq!(test::read_body(resp).await.as_ref(), bytes);
+        }
+    }
+}
+
+/// N1: a chunked File is rebuilt only up to the size it declares. Anyone may
+/// claim a whole-file hash next to chunks of their own, so without a bound a
+/// File listing one huge chunk many times makes every request for it, or for
+/// the hash it claims, assemble that many bytes. A File within its declared
+/// size is still served by its subject and its content address.
+#[actix_rt::test]
+async fn a_chunked_file_is_not_rebuilt_past_its_declared_size() {
+    let appstate = fresh_appstate(&[]).await;
+    let store = appstate.store.clone();
+    let origin = appstate.config.get_origin();
+    let alice = store.create_agent(Some("Alice")).await.unwrap();
+    let drive = signed_genesis(&store, &alice, None, vec![]).await.unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    let mut failures = Vec::new();
+    for (case, filler, declared_extra, served) in
+        [("oversized", 1u8, -1i64, false), ("within", 2u8, 0, true)]
+    {
+        let chunk_a = vec![filler; 64];
+        let chunk_b = vec![filler.wrapping_add(10); 64];
+        let whole = [chunk_a.as_slice(), chunk_b.as_slice()].concat();
+        let whole_hash = blake3::hash(&whole).to_hex().to_string();
+        let chunk_ref =
+            |bytes: &[u8]| atomic_lib::identifiers::blob_subject(&blake3::hash(bytes).to_hex());
+        let file = signed_genesis(
+            &store,
+            &alice,
+            Some(&drive),
+            vec![
+                (
+                    urls::INTERNAL_ID,
+                    atomic_lib::Value::String(whole_hash.clone()),
+                ),
+                (
+                    urls::CHUNKS,
+                    atomic_lib::Value::ResourceArray(vec![
+                        chunk_ref(&chunk_a).as_str().into(),
+                        chunk_ref(&chunk_b).as_str().into(),
+                    ]),
+                ),
+                (
+                    urls::FILESIZE,
+                    atomic_lib::Value::Integer(whole.len() as i64 + declared_extra),
+                ),
+                (
+                    urls::READ,
+                    atomic_lib::Value::ResourceArray(vec![urls::PUBLIC_AGENT.into()]),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        for chunk in [&chunk_a, &chunk_b] {
+            store
+                .put_blob(blake3::hash(chunk).as_bytes(), chunk)
+                .await
+                .unwrap();
+        }
+
+        for path in [
+            format!("/download/{file}"),
+            format!("/download/files/{whole_hash}"),
+        ] {
+            let resp = test::call_service(
+                &app,
+                TestRequest::get()
+                    .uri(&path)
+                    .insert_header(("Host", origin_authority(&origin)))
+                    .to_request(),
+            )
+            .await;
+            let status = resp.status();
+            let got_whole = test::read_body(resp).await.as_ref() == whole.as_slice();
+            if served != (status == 200 && got_whole) {
+                failures.push(format!(
+                    "{case} {path}: status {status}, served the rebuilt bytes: {got_whole}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// N1: the mimetype of a stored blob comes from a File whose own bytes are
+/// that blob. A chunked File's bytes are its chunks, so naming the blob's hash
+/// as its `internalId` does not count, and finding out whether its chunks
+/// happen to hash to it would mean rebuilding them on every request.
+#[actix_rt::test]
+async fn a_stored_blobs_mimetype_is_not_taken_from_a_chunked_file() {
+    let appstate = fresh_appstate(&[]).await;
+    let store = appstate.store.clone();
+    let origin = appstate.config.get_origin();
+    let alice = store.create_agent(Some("Alice")).await.unwrap();
+    let drive = signed_genesis(&store, &alice, None, vec![]).await.unwrap();
+
+    let whole = b"bytes stored whole and as chunks".as_slice();
+    let (chunk_a, chunk_b) = whole.split_at(whole.len() / 2);
+    let whole_hash = blake3::hash(whole).to_hex().to_string();
+    let chunk_ref =
+        |bytes: &[u8]| atomic_lib::identifiers::blob_subject(&blake3::hash(bytes).to_hex());
+    signed_genesis(
+        &store,
+        &alice,
+        Some(&drive),
+        vec![
+            (
+                urls::INTERNAL_ID,
+                atomic_lib::Value::String(whole_hash.clone()),
+            ),
+            (
+                urls::MIMETYPE,
+                atomic_lib::Value::String("image/png".into()),
+            ),
+            (
+                urls::CHUNKS,
+                atomic_lib::Value::ResourceArray(vec![
+                    chunk_ref(chunk_a).as_str().into(),
+                    chunk_ref(chunk_b).as_str().into(),
+                ]),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    for bytes in [whole, chunk_a, chunk_b] {
+        store
+            .put_blob(blake3::hash(bytes).as_bytes(), bytes)
+            .await
+            .unwrap();
+    }
+
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let path = format!("/download/files/{whole_hash}");
+    let resp = test::call_service(
+        &app,
+        request_signed_by(
+            actix_web::http::Method::GET,
+            &path,
+            &format!("{origin}{path}"),
+            &alice,
+            &origin,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "the stored blob is served");
+    assert_eq!(
+        resp.headers()
+            .get(actix_web::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream"),
+        "no File whose own bytes are the blob names a type"
+    );
+    assert_eq!(test::read_body(resp).await.as_ref(), whole);
+}
+
+/// N2: a published form serves its images to anonymous visitors through the
+/// server's own agent, so the form's drive is not enough of a boundary: an
+/// agent who may only append to a drive could publish a form there whose
+/// cover is a File of that drive they cannot read themselves. The form's
+/// verified creator must be able to read what it serves.
+#[actix_rt::test]
+async fn a_form_does_not_serve_a_file_its_creator_cannot_read() {
+    let appstate = fresh_appstate(&[]).await;
+    let store = appstate.store.clone();
+    let alice = store.create_agent(Some("Alice")).await.unwrap();
+    let mallory = store.create_agent(Some("Mallory")).await.unwrap();
+    let drive = signed_genesis(
+        &store,
+        &alice,
+        None,
+        vec![(
+            urls::APPEND,
+            atomic_lib::Value::ResourceArray(vec![mallory.subject.to_string().into()]),
+        )],
+    )
+    .await
+    .unwrap();
+
+    let bytes = b"alice's private picture".as_slice();
+    let hash_hex = blake3::hash(bytes).to_hex().to_string();
+    let file = signed_genesis(
+        &store,
+        &alice,
+        Some(&drive),
+        vec![
+            (
+                urls::IS_A,
+                atomic_lib::Value::ResourceArray(vec![urls::FILE.into()]),
+            ),
+            (urls::INTERNAL_ID, atomic_lib::Value::String(hash_hex)),
+            (
+                urls::MIMETYPE,
+                atomic_lib::Value::String("image/png".into()),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    store
+        .put_blob(blake3::hash(bytes).as_bytes(), bytes)
+        .await
+        .unwrap();
+    let file_resource = store.get_resource(&file.as_str().into()).await.unwrap();
+    assert!(
+        atomic_lib::hierarchy::check_read(&store, &file_resource, &ForAgent::from(&mallory))
+            .await
+            .is_err(),
+        "fixture: Mallory may append to the drive but not read the File"
+    );
+
+    let form_props = || {
+        vec![
+            (
+                urls::IS_A,
+                atomic_lib::Value::ResourceArray(vec![urls::FORM.into()]),
+            ),
+            (urls::NAME, atomic_lib::Value::String("Survey".into())),
+            (
+                urls::COVER_IMAGE,
+                atomic_lib::Value::AtomicUrl(file.as_str().into()),
+            ),
+            (
+                urls::FORM_PUBLISHED_AT,
+                atomic_lib::Value::Timestamp(atomic_lib::utils::now()),
+            ),
+        ]
+    };
+    let mallorys_form = signed_genesis(&store, &mallory, Some(&drive), form_props())
+        .await
+        .expect("append on the drive lets Mallory create a form in it");
+    let alices_form = signed_genesis(&store, &alice, Some(&drive), form_props())
+        .await
+        .unwrap();
+
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let mut failures = Vec::new();
+    for (form, expected) in [(&mallorys_form, 404), (&alices_form, 200)] {
+        let resp = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri(&format!("/form/{form}/image"))
+                .to_request(),
+        )
+        .await;
+        let status = resp.status().as_u16();
+        let body = test::read_body(resp).await;
+        if status != expected {
+            failures.push(format!("{form}: status {status}, expected {expected}"));
+        }
+        if expected == 404 && body.as_ref() == bytes {
+            failures.push(format!("{form}: served the private File"));
+        }
+        if expected == 200 && body.as_ref() != bytes {
+            failures.push(format!("{form}: the owner's form lost its cover image"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Lowercase hex BLAKE3 hash of `bytes`.
+#[cfg(feature = "img")]
+fn blob_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 /// `--served-domain-suffix` (`ATOMIC_SERVED_DOMAIN_SUFFIX`) lets a node answer

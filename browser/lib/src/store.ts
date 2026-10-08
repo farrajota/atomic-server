@@ -21,6 +21,8 @@ import {
   canonicalDriveHashV2,
 } from './canonical-drive-hash.js';
 import {
+  SESSION_COOKIE_REFRESH_INTERVAL_MS,
+  checkAuthenticationCookie,
   removeCookieAuthentication,
   setCookieAuthentication,
   signRequest,
@@ -348,6 +350,9 @@ export interface AddResourcesOpts {
 /** Mirrors `SUBDOMAIN` in the server's `lib/src/urls.rs` (not yet part of a
  *  generated ontology). Serves the drive on its own subdomain. */
 const SUBDOMAIN_PROP = 'https://atomicdata.dev/properties/subdomain';
+const DRIVE_PROPERTY = 'https://atomicdata.dev/properties/drive';
+/** Bounds the parent walk in `resolveDriveFromParent`. */
+const MAX_DRIVE_LINEAGE_DEPTH = 32;
 
 /**
  * Opt-in tracing for search, mirroring `ws-debug`:
@@ -692,6 +697,11 @@ export class Store {
 
   /** Current Agent, used for signing commits. Is required for posting things. */
   private agent?: Agent;
+  /** Keeps the same-origin session cookie fresh; see `syncSessionCookieRefresh`. */
+  private sessionCookieRefresh?: {
+    timer: ReturnType<typeof setInterval>;
+    onWake: () => void;
+  };
   /** Mapped from origin to websocket */
   private webSockets: Map<string, WSClient>;
 
@@ -2988,6 +2998,77 @@ export class Store {
   }
 
   /**
+   * The drive a child of `parent` lives in: the nearest ancestor's explicit
+   * `drive`, or the nearest ancestor that is itself a Drive. `undefined` when
+   * the lineage is unknown (an ancestor is missing, failed to load, or has no
+   * parent), cyclic, or deeper than {@link MAX_DRIVE_LINEAGE_DEPTH}: the
+   * immediate parent or the active drive are never guessed, since a wrong
+   * drive misroutes the commit and its rights check.
+   *
+   * With `fetchMissing: false` only resources already in this store are
+   * consulted, so it never waits on the network.
+   *
+   * @internal shared by `newResource` and `Resource.signChanges`.
+   */
+  public async resolveDriveFromParent(
+    parent: string,
+    { fetchMissing }: { fetchMissing: boolean },
+  ): Promise<string | undefined> {
+    const seen = new Set<string>();
+    let subject = parent;
+
+    for (let depth = 0; depth < MAX_DRIVE_LINEAGE_DEPTH; depth++) {
+      subject = this.normalizeSubject(subject);
+
+      if (seen.has(subject)) return undefined;
+
+      seen.add(subject);
+
+      const ancestor = await this.lineageAncestor(subject, fetchMissing);
+
+      if (!ancestor || ancestor.error) return undefined;
+
+      const explicitDrive = ancestor.get(DRIVE_PROPERTY);
+
+      if (typeof explicitDrive === 'string' && explicitDrive) {
+        return this.normalizeSubject(explicitDrive);
+      }
+
+      if (ancestor.hasClasses(server.classes.drive)) return subject;
+
+      const next = ancestor.get(core.properties.parent);
+
+      if (typeof next !== 'string' || !next) return undefined;
+
+      subject = next;
+    }
+
+    return undefined;
+  }
+
+  private async lineageAncestor(
+    subject: string,
+    fetchMissing: boolean,
+  ): Promise<Resource | undefined> {
+    const cached = this.resources.get(this.resolveSubject(subject));
+
+    if (cached?.isReady() || cached?.error || !fetchMissing) return cached;
+
+    try {
+      return await this.getResource(subject);
+    } catch (e) {
+      // A cancelled or timed-out read leaves the lineage unknown, which the
+      // caller handles by not stamping a drive.
+      console.warn(
+        `[Store] could not load ${subject} to resolve its drive:`,
+        e,
+      );
+
+      return undefined;
+    }
+  }
+
+  /**
    * Create a new resource.
    *
    * When `did` is `true` (the default) the genesis commit is signed locally so
@@ -3021,14 +3102,14 @@ export class Store {
     const DRIVE_PROP = 'https://atomicdata.dev/properties/drive';
     const GENESIS_PROP = 'https://atomicdata.dev/properties/genesis';
 
-    // The immutable `drive` this resource lives in — its parent's drive, or the
-    // parent itself when the parent is a drive root. Resolved from the local
-    // cache (sync, no network). Undefined for a top-level (noParent) resource.
+    // The immutable `drive` this resource lives in, from its parent's actual
+    // lineage (see `resolveDriveFromParent`). The implicit server-root parent
+    // is only looked up locally: resolving it is no reason to fetch the root.
     const resolvedDrive = noParent
       ? undefined
-      : ((this.resources.get(normalizedParent)?.get(DRIVE_PROP) as
-          | string
-          | undefined) ?? normalizedParent);
+      : await this.resolveDriveFromParent(normalizedParent, {
+          fetchMissing: !!parent,
+        });
 
     // Mint the DID up front from a self-verifying genesis certificate (mirrors
     // `lib/src/commit.rs::create_did`): the cert's fields — signer, createdAt,
@@ -3076,11 +3157,14 @@ export class Store {
 
     if (!noParent) {
       await resource.set(core.properties.parent, normalizedParent);
-      // The same value that seeded the cert's immutable `drive` above; the
-      // server's rights check consults this stable grant instead of walking a
-      // parent that may not be materialized yet (the parent-before-child 401
-      // cascade). `validate:false` skips the ontology fetch.
-      await resource.set(DRIVE_PROP, resolvedDrive ?? normalizedParent, false);
+
+      // Store only the lineage-resolved value used for the cert's immutable
+      // `drive`. If lineage is unknown, omit DRIVE rather than making an
+      // arbitrary immediate parent look like a drive. `validate:false` skips
+      // the ontology fetch.
+      if (resolvedDrive) {
+        await resource.set(DRIVE_PROP, resolvedDrive, false);
+      }
     }
 
     if (propVals) {
@@ -5712,7 +5796,12 @@ export class Store {
         // not a precondition of a specific request. The HTTP request
         // path (`Client.fetchResourceHTTP`) re-installs the cookie if
         // it's missing, and awaits it there.
-        setCookieAuthentication(this.serverUrl, agent).catch(() => undefined);
+        const serverUrl = this.serverUrl;
+        setCookieAuthentication(
+          serverUrl,
+          agent,
+          () => this.agent === agent && this.serverUrl === serverUrl,
+        ).catch(() => undefined);
       }
 
       this.webSockets.forEach(ws => {
@@ -5732,11 +5821,78 @@ export class Store {
       }
     }
 
+    this.syncSessionCookieRefresh();
+
     this.eventManager.emit(StoreEvents.AgentChanged, agent);
 
     // After the event: an app that keeps one database per agent detaches the
     // previous agent's on it, and this must not bind that one.
     void this.bindOutboxDatabase();
+  }
+
+  /**
+   * Same-origin `<img>`, `<video>` and download requests can only
+   * authenticate with the `atomic_session` cookie, and its proof expires
+   * after {@link AUTH_PROOF_MAX_AGE_MS}. Only HTTP resource fetches renew it,
+   * while this client mostly talks over the WebSocket, so without this timer
+   * private media starts answering 401 a few minutes after sign-in. Runs while
+   * an Agent is set and the server shares the page's origin (a cross-origin
+   * server never receives this host-only cookie).
+   */
+  private syncSessionCookieRefresh(): void {
+    this.stopSessionCookieRefresh();
+
+    const agent = this.agent;
+    const serverUrl = this.serverUrl;
+
+    if (!agent?.subject || !hasBrowserAPI() || !serverUrl) return;
+
+    let serverOrigin: string;
+
+    try {
+      serverOrigin = new URL(serverUrl).origin;
+    } catch {
+      return;
+    }
+
+    if (serverOrigin !== window.location.origin) return;
+
+    const refresh = () => {
+      // `setCookieAuthentication` reports its own failures and never rejects.
+      if (!checkAuthenticationCookie()) {
+        void setCookieAuthentication(
+          serverUrl,
+          agent,
+          () => this.agent === agent && this.serverUrl === serverUrl,
+        );
+      }
+    };
+
+    // Hidden tabs have their timers throttled; check again on return.
+    const onWake = () => {
+      if (document.visibilityState !== 'hidden') refresh();
+    };
+
+    const timer = setInterval(refresh, SESSION_COOKIE_REFRESH_INTERVAL_MS);
+
+    window.addEventListener('focus', onWake);
+    document.addEventListener('visibilitychange', onWake);
+    this.sessionCookieRefresh = { timer, onWake };
+  }
+
+  /**
+   * Stops keeping the session cookie fresh. Signing out and switching servers
+   * do this already; call it when discarding a Store that still has an Agent.
+   */
+  public stopSessionCookieRefresh(): void {
+    const running = this.sessionCookieRefresh;
+
+    if (!running) return;
+
+    clearInterval(running.timer);
+    window.removeEventListener('focus', running.onWake);
+    document.removeEventListener('visibilitychange', running.onWake);
+    this.sessionCookieRefresh = undefined;
   }
 
   /**
@@ -6068,6 +6224,10 @@ export class Store {
 
       this.setServerConnected(false);
     }
+
+    // The cookie is host-only, so whether it is worth refreshing follows the
+    // server's origin.
+    this.syncSessionCookieRefresh();
 
     this.eventManager.emit(StoreEvents.ServerURLChanged, url);
 
@@ -7011,9 +7171,9 @@ export class Store {
       await this.clientDb!.putBlob(hashBytes, data);
 
       const DRIVE_PROP = 'https://atomicdata.dev/properties/drive';
-      const driveVal =
-        (this.resources.get(parent)?.get(DRIVE_PROP) as string | undefined) ??
-        parent;
+      const driveVal = await this.resolveDriveFromParent(parent, {
+        fetchMissing: true,
+      });
 
       // Mint the cert-based DID up front (like `newResource`), so the upload
       // carries its real `did:ad:` from creation — no `_new:` placeholder.
@@ -7021,7 +7181,7 @@ export class Store {
       let newSubject: string;
 
       if (useDid) {
-        const minted = await this.mintCertDid(parent, driveVal);
+        const minted = await this.mintCertDid(parent, driveVal ?? '');
         newSubject = minted.did;
         genesisCertB64 = minted.certB64;
       } else {
@@ -7038,7 +7198,10 @@ export class Store {
           genesisCertB64,
           false,
         );
-        await resource.set(DRIVE_PROP, driveVal, false);
+
+        if (driveVal) {
+          await resource.set(DRIVE_PROP, driveVal, false);
+        }
       }
 
       // All values are produced from trusted code (hashes, fixed property

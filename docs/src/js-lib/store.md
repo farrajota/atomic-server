@@ -49,6 +49,23 @@ Generally in a client application with one authenticated user, you'll want to ha
 This way you'll never fetch resources more than once while still receiving updates via websocket messages.
 If `store` is used on the server however, you might want to consider creating a new store for each request as a store can only have a single agent associated with it and changing the agent will reauthenticate all websocket connections.
 
+### The session cookie in browsers
+
+In a browser, a Store with an agent signs a short-lived proof into an `atomic_session` cookie for its server.
+Same-origin requests the Store does not make itself, such as an `<img>` or `<video>` showing a private file, authenticate with that cookie.
+The proof expires after five minutes, so while an agent is set and the server has the page's origin, the Store renews it every minute and whenever the page regains focus or becomes visible.
+
+`setAgent(undefined)` and `setServerUrl()` stop or restart this as needed.
+If you discard a Store that still has an agent, call `store.stopSessionCookieRefresh()` first; otherwise its timer keeps running for the life of the page.
+
+```typescript
+store.stopSessionCookieRefresh();
+```
+
+The cookie belongs to the page's host, not to a Store.
+Two Stores on the same origin with different agents overwrite each other's cookie, and media then loads as whichever agent signed last.
+Use one Store per page, or give the other Stores no agent.
+
 ## Fetching resources
 
 > [!NOTE]

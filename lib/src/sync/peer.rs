@@ -914,6 +914,35 @@ async fn admitted_for_drive(
     verdict
 }
 
+/// Whether a live `UPDATE` may be persisted, and why not when it may not. It
+/// is the same write as a `SYNC_PUSH` entry, so after drive admission it gets
+/// that entry's checks: it stays in the admitted drive (no foreign `drive`,
+/// no move without `append`) and references no held blob bytes its sender
+/// cannot already read.
+async fn live_update_may_land(
+    store: &Db,
+    agent: &ForAgent,
+    resolved: &super::ws_apply::ResolvedUpdate,
+    trust_owned: bool,
+    cache: &mut std::collections::HashMap<String, bool>,
+) -> Result<(), String> {
+    if !admitted_for_drive(store, agent, &resolved.drive_subject, trust_owned, cache).await {
+        return Err(format!("not admitted for drive {}", resolved.drive_subject));
+    }
+    super::engine::check_replicated_placement(
+        store,
+        resolved.existing(),
+        resolved.resource(),
+        &resolved.drive_subject,
+        agent,
+        trust_owned,
+    )
+    .await?;
+    crate::commit::check_new_blob_references(store, resolved.existing(), resolved.resource(), agent)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Apply one peer-supplied `SYNC_DIFF.remove[]` entry. A signed destroy
 /// envelope (`removeCommits[subject]`) is applied as a peer `COMMIT` — the
 /// signature and the signer's rights are the authority, same as the live
@@ -1403,15 +1432,15 @@ fn register_live_peer(
                         )
                         .await
                         {
-                            if admitted_for_drive(
+                            let verdict = live_update_may_land(
                                 &store,
                                 &agent,
-                                &resolved.drive_subject,
+                                &resolved,
                                 initiated_by_us,
                                 &mut drive_cache,
                             )
-                            .await
-                            {
+                            .await;
+                            if verdict.is_ok() {
                                 // Attribute this write to the peer it came
                                 // from: `add_resource_opts` reads the import
                                 // scope while the write is still on the stack
@@ -1477,12 +1506,11 @@ fn register_live_peer(
                                     &decoded.subject[..decoded.subject.len().min(20)],
                                     &read_peer_id[..read_peer_id.len().min(12)]
                                 );
-                            } else {
+                            } else if let Err(why) = verdict {
                                 tracing::warn!(
-                                    "[live] rejected UPDATE for {} from {}: not admitted for drive {}",
+                                    "[live] rejected UPDATE for {} from {}: {why}",
                                     &decoded.subject[..decoded.subject.len().min(20)],
                                     &read_peer_id[..read_peer_id.len().min(12)],
-                                    &resolved.drive_subject[..resolved.drive_subject.len().min(20)]
                                 );
                             }
                         }
@@ -2993,6 +3021,144 @@ mod live_write_admission_tests {
     use super::*;
     use crate::Db;
     use std::collections::HashMap;
+
+    /// Alice's private File references bytes this node holds; Mallory owns a
+    /// drive here with a note in it. Blob read auth is on.
+    struct LiveFixture {
+        db: Db,
+        alice_drive: String,
+        mallory: ForAgent,
+        mallory_drive: String,
+        mallory_note: String,
+        held: String,
+    }
+
+    async fn live_fixture(id: &str) -> LiveFixture {
+        let db = Db::init_temp(id).await.unwrap();
+        let node_agent = db.get_default_agent().unwrap();
+        let (_alice, alice_drive) = db.setup("Alice").await.unwrap();
+        let bytes = b"alice's private live attachment";
+        let hash = blake3::hash(bytes);
+        db.put_blob(hash.as_bytes(), bytes).await.unwrap();
+        let held = hash.to_hex().to_string();
+        db.create_resource(
+            crate::urls::FILE,
+            &alice_drive,
+            "private.txt",
+            Some(vec![(
+                crate::urls::INTERNAL_ID,
+                crate::Value::String(held.clone()),
+            )]),
+        )
+        .await
+        .unwrap();
+        let (mallory, mallory_drive) = db.setup("Mallory").await.unwrap();
+        let mallory_note = db
+            .create_resource(crate::urls::FOLDER, &mallory_drive, "note", None)
+            .await
+            .unwrap();
+        db.set_default_agent(node_agent);
+        db.set_require_blob_read_auth(true);
+        LiveFixture {
+            db,
+            alice_drive,
+            mallory: ForAgent::from(mallory),
+            mallory_drive,
+            mallory_note,
+            held,
+        }
+    }
+
+    fn new_in(drive: &str, properties: &[(&str, crate::Value)]) -> Vec<u8> {
+        let doc = crate::loro::AtomicLoroDoc::new();
+        doc.set_property(crate::urls::PARENT, &crate::Value::AtomicUrl(drive.into()))
+            .unwrap();
+        for (property, value) in properties {
+            doc.set_property(property, value).unwrap();
+        }
+        doc.export_snapshot()
+    }
+
+    fn note_edit(f: &LiveFixture, property: &str, value: crate::Value) -> Vec<u8> {
+        let stored =
+            f.db.kv
+                .get(
+                    crate::db::trees::Tree::LoroSnapshots,
+                    f.mallory_note.as_bytes(),
+                )
+                .unwrap()
+                .unwrap();
+        let doc = crate::loro::AtomicLoroDoc::from_snapshot(&stored).unwrap();
+        doc.set_property(property, &value).unwrap();
+        doc.export_snapshot()
+    }
+
+    async fn verdict(f: &LiveFixture, subject: &str, bytes: &[u8]) -> Result<(), String> {
+        let resolved = crate::sync::ws_apply::resolve_update(&f.db, subject, bytes)
+            .await
+            .expect("the update resolves");
+        live_update_may_land(&f.db, &f.mallory, &resolved, false, &mut HashMap::new()).await
+    }
+
+    /// A live `UPDATE` is the same write as a `SYNC_PUSH` entry and gets the
+    /// same refusals: no reference to held bytes its sender cannot read, no
+    /// `drive` other than the one it was admitted under, no move without
+    /// `append` on the new parent.
+    #[tokio::test]
+    async fn a_live_update_is_held_to_the_sync_push_write_checks() {
+        let f = live_fixture("live_update_write_checks").await;
+        let refused = [
+            (
+                "held bytes",
+                "atomic:live-held-reference".to_string(),
+                new_in(
+                    &f.mallory_drive,
+                    &[(
+                        crate::urls::INTERNAL_ID,
+                        crate::Value::String(f.held.clone()),
+                    )],
+                ),
+            ),
+            (
+                "foreign drive",
+                "atomic:live-foreign-drive".to_string(),
+                new_in(
+                    &f.mallory_drive,
+                    &[(
+                        crate::urls::DRIVE_PROP,
+                        crate::Value::AtomicUrl(f.alice_drive.as_str().into()),
+                    )],
+                ),
+            ),
+            (
+                "move without append",
+                f.mallory_note.clone(),
+                note_edit(
+                    &f,
+                    crate::urls::PARENT,
+                    crate::Value::AtomicUrl(f.alice_drive.as_str().into()),
+                ),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, subject, bytes) in refused {
+            if verdict(&f, &subject, &bytes).await.is_ok() {
+                failures.push(format!("{case}: admitted"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn a_live_update_within_the_senders_drive_lands() {
+        let f = live_fixture("live_update_own_drive").await;
+        let edit = note_edit(
+            &f,
+            crate::urls::NAME,
+            crate::Value::String("renamed".into()),
+        );
+        assert_eq!(verdict(&f, &f.mallory_note, &edit).await, Ok(()));
+    }
 
     /// Regression coverage for the live-sync write bypass: `apply_state_update`
     /// / `apply_destroy` used to run with no ACL check and no admission-gate

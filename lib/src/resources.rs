@@ -51,6 +51,12 @@ impl Clone for Resource {
     }
 }
 
+/// Whether two stored values say the same thing. `Value` has no `PartialEq`;
+/// same datatype and same serialization is what a reader can tell apart.
+fn same_value(a: &Value, b: &Value) -> bool {
+    a.datatype() == b.datatype() && a.to_string() == b.to_string()
+}
+
 impl Resource {
     fn clone_loro_state(doc: &crate::loro::AtomicLoroDoc) -> crate::loro::AtomicLoroDoc {
         let snapshot = doc.export_snapshot();
@@ -647,12 +653,27 @@ impl Resource {
         &self.subject
     }
 
-    /// Get a value by property URL
+    /// Get a value by property URL. A `did:ad:` / `atomic:` property is one
+    /// logical property, so either stored spelling answers. Property keys are
+    /// part of the signed history and are never rewritten; when both spellings
+    /// are stored with different values the read fails instead of picking one.
     pub fn get(&self, property_url: &str) -> AtomicResult<&Value> {
-        Ok(self.propvals.get(property_url).ok_or(format!(
-            "Property {} for resource {} not found",
-            property_url, self.subject
-        ))?)
+        let exact = self.propvals.get(property_url);
+        let alias = crate::identifiers::scheme_alias(property_url)
+            .and_then(|alias| self.propvals.get(&alias));
+        match (exact, alias) {
+            (Some(exact), Some(alias)) if !same_value(exact, alias) => Err(format!(
+                "Property {} for resource {} is stored under both scheme spellings with different values",
+                property_url, self.subject
+            )
+            .into()),
+            (Some(value), _) | (None, Some(value)) => Ok(value),
+            (None, None) => Err(format!(
+                "Property {} for resource {} not found",
+                property_url, self.subject
+            )
+            .into()),
+        }
     }
 
     pub fn get_commit_builder(&self) -> &CommitBuilder {
@@ -1122,13 +1143,33 @@ impl Resource {
     /// resources ([`Self::is_native`]) are propval-only and never get a state
     /// doc.
     pub fn remove_propval(&mut self, property_url: &str) -> AtomicResult<()> {
-        if !self.is_native() {
+        let is_native = self.is_native();
+        if !is_native {
             self.ensure_materialized()?;
-            self.loro().remove_property(property_url)?;
         }
-        self.propvals.remove_entry(property_url);
-        self.commit.remove(property_url.into());
+        for key in self.stored_spellings(property_url) {
+            if !is_native {
+                self.loro().remove_property(&key)?;
+            }
+            self.propvals.remove_entry(&key);
+            self.commit.remove(key);
+        }
         Ok(())
+    }
+
+    /// The stored keys a write to `property` acts on: whichever of its
+    /// `did:ad:` / `atomic:` spellings are stored, else `property` itself.
+    /// Editing through one spelling must not add the other beside it, and
+    /// removing must not leave the other behind to reappear through `get`.
+    fn stored_spellings(&self, property: &str) -> Vec<String> {
+        let mut keys: Vec<String> = std::iter::once(property.to_string())
+            .chain(crate::identifiers::scheme_alias(property))
+            .filter(|key| self.propvals.contains_key(key))
+            .collect();
+        if keys.is_empty() {
+            keys.push(property.to_string());
+        }
+        keys
     }
 
     /// Remove a propval from a resource by property URL or shortname.
@@ -1560,10 +1601,14 @@ impl Resource {
 
         if !is_native {
             self.ensure_materialized()?;
-            self.loro().set_property(&property, &value)?;
         }
-        self.propvals.insert(property.clone(), value.clone());
-        self.commit.set(property, value);
+        for key in self.stored_spellings(&property) {
+            if !is_native {
+                self.loro().set_property(&key, &value)?;
+            }
+            self.propvals.insert(key.clone(), value.clone());
+            self.commit.set(key, value.clone());
+        }
         Ok(self)
     }
 
@@ -1756,6 +1801,133 @@ impl From<&Resource> for crate::storelike::ResourceResponse {
 mod test {
     use super::*;
     use crate::{test_utils::init_store, urls};
+
+    /// A resource as stored by a writer that used `spellings` as keys (old
+    /// data, or a peer on the other scheme): set directly, not through the
+    /// alias-aware setters.
+    fn stored_under(subject: &str, spellings: &[(&str, &str)]) -> Resource {
+        let mut resource = Resource::new(subject.into());
+        resource.set_propvals_unsafe(
+            spellings
+                .iter()
+                .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+                .collect(),
+        );
+        resource
+    }
+
+    #[test]
+    fn get_reports_conflicting_scheme_spellings_instead_of_picking_one() {
+        let resource = stored_under(
+            "internal:/property-alias-conflict",
+            &[
+                ("did:ad:property:conflicted", "legacy"),
+                ("atomic:property:conflicted", "canonical"),
+            ],
+        );
+
+        for spelling in ["did:ad:property:conflicted", "atomic:property:conflicted"] {
+            let err = resource.get(spelling).unwrap_err().to_string();
+            assert!(err.contains("different values"), "{spelling}: {err}");
+        }
+    }
+
+    #[test]
+    fn get_reads_equal_values_stored_under_both_scheme_spellings() {
+        let resource = stored_under(
+            "internal:/property-alias-agree",
+            &[
+                ("did:ad:property:agreed", "same"),
+                ("atomic:property:agreed", "same"),
+            ],
+        );
+
+        for spelling in ["did:ad:property:agreed", "atomic:property:agreed"] {
+            assert_eq!(resource.get(spelling).unwrap().to_string(), "same");
+        }
+    }
+
+    #[test]
+    fn setting_through_the_other_spelling_updates_the_stored_key() {
+        let mut resource = stored_under(
+            "internal:/property-alias-set",
+            &[("did:ad:property:edited", "before")],
+        );
+        resource
+            .set_unsafe(
+                "atomic:property:edited".into(),
+                Value::String("after".into()),
+            )
+            .unwrap();
+
+        assert!(
+            !resource
+                .get_propvals()
+                .contains_key("atomic:property:edited"),
+            "no second spelling is stored beside the first"
+        );
+        for spelling in ["did:ad:property:edited", "atomic:property:edited"] {
+            assert_eq!(resource.get(spelling).unwrap().to_string(), "after");
+        }
+        let doc_keys = resource.build_state_doc().unwrap().get_all_properties();
+        assert!(doc_keys.contains_key("did:ad:property:edited"));
+        assert!(!doc_keys.contains_key("atomic:property:edited"));
+    }
+
+    #[test]
+    fn removing_through_the_other_spelling_removes_the_stored_key() {
+        let mut resource = stored_under(
+            "internal:/property-alias-remove",
+            &[("atomic:property:dropped", "gone")],
+        );
+        resource.remove_propval("did:ad:property:dropped").unwrap();
+
+        for spelling in ["did:ad:property:dropped", "atomic:property:dropped"] {
+            let err = resource.get(spelling).unwrap_err().to_string();
+            assert!(err.contains("not found"), "{spelling}: {err}");
+        }
+    }
+
+    #[test]
+    fn setting_a_conflicted_property_updates_both_stored_spellings() {
+        let mut resource = stored_under(
+            "internal:/property-alias-set-both",
+            &[
+                ("did:ad:property:resolved", "legacy"),
+                ("atomic:property:resolved", "canonical"),
+            ],
+        );
+        resource
+            .set_unsafe(
+                "atomic:property:resolved".into(),
+                Value::String("chosen".into()),
+            )
+            .unwrap();
+
+        for spelling in ["did:ad:property:resolved", "atomic:property:resolved"] {
+            assert_eq!(resource.get(spelling).unwrap().to_string(), "chosen");
+        }
+        let doc_keys = resource.build_state_doc().unwrap().get_all_properties();
+        assert!(doc_keys.contains_key("did:ad:property:resolved"));
+        assert!(doc_keys.contains_key("atomic:property:resolved"));
+    }
+
+    #[test]
+    fn removing_a_conflicted_property_removes_both_stored_spellings() {
+        let mut resource = stored_under(
+            "internal:/property-alias-remove-both",
+            &[
+                ("did:ad:property:cleared", "legacy"),
+                ("atomic:property:cleared", "canonical"),
+            ],
+        );
+        resource.remove_propval("did:ad:property:cleared").unwrap();
+
+        for spelling in ["did:ad:property:cleared", "atomic:property:cleared"] {
+            let err = resource.get(spelling).unwrap_err().to_string();
+            assert!(err.contains("not found"), "{spelling}: {err}");
+        }
+    }
 
     mod genesis_signer {
         use super::*;

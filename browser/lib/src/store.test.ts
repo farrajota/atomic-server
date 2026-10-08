@@ -1305,4 +1305,101 @@ describe('Store', () => {
     store.finishScheduledSave();
     expect(store.getSyncStatus().pendingDirtyCount).toBe(0);
   });
+  it('stamps nested resources with the root drive rather than their immediate parent', async ({
+    expect,
+  }) => {
+    const { store } = await testStore();
+    const drive = await store.createDrive('Knowledge Base');
+    const folder = await store.newResource({
+      parent: drive.subject,
+      isA: 'https://atomicdata.dev/classes/Folder',
+    });
+    const nestedFolder = await store.newResource({
+      parent: folder.subject,
+      isA: 'https://atomicdata.dev/classes/Folder',
+    });
+    const nestedResource = await store.newResource({
+      parent: nestedFolder.subject,
+      isA: 'https://atomicdata.dev/classes/Article',
+    });
+
+    expect(folder.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+    expect(nestedFolder.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+    expect(nestedResource.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+  });
+  it('inherits the root drive when an immediate parent has no drive field', async ({
+    expect,
+  }) => {
+    const { store } = await testStore();
+    const drive = await store.createDrive('Knowledge Base');
+    const ancestor = await store.newResource({
+      parent: drive.subject,
+      isA: 'https://atomicdata.dev/classes/Folder',
+    });
+    const parent = new Resource('atomic:resource:parent-without-drive');
+    await parent.set(core.properties.parent, ancestor.subject, false);
+    store.addResource(parent);
+
+    const child = await store.newResource({
+      parent: parent.subject,
+      isA: 'https://atomicdata.dev/classes/Article',
+    });
+
+    expect(child.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+  });
+  it('resolves a cache-missed parent through its persisted ancestry', async ({
+    expect,
+  }) => {
+    const { store } = await testStore();
+    const drive = await store.createDrive('Knowledge Base');
+    const ancestor = await store.newResource({
+      parent: drive.subject,
+      isA: 'https://atomicdata.dev/classes/Folder',
+    });
+    const parentSubject = 'atomic:resource:persisted-parent-cache-miss';
+    const fetchedSubjects: string[] = [];
+
+    store.injectFetch(async input => {
+      const requestedSubject = new URL(String(input)).searchParams.get(
+        'subject',
+      );
+
+      if (requestedSubject === parentSubject) {
+        fetchedSubjects.push(parentSubject);
+
+        return new Response(
+          JSON.stringify({
+            '@id': parentSubject,
+            [core.properties.parent]: ancestor.subject,
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/ad+json' },
+          },
+        );
+      }
+
+      return new Response('Not found', { status: 404 });
+    });
+
+    expect(store.resources.has(parentSubject)).toBe(false);
+
+    const child = await store.newResource({
+      parent: parentSubject,
+      isA: 'https://atomicdata.dev/classes/Article',
+    });
+
+    expect(fetchedSubjects).toContain(parentSubject);
+    expect(child.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+  });
 });
