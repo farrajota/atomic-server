@@ -1745,6 +1745,58 @@ async fn identical_uploads_by_different_users_keep_separate_files() {
     assert_eq!(resp.status(), 401, "a reader of neither drive gets nothing");
 }
 
+/// With `img`, an image upload records its pixel dimensions. Both Properties
+/// must come from the bundled defaults: a server without internet egress
+/// cannot fetch them from atomicdata.dev, and the upload answered 500.
+#[cfg(feature = "img")]
+#[actix_rt::test]
+async fn image_upload_records_dimensions_without_fetching_remote_properties() {
+    let appstate = fresh_appstate(&[]).await;
+    let store = appstate.store.clone();
+    let origin = appstate.config.get_origin();
+    let alice = store.create_agent(Some("Alice")).await.unwrap();
+    let drive = signed_genesis(&store, &alice, None, vec![]).await.unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        5,
+        3,
+        image::Rgba([200, 10, 10, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let png = png.into_inner();
+
+    let resp = test::call_service(
+        &app,
+        upload_request(&alice, &drive, "picture.png", &png, &origin),
+    )
+    .await;
+    let status = resp.status();
+    assert_eq!(status, 200, "image upload: {}", get_body(resp));
+
+    let files = files_with_internal_id(&store, &blob_hex(&png)).await;
+    assert_eq!(files.len(), 1, "the upload made one File");
+    let file = &files[0];
+    assert_eq!(file.get(urls::MIMETYPE).unwrap().to_string(), "image/png");
+    let width = file.get(urls::IMAGE_WIDTH).unwrap();
+    assert!(
+        matches!(width, atomic_lib::Value::Integer(5)),
+        "imageWidth: {width:?}"
+    );
+    let height = file.get(urls::IMAGE_HEIGHT).unwrap();
+    assert!(
+        matches!(height, atomic_lib::Value::Integer(3)),
+        "imageHeight: {height:?}"
+    );
+}
+
 /// Two agents with drives of their own and image Files that share a claimed
 /// hash: alice's private picture is chunked (so its whole-file hash is never
 /// stored as a blob and anyone may reference it), and mallory's File claims

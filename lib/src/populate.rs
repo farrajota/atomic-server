@@ -479,6 +479,39 @@ mod tests {
         );
     }
 
+    /// The server writes `imageWidth`/`imageHeight` on every image upload, so
+    /// their definitions must be bundled: a server without internet egress
+    /// cannot fetch them, and a store seeded by an older build gains them on
+    /// the next open.
+    #[tokio::test]
+    async fn image_dimension_properties_reach_a_store_seeded_without_them() {
+        let id = "populate_image_dimensions_on_reopen";
+        let (db_path, uploads) = temp_paths(id);
+        let dimensions = [urls::IMAGE_WIDTH, urls::IMAGE_HEIGHT];
+        {
+            let store = Db::init_temp(id).await.unwrap();
+            for prop in dimensions {
+                if store.has_stored_resource(&prop.into()) {
+                    store.remove_resource(&prop.into()).await.unwrap();
+                }
+            }
+            store.set_defaults_fingerprint("older-build").unwrap();
+            store.flush().unwrap();
+        }
+
+        let store = Db::init_redb_file(&db_path, Some("https://localhost".into()), &uploads)
+            .await
+            .unwrap();
+        for prop in dimensions {
+            assert!(
+                store.has_stored_resource(&prop.into()),
+                "{prop} must be seeded from the bundled defaults"
+            );
+            let property = store.get_property(prop).await.unwrap();
+            assert_eq!(property.data_type, DataType::Integer);
+        }
+    }
+
     /// Re-seeding only adds; a value the user changed on a default resource
     /// is kept, while a property the resource lost is put back.
     #[tokio::test]

@@ -24,6 +24,8 @@ New-drive sync: WebSocket unit coverage verifies SUB and SYNC wait for a pending
 
 Document images: `document-image.spec.ts` uploads a freshly generated PNG through the editor's image picker in a browser-only drive, whose bytes never reach a server, and verifies the image renders from the local blob store before and after a reload instead of showing "Failed to load image". `subject.test.ts` covers mapping a content-addressed `/download/files/<hash>` URL back to its blob. An image in a server-synced drive on a device that has not got the bytes still loads from the server URL; that path is not separately covered.
 
+Image upload dimensions (`img` feature): `image_upload_records_dimensions_without_fetching_remote_properties` (server) posts a 5x3 PNG to `/upload` with no network and checks the File's integer `imageWidth`/`imageHeight`; before both Properties were bundled in `default_store.json` it answered 500 trying to fetch them from atomicdata.dev. `image_dimension_properties_reach_a_store_seeded_without_them` (`populate.rs`) checks a store seeded by an older build gains them on reopen.
+
 Cover repositioning: `cover-reposition.spec.ts` uploads a real image and verifies multiple pointer movements update its framing before release (native image dragging previously interrupted the gesture).
 
 Template visibility: `settings-templates.spec.ts` toggles Hide templates through Settings, verifies the loaded New page hides templates across reload, and restores them when unchecked.
