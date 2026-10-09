@@ -349,6 +349,162 @@ test.describe('dashboards', () => {
       timeout: 15_000,
     });
   });
+  test('direct table navigation preserves subject, workspace, and view across tabs, history, and dialog close', async ({
+    page,
+  }) => {
+    const fixture = await createSpendingTable(page);
+    const drive = await page.evaluate(() => window.store.getDrive()!);
+    const directURL = new URL('/app/show', FRONTEND_URL);
+    directURL.searchParams.set('subject', fixture.table);
+    directURL.searchParams.set('drive', drive);
+    await page.goto(directURL.href);
+    await expect(page.getByRole('gridcell', { name: 'Coffee' })).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await page.getByTitle('Add view').click();
+    await page.getByRole('menuitem', { name: 'Kanban', exact: true }).click();
+
+    const tableTab = page.getByRole('tab', { name: 'Table', exact: true });
+    const kanbanTab = page.getByRole('tab', { name: 'Kanban', exact: true });
+    await expect(tableTab).toBeVisible({ timeout: 15_000 });
+    await expect(kanbanTab).toHaveAttribute('aria-selected', 'true');
+    // The tab is selected before the route records the new view.
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get('view'))
+      .toBeTruthy();
+    const kanbanView = new URL(page.url()).searchParams.get('view')!;
+
+    const expectRoute = async (view: string) => {
+      await expect
+        .poll(() => {
+          const search = new URL(page.url()).searchParams;
+
+          return {
+            subject: search.get('subject'),
+            drive: search.get('drive'),
+            view: search.get('view'),
+          };
+        })
+        .toEqual({ subject: fixture.table, drive, view });
+    };
+
+    await tableTab.click();
+    await expect(tableTab).toHaveAttribute('aria-selected', 'true');
+    const tableView = new URL(page.url()).searchParams.get('view')!;
+    expect(tableView).toBeTruthy();
+    expect(tableView).not.toBe(kanbanView);
+    await expectRoute(tableView);
+
+    await kanbanTab.click();
+    await expect(kanbanTab).toHaveAttribute('aria-selected', 'true');
+    await expectRoute(kanbanView);
+
+    await page.goBack();
+    await expect(tableTab).toHaveAttribute('aria-selected', 'true');
+    await expectRoute(tableView);
+    await page.goForward();
+    await expect(kanbanTab).toHaveAttribute('aria-selected', 'true');
+    await expectRoute(kanbanView);
+
+    const editURL = new URL(page.url());
+    editURL.searchParams.set('editColumn', fixture.amount);
+    await page.goto(editURL.href);
+    const dialog = page.getByRole('dialog');
+    await expect(
+      dialog.getByRole('heading', { name: 'Edit Column' }),
+    ).toBeVisible({ timeout: 15_000 });
+    await dialog.getByRole('button', { name: 'close' }).click();
+    await expect(dialog).toBeHidden({ timeout: 15_000 });
+
+    const afterClose = new URL(page.url()).searchParams;
+    expect(afterClose.get('subject')).toBe(fixture.table);
+    expect(afterClose.get('drive')).toBe(drive);
+    expect(afterClose.get('view')).toBe(kanbanView);
+    expect(afterClose.get('editColumn')).toBeNull();
+  });
+
+  test('an embedded table route uses its dashboard view instead of the host view query', async ({
+    page,
+  }) => {
+    const fixture = await createSpendingTable(page);
+    const gridView = await page.evaluate(async tableSubject => {
+      const store = window.store;
+      const table = await store.getResourceLoading(tableSubject);
+      const view = await store.newResource({
+        parent: tableSubject,
+        isA: 'https://atomicdata.dev/classes/View',
+        propVals: {
+          'https://atomicdata.dev/properties/name': 'Table',
+          'https://atomicdata.dev/properties/view-kind': 'table',
+        },
+      });
+      await view.save();
+      await table.push(
+        'https://atomicdata.dev/properties/table-views',
+        [view.subject],
+        true,
+      );
+      await table.set(
+        'https://atomicdata.dev/properties/table-default-view',
+        view.subject,
+      );
+      await table.save();
+
+      return view.subject;
+    }, fixture.table);
+    const tableURL = new URL('/app/show', FRONTEND_URL);
+    tableURL.searchParams.set('subject', fixture.table);
+    await page.goto(tableURL.href);
+    await expect(page.getByRole('gridcell', { name: 'Coffee' })).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await page.getByTitle('Add view').click();
+    await page.getByRole('menuitem', { name: 'Kanban', exact: true }).click();
+    await expect(
+      page.getByRole('tab', { name: 'Kanban', exact: true }),
+    ).toHaveAttribute('aria-selected', 'true', { timeout: 15_000 });
+    await expect
+      .poll(() => new URL(page.url()).searchParams.get('view'))
+      .toBeTruthy();
+    const embeddedView = new URL(page.url()).searchParams.get('view')!;
+    expect(embeddedView).toBeTruthy();
+    expect(embeddedView).not.toBe(gridView);
+
+    const dashboard = await createDashboard(page, fixture);
+    const persistedGrid = await page.evaluate(
+      async ({ tableSubject, viewSubject }) => {
+        const store = window.store;
+        const table = await store.getResource(tableSubject);
+        const view = await store.getResource(viewSubject);
+
+        return {
+          defaultView: table.get(
+            'https://atomicdata.dev/properties/table-default-view',
+          ),
+          kind: view.get('https://atomicdata.dev/properties/view-kind'),
+        };
+      },
+      { tableSubject: fixture.table, viewSubject: gridView },
+    );
+    expect(persistedGrid).toEqual({ defaultView: gridView, kind: 'table' });
+    const dashboardURL = new URL(page.url());
+    dashboardURL.searchParams.set('view', embeddedView);
+    await page.goto(dashboardURL.href);
+
+    const embeddedTable = block(page, 'All expenses');
+    await expect(embeddedTable.getByRole('grid')).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(
+      embeddedTable.getByRole('gridcell', { name: 'Coffee' }),
+    ).toBeVisible({ timeout: 15_000 });
+
+    const hostSearch = new URL(page.url()).searchParams;
+    expect(hostSearch.get('subject')).toBe(dashboard);
+    expect(hostSearch.get('view')).toBe(embeddedView);
+  });
 
   test(
     'the four block kinds each show what they were configured to',

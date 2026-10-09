@@ -45,37 +45,35 @@ pub async fn handle_download(
     // Content-addressed URLs identify blob bytes, not a File resource at
     // `/files/<hash>`. This remains true when requesting an image rendition:
     // uploads have DID resources, and peers can hold the blob without metadata.
-    // The mimetype is not carried by the hash alone, so it is recovered from
-    // any File resource sharing this `internalId` — falling back to
-    // `application/octet-stream` only when none exists (see
-    // `mimetype_by_internal_id`; without the real mimetype, `nosniff` makes
-    // browsers refuse to render an uploaded SVG inline).
+    // Whatever is served under the hash hashes to it, and the mimetype, which
+    // the hash does not carry, comes from a File of those bytes the reader may
+    // read — falling back to `application/octet-stream` only when there is
+    // none (see `stored_blob_mimetype`; without the real mimetype, `nosniff`
+    // makes browsers refuse to render an uploaded SVG inline).
     if let Some(hash_hex) = subject_path.strip_prefix("/files/") {
-        if hash_hex.len() == 64 && hex::decode(hash_hex).is_ok() {
+        if let Ok(hash) = blake3::Hash::from_hex(hash_hex) {
             let reader = authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
-            let (bytes, mimetype) = match blob_by_hash_hex(hash_hex, &appstate).await? {
-                Some(bytes) => (
-                    Some(bytes),
-                    mimetype_by_internal_id(hash_hex, &appstate).await,
-                ),
-                None => {
-                    match chunked_file_by_internal_id(hash_hex, reader.as_ref(), &appstate).await? {
-                        Some(file) => (
-                            Some(reconstruct_file_bytes(&file, &appstate).await?),
-                            mimetype_of(&file),
-                        ),
-                        None => (None, DEFAULT_MIMETYPE.to_string()),
-                    }
-                }
+            let rendition = params.q.is_some() || params.w.is_some() || params.f.is_some();
+            // A rendition carries its own type, so the stored blob's is only
+            // looked up when the bytes are served as they are.
+            let served = match blob_by_hash_hex(hash_hex, &appstate).await? {
+                Some(bytes) if rendition => Some((bytes, None)),
+                Some(bytes) => Some((
+                    bytes,
+                    Some(stored_blob_mimetype(hash_hex, reader.as_ref(), &appstate).await?),
+                )),
+                None => chunked_file_by_internal_id(hash_hex, &hash, reader.as_ref(), &appstate)
+                    .await?
+                    .map(|(bytes, mimetype)| (bytes, Some(mimetype))),
             };
-            let bytes = bytes.ok_or_else(|| {
+            let (bytes, mimetype) = served.ok_or_else(|| {
                 atomic_lib::errors::AtomicError::not_found(format!("Blob not found: {hash_hex}"))
             })?;
-            if params.q.is_none() && params.w.is_none() && params.f.is_none() {
-                return Ok(user_blob_response(mimetype, bytes));
-            }
-            let hash_bytes = hex::decode(hash_hex).expect("validated hash");
-            return serve_processed_image(&bytes, &hash_bytes, &params, &appstate).await;
+            let response = match mimetype {
+                Some(mimetype) if !rendition => user_blob_response(mimetype, bytes),
+                _ => serve_processed_image(&bytes, &hash, &params, &appstate).await?,
+            };
+            return Ok(private_unless_public(response, reader.as_ref()));
         }
     }
 
@@ -84,11 +82,18 @@ pub async fn handle_download(
     // Support did:ad:blob: subjects directly in /download
     if subject.is_blob_did() {
         if let Some(hash_hex) = subject.blob_hash_hex() {
-            authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
-            if let Some(bytes) = blob_by_hash_hex(hash_hex, &appstate).await? {
-                let mimetype = mimetype_by_internal_id(hash_hex, &appstate).await;
+            let reader = authorize_blob_read(hash_hex, &req, &origin, &appstate).await?;
+            let stored = match blake3::Hash::from_hex(hash_hex) {
+                Ok(_) => blob_by_hash_hex(hash_hex, &appstate).await?,
+                Err(_) => None,
+            };
+            if let Some(bytes) = stored {
+                let mimetype = stored_blob_mimetype(hash_hex, reader.as_ref(), &appstate).await?;
 
-                return Ok(user_blob_response(mimetype, bytes));
+                return Ok(private_unless_public(
+                    user_blob_response(mimetype, bytes),
+                    reader.as_ref(),
+                ));
             }
         }
     }
@@ -103,7 +108,22 @@ pub async fn handle_download(
         .await?
         .to_single();
 
-    download_file_handler_partial(&resource, &req, &params, &appstate).await
+    let response = download_file_handler_partial(&resource, &req, &params, &appstate).await?;
+    Ok(private_unless_public(response, Some(&for_agent)))
+}
+
+/// Bytes served because a signed-in agent may read them must not be kept by
+/// shared caches, which would hand them to the next visitor of the URL.
+/// `None` is a content-addressed read without `--require-blob-auth`, where
+/// the hash itself is the capability and no reader was established.
+fn private_unless_public(mut response: HttpResponse, reader: Option<&ForAgent>) -> HttpResponse {
+    if reader.is_some_and(|agent| *agent != ForAgent::Public) {
+        response.headers_mut().insert(
+            actix_web::http::header::CACHE_CONTROL,
+            actix_web::http::header::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    response
 }
 
 /// With `--require-blob-auth`, a content-addressed request is answered only
@@ -175,15 +195,31 @@ async fn blob_by_hash_hex(
     Ok(appstate.store.get_blob(&hash_bytes).await?)
 }
 
+/// The most bytes a chunked File is rebuilt to: its declared `filesize`, and
+/// never more than an upload may carry. Anyone may list the same huge chunk
+/// any number of times, and the File's subject and every hash it claims are
+/// served by rebuilding it.
+fn rebuild_limit(resource: &Resource) -> usize {
+    let declared = match resource.get(urls::FILESIZE) {
+        Ok(Value::Integer(size)) => usize::try_from(*size).ok(),
+        _ => None,
+    };
+    declared.map_or(crate::serve::PAYLOAD_MAX, |size| {
+        size.min(crate::serve::PAYLOAD_MAX)
+    })
+}
+
 /// The bytes of a File: concatenated chunk blobs when it is chunked (its `chunks`
 /// property is a non-empty ordered list of `did:ad:blob:` refs), otherwise the
-/// single blob referenced by `internalId`.
+/// single blob referenced by `internalId`. Rebuilding stops with an error as
+/// soon as the chunks exceed [rebuild_limit].
 async fn reconstruct_file_bytes(
     resource: &Resource,
     appstate: &AppState,
 ) -> AtomicServerResult<Vec<u8>> {
     if let Ok(Value::ResourceArray(chunks)) = resource.get(urls::CHUNKS) {
         if !chunks.is_empty() {
+            let limit = rebuild_limit(resource);
             let mut out = Vec::new();
 
             for chunk in chunks {
@@ -195,6 +231,13 @@ async fn reconstruct_file_bytes(
                 let bytes = blob_by_hash_hex(hash_hex, appstate)
                     .await?
                     .ok_or_else(|| format!("Chunk blob not found: {hash_hex}"))?;
+                if bytes.len() > limit - out.len() {
+                    return Err(format!(
+                        "The chunks of {} exceed its size of at most {limit} bytes",
+                        resource.get_subject()
+                    )
+                    .into());
+                }
                 out.extend_from_slice(&bytes);
             }
 
@@ -223,48 +266,106 @@ async fn reconstruct_file_bytes(
         .ok_or_else(|| format!("Blob not found: {}", internal_id).into())
 }
 
-/// Every File resource whose whole-file `internalId` is this hash. Lets the
+/// Resources whose whole-file `internalId` is this hash. Lets the
 /// content-addressed `/download/files/{hash}` route recover the metadata
 /// (mimetype, chunk list) that the hash alone does not carry. More than one
 /// File can share a hash — the same bytes uploaded twice are stored once.
+/// Like the read check on the blob, only the first
+/// [MAX_BLOB_REFERENCES_CHECKED](atomic_lib::hierarchy::MAX_BLOB_REFERENCES_CHECKED)
+/// are looked at: anyone may name a hash from as many resources as they like.
 async fn files_by_internal_id(
     hash_hex: &str,
     appstate: &AppState,
 ) -> AtomicServerResult<Vec<Resource>> {
-    let result = appstate
-        .store
-        .query(&Query::new_prop_val(urls::INTERNAL_ID, hash_hex))
-        .await?;
+    let mut query = Query::new_prop_val(urls::INTERNAL_ID, hash_hex);
+    query.limit = Some(atomic_lib::hierarchy::MAX_BLOB_REFERENCES_CHECKED);
+    let result = appstate.store.query(&query).await?;
 
     Ok(result.resources)
 }
 
-/// Find a chunked File by its whole-file `internalId`, so the content-addressed
-/// URL works for chunked files (whose whole-file blob is never stored).
-/// `None` if no such chunked File.
+/// How many chunked Files claiming a whole-file hash
+/// [chunked_file_by_internal_id] rebuilds and hashes, at most, per request.
+/// The whole-file hash is never stored, so anyone may claim it from Files of
+/// their own; each costs a rebuild. A real file is normally claimed by one or
+/// a few Files. Past the bound the address answers `404` while each File's
+/// own `/download/{subject}` keeps working.
+const MAX_CHUNKED_CLAIMANTS_REBUILT: usize = 8;
+
+fn has_chunks(resource: &Resource) -> bool {
+    matches!(resource.get(urls::CHUNKS), Ok(Value::ResourceArray(c)) if !c.is_empty())
+}
+
+/// With `reader` (blob read auth on), whether that agent may read `file`.
+/// Without it the hash is the capability and every File counts.
+async fn may_read(file: &Resource, reader: Option<&ForAgent>, appstate: &AppState) -> bool {
+    match reader {
+        Some(reader) => atomic_lib::hierarchy::check_read(&appstate.store, file, reader)
+            .await
+            .is_ok(),
+        None => true,
+    }
+}
+
+/// The bytes of a chunked File when they hash to `hash`. Its `internalId` is
+/// only a claim: anyone may name a whole-file hash that has no stored blob,
+/// next to chunks of their own. A File whose chunks are not all held here
+/// cannot produce the bytes and does not match either.
+async fn chunked_bytes_matching(
+    file: &Resource,
+    hash: &blake3::Hash,
+    appstate: &AppState,
+) -> Option<Vec<u8>> {
+    match reconstruct_file_bytes(file, appstate).await {
+        Ok(bytes) if blake3::hash(&bytes) == *hash => Some(bytes),
+        Ok(_) => {
+            tracing::debug!(
+                "{} claims blob {hash} but its chunks hash otherwise",
+                file.get_subject()
+            );
+            None
+        }
+        Err(e) => {
+            tracing::debug!(
+                "{} claims blob {hash} but its bytes cannot be rebuilt: {e}",
+                file.get_subject()
+            );
+            None
+        }
+    }
+}
+
+/// Bytes and mimetype for the content-addressed URL of a chunked file, whose
+/// whole-file blob is never stored: from the first chunked File with this
+/// `internalId` that the reader may read and whose chunks hash to it. `None`
+/// if there is no such File among the first [MAX_CHUNKED_CLAIMANTS_REBUILT]
+/// readable ones.
 ///
-/// With `reader` (blob read auth on), only a File that agent may read counts.
 /// The whole-file hash has no bytes of its own, so anyone may reference it
 /// from a resource they write; that reference passes `check_blob_read`, and
-/// must not then unlock somebody else's chunks.
+/// must neither unlock somebody else's chunks nor serve its own chunks under
+/// somebody else's hash.
 async fn chunked_file_by_internal_id(
     hash_hex: &str,
+    hash: &blake3::Hash,
     reader: Option<&ForAgent>,
     appstate: &AppState,
-) -> AtomicServerResult<Option<Resource>> {
+) -> AtomicServerResult<Option<(Vec<u8>, String)>> {
+    let mut rebuilt = 0;
     for file in files_by_internal_id(hash_hex, appstate).await? {
-        if !matches!(file.get(urls::CHUNKS), Ok(Value::ResourceArray(c)) if !c.is_empty()) {
+        if rebuilt >= MAX_CHUNKED_CLAIMANTS_REBUILT {
+            tracing::debug!(
+                "blob {hash}: more than {MAX_CHUNKED_CLAIMANTS_REBUILT} chunked Files claim it"
+            );
+            break;
+        }
+        if !has_chunks(&file) || !may_read(&file, reader, appstate).await {
             continue;
         }
-        if let Some(reader) = reader {
-            if atomic_lib::hierarchy::check_read(&appstate.store, &file, reader)
-                .await
-                .is_err()
-            {
-                continue;
-            }
+        rebuilt += 1;
+        if let Some(bytes) = chunked_bytes_matching(&file, hash, appstate).await {
+            return Ok(Some((bytes, mimetype_of(&file))));
         }
-        return Ok(Some(file));
     }
     Ok(None)
 }
@@ -277,24 +378,49 @@ fn mimetype_of(resource: &Resource) -> String {
         .unwrap_or_else(|_| DEFAULT_MIMETYPE.to_string())
 }
 
-/// The mimetype of the File whose `internalId` is this hash.
+/// The mimetype to serve the stored blob `hash` with.
 ///
 /// The content-addressed routes are handed nothing but a hash, but they must
 /// still answer with the real mimetype: `user_blob_response` sets `nosniff`, so
 /// an `application/octet-stream` answer makes the browser refuse to render the
 /// bytes in an `<img>` — which is exactly how every client-uploaded file is
 /// referenced, since `downloadURL` points at `/download/files/{hash}`.
-async fn mimetype_by_internal_id(hash_hex: &str, appstate: &AppState) -> String {
-    let Ok(files) = files_by_internal_id(hash_hex, appstate).await else {
-        return DEFAULT_MIMETYPE.to_string();
-    };
-
-    // Duplicate uploads of the same bytes all carry the same mimetype, so any
-    // File that has one answers for the hash; skip those that don't.
-    files
-        .iter()
-        .find_map(|f| f.get(urls::MIMETYPE).ok().map(|v| v.to_string()))
-        .unwrap_or_else(|| DEFAULT_MIMETYPE.to_string())
+///
+/// Anyone may name a hash before its bytes are uploaded, so the type comes
+/// only from a File the reader may read whose own bytes are this blob: one
+/// naming it by `internalId` or `blob`, without chunks. A chunked File's bytes
+/// are its chunks; telling whether they hash to this blob would take
+/// rebuilding them, for every such File, on every request.
+async fn stored_blob_mimetype(
+    hash_hex: &str,
+    reader: Option<&ForAgent>,
+    appstate: &AppState,
+) -> AtomicServerResult<String> {
+    let mut by_blob = Query::new();
+    by_blob.property = Some(urls::BLOB.to_string());
+    by_blob.value = Some(Value::AtomicUrl(
+        atomic_lib::identifiers::blob_subject(&hash_hex.to_ascii_lowercase()).into(),
+    ));
+    by_blob.limit = Some(atomic_lib::hierarchy::MAX_BLOB_REFERENCES_CHECKED);
+    let named_by_blob = appstate.store.query(&by_blob).await?.resources;
+    let claimants = files_by_internal_id(hash_hex, appstate)
+        .await?
+        .into_iter()
+        .chain(named_by_blob);
+    for file in claimants {
+        let Ok(mimetype) = file.get(urls::MIMETYPE) else {
+            continue;
+        };
+        let own_bytes = match file.get(urls::INTERNAL_ID) {
+            Ok(id) => id.to_string().eq_ignore_ascii_case(hash_hex),
+            Err(_) => true,
+        };
+        if !own_bytes || has_chunks(&file) || !may_read(&file, reader, appstate).await {
+            continue;
+        }
+        return Ok(mimetype.to_string());
+    }
+    Ok(DEFAULT_MIMETYPE.to_string())
 }
 
 pub async fn download_file_handler_partial(
@@ -305,13 +431,6 @@ pub async fn download_file_handler_partial(
 ) -> AtomicServerResult<HttpResponse> {
     let bytes = reconstruct_file_bytes(resource, appstate).await?;
 
-    // The source hash for the image-rendition cache key is the whole-file hash.
-    let internal_id = resource
-        .get(urls::INTERNAL_ID)
-        .map(|v| v.to_string())
-        .unwrap_or_default();
-    let hash_bytes = hex::decode(&internal_id).unwrap_or_default();
-
     let mimetype = mimetype_of(resource);
 
     // No params: serve the original bytes verbatim.
@@ -319,17 +438,16 @@ pub async fn download_file_handler_partial(
         return Ok(user_blob_response(mimetype, bytes));
     }
 
-    // With image params: serve a processed rendition. Cache it in the blob backend
-    // under a deterministic synthetic hash so future requests with the same
-    // params hit the cache and any peer that has produced the same rendition
-    // can serve it content-addressably.
-    serve_processed_image(&bytes, &hash_bytes, params, appstate).await
+    // With image params: serve a processed rendition, cached in the blob
+    // backend under a key derived from these bytes (see `processed_cache_key`).
+    serve_processed_image(&bytes, &blake3::hash(&bytes), params, appstate).await
 }
 
+/// `source_hash` is the BLAKE3 hash of `source_bytes`.
 #[cfg(feature = "img")]
 async fn serve_processed_image(
     source_bytes: &[u8],
-    source_hash: &[u8],
+    source_hash: &blake3::Hash,
     params: &web::Query<DownloadParams>,
     appstate: &AppState,
 ) -> AtomicServerResult<HttpResponse> {
@@ -357,26 +475,44 @@ async fn serve_processed_image(
 #[cfg(not(feature = "img"))]
 async fn serve_processed_image(
     _source_bytes: &[u8],
-    _source_hash: &[u8],
+    _source_hash: &blake3::Hash,
     _params: &web::Query<DownloadParams>,
     _appstate: &AppState,
 ) -> AtomicServerResult<HttpResponse> {
     Err("Image processing is not enabled in this build (compile with the `img` feature)".into())
 }
 
-/// Deterministic 32-byte cache key for a processed rendition. Same source
-/// hash + same params => same key on every server, so the rendition is
-/// content-addressable across the mesh.
+/// Prefix of every rendition cache key. It makes the key longer than the 32
+/// bytes of a BLAKE3 hash, the only length `/download/files/<hash>`, a blob
+/// identifier or a sync blob request can name.
 #[cfg(feature = "img")]
-fn processed_cache_key(source_hash: &[u8], format: &str, params: &DownloadParams) -> [u8; 32] {
+const RENDITION_KEY_PREFIX: &[u8] = b"rendition:";
+
+/// Cache key for a processed rendition: derived from the hash of the bytes it
+/// is made from (computed from them, or the content address they were
+/// verified against) and the parameters, never from the hash a File merely
+/// claims as its `internalId`. A File claiming someone else's hash next to
+/// chunks of its own would otherwise read or overwrite their cached
+/// renditions, and a 32-byte key computable from a public hash could be
+/// referenced before it is rendered and then fetched as a blob.
+#[cfg(feature = "img")]
+fn processed_cache_key(
+    source_hash: &blake3::Hash,
+    format: &str,
+    params: &DownloadParams,
+) -> Vec<u8> {
     let canonical = format!(
-        "processed|hash={}|f={}|q={}|w={}",
-        hex::encode(source_hash),
+        "rendition|source={}|f={}|q={}|w={}",
+        source_hash.to_hex(),
         format,
         params.q.map(|q| q.to_string()).unwrap_or_default(),
         params.w.map(|w| w.to_string()).unwrap_or_default(),
     );
-    *blake3::hash(canonical.as_bytes()).as_bytes()
+    [
+        RENDITION_KEY_PREFIX,
+        blake3::hash(canonical.as_bytes()).as_bytes(),
+    ]
+    .concat()
 }
 
 /// Largest width a rendition is produced at; wider requests are clamped.

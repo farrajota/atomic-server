@@ -16,9 +16,11 @@ import type { Collection } from './collection.js';
 import { CollectionBuilder } from './collectionBuilder.js';
 import { CommitBuilder, isCommitSubject, Commit } from './commit.js';
 import {
+  canonicalizeScheme,
   isAgentSubject,
   isAtomicIdentifier,
   commitSubject,
+  schemeAlias,
 } from './subject.js';
 import { perfSpan } from './perf-trace.js';
 import { validateDatatype, datatypeTag, Datatype } from './datatypes.js';
@@ -47,6 +49,7 @@ import { withDeadline } from './withDeadline.js';
 
 /** How long a save the server already acknowledged waits on the local mirror. */
 const LOCAL_MIRROR_AFTER_ACK_DEADLINE_MS = 3_000;
+const DRIVE_PROPERTY = 'https://atomicdata.dev/properties/drive';
 
 /**
  * How long a write whose local copy is the only copy waits for a database that
@@ -154,6 +157,15 @@ export type ResourceReadState =
   | 'ready'
   | 'error';
 
+/** One logical property stored under both `did:ad:` and `atomic:` spellings
+ * with different values. See {@link Resource.getPropertyAliasConflict}. */
+export interface PropertyAliasConflict {
+  property: string;
+  value: AtomicValue;
+  alias: string;
+  aliasValue: AtomicValue;
+}
+
 type ResourceEventHandlers = {
   [ResourceEvents.SaveStateChange]: () => void;
   [ResourceEvents.LocalChange]: (prop: string, value: JSONValue) => void;
@@ -205,6 +217,8 @@ export class Resource<C extends OptionalClass = any> {
   /** True when Loro has been modified but #cache hasn't been rebuilt yet. */
   #cacheDirty = false;
   private _auxValues: Map<string, AtomicValue> = new Map();
+  /** Logical properties whose conflicting spellings were already reported. */
+  #reportedAliasConflicts = new Set<string>();
   /** Raw Loro snapshot bytes, kept separate from properties. Not a propval. */
   private _loroSnapshotBytes?: Uint8Array | string;
 
@@ -1161,7 +1175,11 @@ export class Resource<C extends OptionalClass = any> {
     // Incremental saves bypass `signChanges`; the datatype tags for newly
     // added JSON/reference fields are written by `exportLoroDeltaInternal`,
     // the path both signers share.
-    const bytes = this.exportLoroDeltaInternal(isFirstCommit, commitMessage);
+    const bytes = this.exportLoroDeltaInternal(
+      isFirstCommit,
+      commitMessage,
+      false,
+    );
     if (!bytes) return undefined;
     if (!this._loroDoc) return undefined;
 
@@ -1181,7 +1199,14 @@ export class Resource<C extends OptionalClass = any> {
     isFirstCommit: boolean,
     commitMessage?: string,
   ): Uint8Array | undefined {
-    return this.exportLoroDeltaInternal(isFirstCommit, commitMessage);
+    // `signChanges` passes the signing agent as the genesis message; it must
+    // name the genesis change even when an edit token is staged, since that
+    // message is what `getCreatedBy` reads.
+    return this.exportLoroDeltaInternal(
+      isFirstCommit,
+      commitMessage,
+      isFirstCommit,
+    );
   }
 
   /**
@@ -1382,7 +1407,8 @@ export class Resource<C extends OptionalClass = any> {
 
   private exportLoroDeltaInternal(
     isFirstCommit: boolean,
-    commitMessage?: string,
+    commitMessage: string | undefined,
+    commitMessageWins: boolean,
   ): Uint8Array | undefined {
     if (!this._loroDoc) {
       return undefined;
@@ -1421,7 +1447,9 @@ export class Resource<C extends OptionalClass = any> {
     // mixed-unit oplogs via `normalizeLoroChangeTimestampMs`.
     // Ops a remote import already sealed carry the staged token; use the
     // same one here so everything in this export forms one bucket.
-    const message = this._stagedCommitToken ?? commitMessage;
+    const message = commitMessageWins
+      ? commitMessage
+      : (this._stagedCommitToken ?? commitMessage);
     this._loroDoc.commit({
       timestamp: Date.now(),
       ...(message ? { message } : {}),
@@ -1562,18 +1590,48 @@ export class Resource<C extends OptionalClass = any> {
     }
 
     // Agents can always edit their own resource (e.g. their profile)
-    if (agent === this.subject) {
+    if (sameAgent(agent, this.subject)) {
       return [true, undefined];
     }
 
+    // Mirrors the server's `check_rights` (lib/src/hierarchy.rs): explicit
+    // grants first, then the drive stamp, then the parent walk. One server
+    // rule is not mirrored: the server's own default agent may write
+    // anything. No resource or response tells a client which agent that is,
+    // and guessing would show edit controls the server refuses, so someone
+    // signed in as that agent sees read-only controls where it has no grant.
     const writeArray = this.get(core.properties.write);
+    const writers = writeArray ? (valToArray(writeArray) as string[]) : [];
 
-    if (writeArray && valToArray(writeArray).includes(agent)) {
+    if (writers.some(writer => sameAgent(writer, agent))) {
       return [true, undefined];
     }
 
-    if (writeArray && valToArray(writeArray).includes(instances.publicAgent)) {
+    if (writers.includes(instances.publicAgent)) {
       return [true, undefined];
+    }
+
+    // Cycle detection: any ancestor we've already visited in this chain.
+    // Catches both immediate (A↔B) and longer (A→B→C→A) cycles.
+    const visited = seen ?? new Set<string>();
+    visited.add(this.subject);
+
+    // The drive stamp grants what the drive grants, even while the parent
+    // chain is not loaded; a deny there still lets an intermediate parent's
+    // grant count, so the walk continues below.
+    const driveSubject = this.get(DRIVE_PROPERTY);
+
+    if (
+      typeof driveSubject === 'string' &&
+      driveSubject &&
+      !visited.has(driveSubject)
+    ) {
+      const drive: Resource = await this.store.getResource(driveSubject);
+      const [driveAllows] = await drive.canWrite(agent, new Set(visited));
+
+      if (driveAllows) {
+        return [true, undefined];
+      }
     }
 
     const parentSubject = this.get(properties.parent) as string;
@@ -1582,14 +1640,10 @@ export class Resource<C extends OptionalClass = any> {
       return [false, `No write right or parent in ${this.subject}`];
     }
 
-    // Agents can always edit themselves
-    if (parentSubject === agent) {
+    // Agents can always edit their children.
+    if (sameAgent(parentSubject, agent)) {
       return [true, undefined];
     }
-
-    // Cycle detection: any ancestor we've already visited in this chain.
-    // Catches both immediate (A↔B) and longer (A→B→C→A) cycles.
-    const visited = seen ?? new Set<string>();
 
     if (visited.has(parentSubject)) {
       console.warn(
@@ -1599,10 +1653,8 @@ export class Resource<C extends OptionalClass = any> {
         parentSubject,
       );
 
-      return [true, `Circular parent chain at ${this.subject}`];
+      return [false, `Circular parent chain at ${this.subject}`];
     }
-
-    visited.add(this.subject);
 
     const parent: Resource = await this.store.getResource(parentSubject);
 
@@ -1841,6 +1893,16 @@ export class Resource<C extends OptionalClass = any> {
   }
 
   /** Get a Value by its property
+   *
+   * A `did:ad:` / `atomic:` property is one logical property, so a value
+   * stored under either spelling answers. When both spellings hold different
+   * values, the value stored under the requested spelling is returned and the
+   * conflict is reported once (see {@link getPropertyAliasConflict}).
+   *
+   * This intentionally differs from the Rust `Resource::get`, which returns
+   * an error for such a conflict: here `get` runs inside React render
+   * snapshots (`useValue`), where a throw would take down the whole view, so
+   * the conflict is diagnosed instead and both values stay readable.
    * @param propUrl The subject of the property
    * @example
    * import { core } from '@tomic/lib'
@@ -1850,14 +1912,103 @@ export class Resource<C extends OptionalClass = any> {
   public get<Prop extends string, Returns = InferTypeOfValueInTriple<C, Prop>>(
     propUrl: Prop,
   ): Returns {
+    this.ensureFreshCache();
+
+    const directValue = this.storedValue(propUrl);
+    const alias = schemeAlias(propUrl);
+    const aliasValue = alias ? this.storedValue(alias) : undefined;
+
+    if (directValue === undefined) {
+      return aliasValue as Returns;
+    }
+
+    if (alias && aliasValue !== undefined) {
+      this.reportAliasConflict(propUrl, directValue, alias, aliasValue);
+    }
+
+    return directValue as Returns;
+  }
+
+  /**
+   * The two stored values when `propUrl` is stored under both the `did:ad:`
+   * and the `atomic:` spelling with different values; `undefined` when only
+   * one spelling is stored or both hold the same value. Neither stored value
+   * is rewritten: both remain readable through their own spelling.
+   */
+  public getPropertyAliasConflict(
+    propUrl: string,
+  ): PropertyAliasConflict | undefined {
+    this.ensureFreshCache();
+
+    const value = this.storedValue(propUrl);
+    const alias = schemeAlias(propUrl);
+    const aliasValue = alias ? this.storedValue(alias) : undefined;
+
+    if (
+      !alias ||
+      value === undefined ||
+      aliasValue === undefined ||
+      jsonEqual(value as JSONValue, aliasValue as JSONValue)
+    ) {
+      return undefined;
+    }
+
+    return { property: propUrl, value, alias, aliasValue };
+  }
+
+  private ensureFreshCache(): void {
     this.materializeBufferedSnapshot();
 
     if (this.#cacheDirty && this._loroDoc) {
       this.rebuildCacheFromLoro();
       this.#cacheDirty = false;
     }
+  }
 
-    return (this._auxValues.get(propUrl) ?? this.#cache[propUrl]) as Returns;
+  private storedValue(propUrl: string): AtomicValue | undefined {
+    return this._auxValues.get(propUrl) ?? this.#cache[propUrl];
+  }
+
+  /**
+   * The keys a write to `propUrl` acts on: whichever of its `did:ad:` /
+   * `atomic:` spellings are stored, else `propUrl` itself. A value stored only
+   * under the opposite spelling is edited in place, so an edit never splits
+   * one logical property across two keys (which would then read as a
+   * conflict). When both are stored, an explicit edit writes or removes both,
+   * settling the conflict as the Rust `Resource::stored_spellings` does; a
+   * removal never leaves the other value behind to reappear through `get`.
+   */
+  private storedSpellings(propUrl: string): string[] {
+    const alias = schemeAlias(propUrl);
+
+    if (!alias) return [propUrl];
+
+    this.ensureFreshCache();
+
+    const stored = [propUrl, alias].filter(
+      key => this.storedValue(key) !== undefined,
+    );
+
+    return stored.length > 0 ? stored : [propUrl];
+  }
+
+  private reportAliasConflict(
+    propUrl: string,
+    value: AtomicValue,
+    alias: string,
+    aliasValue: AtomicValue,
+  ): void {
+    if (jsonEqual(value as JSONValue, aliasValue as JSONValue)) return;
+
+    const logicalProperty = [propUrl, alias].sort().join(' ');
+
+    if (this.#reportedAliasConflicts.has(logicalProperty)) return;
+
+    this.#reportedAliasConflicts.add(logicalProperty);
+    // Names only: property values can be private content.
+    console.warn(
+      `[Resource] Property ${propUrl} for resource ${this.subject} is stored under both scheme spellings with different values (${alias}); returning the value stored under the requested spelling.`,
+    );
   }
 
   /**
@@ -3085,9 +3236,33 @@ export class Resource<C extends OptionalClass = any> {
 
   /** Removes a property value combination from the resource */
   public remove(propertyUrl: string): void {
+    const storedKeys = this.storedSpellings(propertyUrl);
     this.removeUnsafe(propertyUrl);
     this._dirty = true;
-    this.eventManager.emit(ResourceEvents.LocalChange, propertyUrl, undefined);
+    this.emitLocalChange(propertyUrl, storedKeys, undefined);
+  }
+
+  /** Notifies readers of the requested and every stored spelling. */
+  private emitLocalChange(
+    propertyUrl: string,
+    storedKeys: string[],
+    value: JSONValue | undefined,
+  ): void {
+    this.eventManager.emit(
+      ResourceEvents.LocalChange,
+      propertyUrl,
+      value as JSONValue,
+    );
+
+    for (const storedKey of storedKeys) {
+      if (storedKey === propertyUrl) continue;
+
+      this.eventManager.emit(
+        ResourceEvents.LocalChange,
+        storedKey,
+        value as JSONValue,
+      );
+    }
   }
 
   /**
@@ -3149,54 +3324,21 @@ export class Resource<C extends OptionalClass = any> {
       // creating agent's active drive. They coincide when you create in your
       // own drive, but diverge when a guest writes into a drive shared with
       // them (e.g. replying in someone else's chatroom): the resource belongs
-      // to the OWNER's drive. Stamping the guest's own drive (or nothing) would
-      // misroute the commit — the drive-scoped fan-out delivers only to the
-      // owning drive's subscribers, so the owner never sees it. So the parent's
-      // drive is authoritative: walk the LOCAL parent chain first (sync — the
-      // chain is cached while you're viewing it, and `rebuildCacheFromLoro` now
-      // preserves `drive`/`parent`), and only fall back to the active drive for
-      // a top-level resource or a parent not yet materialized.
+      // to the OWNER's drive. Stamping the guest's own drive would misroute
+      // the commit — the drive-scoped fan-out delivers only to the owning
+      // drive's subscribers. So the parent's lineage is authoritative, read
+      // from the local store only (sync with what `newResource` resolved, no
+      // network on the signing path). When it is unknown the drive stays
+      // unset and the server resolves it from the parent; the active drive is
+      // only a fallback for a top-level resource, which has no parent at all.
       const DRIVE_CLASS = 'https://atomicdata.dev/classes/Drive';
       let drive: string | undefined;
 
       if (parentSubject) {
-        let cursor: string | undefined = parentSubject;
-        const seen = new Set<string>();
-
-        while (cursor && !seen.has(cursor)) {
-          seen.add(cursor);
-          const ancestor = this.store.getResourceLoading(cursor);
-          const ancestorDrive = ancestor?.get(DRIVE_PROP) as string | undefined;
-
-          if (ancestorDrive) {
-            drive = ancestorDrive; // ancestor knows its drive (common path)
-            break;
-          }
-
-          const classes =
-            (ancestor?.get(core.properties.isA) as string[] | undefined) ?? [];
-
-          if (classes.includes(DRIVE_CLASS)) {
-            drive = cursor; // the chain reached the Drive root itself
-            break;
-          }
-
-          const grandparent = ancestor?.get(core.properties.parent) as
-            | string
-            | undefined;
-
-          if (!grandparent) {
-            // Inconclusive: a genuine top-level root, or an ancestor not
-            // materialized yet. Don't guess a non-drive ancestor — fall back
-            // to the active drive below.
-            break;
-          }
-
-          cursor = grandparent;
-        }
-      }
-
-      if (!drive) {
+        drive = await this.store.resolveDriveFromParent(parentSubject, {
+          fetchMissing: false,
+        });
+      } else {
         // A Drive IS its own drive. Its authoritative drive is its own subject
         // (a DID derived from the genesis signature — unknown here, before
         // signing), resolved by children walking the parent chain and by the
@@ -3927,24 +4069,25 @@ export class Resource<C extends OptionalClass = any> {
       return;
     }
 
-    // Write to Loro only — cache is rebuilt lazily on next get()
-    this.loroSetProperty(prop, value as JSONValue);
+    const storedKeys = this.storedSpellings(prop);
 
-    if (tagDatatype) {
-      const tags = this.getLoroDoc()?.getMap('datatypes');
-      const tag = datatypeTag(tagDatatype, value);
-      if (tag && tags?.get(prop) !== tag) tags?.set(prop, tag);
-      else if (!tag && tags?.get(prop) !== undefined) tags?.delete(prop);
+    for (const storedKey of storedKeys) {
+      // Write to Loro only — cache is rebuilt lazily on next get()
+      this.loroSetProperty(storedKey, value as JSONValue);
+
+      if (tagDatatype) {
+        const tags = this.getLoroDoc()?.getMap('datatypes');
+        const tag = datatypeTag(tagDatatype, value);
+        const existingTag = tags?.get(storedKey);
+        if (tag && existingTag !== tag) tags?.set(storedKey, tag);
+        else if (!tag && existingTag !== undefined) tags?.delete(storedKey);
+      }
     }
 
     this.#cacheDirty = true;
 
     this._dirty = true;
-    this.eventManager.emit(
-      ResourceEvents.LocalChange,
-      prop,
-      value as JSONValue,
-    );
+    this.emitLocalChange(prop, storedKeys, value as JSONValue);
   }
 
   public removeUnsafe(prop: string): void {
@@ -3961,8 +4104,11 @@ export class Resource<C extends OptionalClass = any> {
       return;
     }
 
-    this.loroDeleteProperty(prop);
-    this._auxValues.delete(prop);
+    for (const storedKey of this.storedSpellings(prop)) {
+      this.loroDeleteProperty(storedKey);
+      this._auxValues.delete(storedKey);
+    }
+
     this.#cacheDirty = true;
   }
 
@@ -4361,6 +4507,32 @@ function isNetworkError(e: unknown): boolean {
   }
 
   return false;
+}
+
+const LEGACY_AGENT_PATH =
+  /^(?:https?:\/\/[^/]+|internal:(?:[A-Za-z0-9-]+:)?)\/agents\/(.+)$/;
+
+/**
+ * A subject as the server compares it in `check_rights`: a pre-DID agent path
+ * (`https://host/agents/{key}`, `internal:/agents/{key}`) becomes
+ * `atomic:agent:{key}` with the key text unchanged
+ * (`agents::migrate_legacy_agent_subject`), and an identifier loses its
+ * scheme spelling, query, fragment and trailing slash (`Subject::pure_id`).
+ * Key text is never re-encoded: the server treats the standard and URL-safe
+ * base64 spellings of one key as different agents, so the UI must too.
+ */
+function rightsIdentity(subject: string): string {
+  const legacyKey = subject.match(LEGACY_AGENT_PATH)?.[1];
+  const raw = legacyKey ? `atomic:agent:${legacyKey}` : subject;
+
+  if (!isAtomicIdentifier(raw)) return raw;
+
+  return canonicalizeScheme(raw.split(/[?#]/)[0].replace(/\/$/, ''));
+}
+
+/** Whether two subjects name the same agent (or are the same subject). */
+function sameAgent(a: string, b: string): boolean {
+  return a === b || rightsIdentity(a) === rightsIdentity(b);
 }
 
 /** Structural equality of two JSON values, ignoring object key order. */

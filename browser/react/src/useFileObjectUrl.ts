@@ -7,6 +7,11 @@ import {
 } from '@tomic/lib';
 import { useEffect, useState } from 'react';
 import { useStore } from './hooks.js';
+import {
+  SVG_MEDIA_TYPE,
+  displayMediaType,
+  svgDataUrl,
+} from './displayMediaType.js';
 
 const BLOB = 'https://atomicdata.dev/properties/blob';
 
@@ -50,7 +55,8 @@ function rememberUrl(db: object, blobDid: string, url: string) {
     const evicted = entries.get(oldest);
     entries.delete(oldest);
 
-    if (evicted) URL.revokeObjectURL(evicted);
+    // `data:` URLs (see `svgDataUrl`) hold nothing to revoke.
+    if (evicted?.startsWith('blob:')) URL.revokeObjectURL(evicted);
   }
 }
 
@@ -113,14 +119,19 @@ export function useBlobObjectUrl(
         const bytes = await clientDb.getBlob(hash);
         if (cancelled) return;
 
-        // The Blob's type becomes the object URL's Content-Type. Without it
-        // an `<img>` can still sniff raster formats, but never SVG: browsers
-        // only render SVG when the type is exactly `image/svg+xml`.
-        const url = bytes
-          ? URL.createObjectURL(
-              new Blob([bytes as BlobPart], mimetype ? { type: mimetype } : {}),
-            )
-          : undefined;
+        // The Blob's type becomes the object URL's Content-Type, and the
+        // File's `mimetype` is whatever its uploader claimed: only media
+        // types are kept (see `displayMediaType`). Browsers only render SVG
+        // typed exactly `image/svg+xml`, which a `data:` URL carries without
+        // becoming a same-origin document.
+        const type = displayMediaType(mimetype);
+        let url: string | undefined;
+
+        if (bytes && type === SVG_MEDIA_TYPE) {
+          url = svgDataUrl(bytes);
+        } else if (bytes) {
+          url = URL.createObjectURL(new Blob([bytes as BlobPart], { type }));
+        }
 
         if (url) rememberUrl(clientDb, cacheKey!, url);
 

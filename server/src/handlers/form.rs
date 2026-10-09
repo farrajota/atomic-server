@@ -501,11 +501,11 @@ pub async fn form_image(
         .map_err(|_| not_found())?;
 
     // Referenced by the form is not enough: whoever can edit the form picks
-    // what it references. Serve only Files from the form's own drive, or ones
-    // that are public anyway.
+    // what it references. Serve only Files from the form's own drive that its
+    // creator may read, or ones that are public anyway.
     if !forms::FormScope::of(store, &form)
         .await
-        .may_show(store, &file)
+        .may_serve_file(store, &file)
         .await
     {
         return Err(not_found());

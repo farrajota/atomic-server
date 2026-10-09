@@ -102,7 +102,23 @@ pub async fn apply_state_updates(
 pub struct ResolvedUpdate {
     snapshot: Vec<u8>,
     resource: crate::Resource,
+    /// The stored state before the merge (propvals only), when there was one.
+    #[cfg(feature = "iroh")]
+    existing: Option<crate::Resource>,
     pub drive_subject: String,
+}
+
+#[cfg(feature = "iroh")]
+impl ResolvedUpdate {
+    /// The merged state that would be persisted.
+    pub(crate) fn resource(&self) -> &crate::Resource {
+        &self.resource
+    }
+
+    /// What was stored before the merge, if anything.
+    pub(crate) fn existing(&self) -> Option<&crate::Resource> {
+        self.existing.as_ref()
+    }
 }
 
 /// Merge `state_bytes` into the subject's existing (or a fresh) Loro doc and
@@ -182,6 +198,13 @@ pub async fn resolve_update(
             .unwrap_or_else(|_| existing.get_subject().to_string())
     });
 
+    #[cfg(feature = "iroh")]
+    let before = existing.as_ref().map(|existing| {
+        crate::Resource::from_propvals(
+            existing.get_propvals().clone(),
+            existing.get_subject().clone(),
+        )
+    });
     let mut resource = existing.unwrap_or_else(|| crate::Resource::new(subject.to_string()));
     if resource.apply_state_doc(doc).is_err() {
         return None;
@@ -214,6 +237,8 @@ pub async fn resolve_update(
     Some(ResolvedUpdate {
         snapshot,
         resource,
+        #[cfg(feature = "iroh")]
+        existing: before,
         drive_subject,
     })
 }

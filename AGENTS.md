@@ -402,9 +402,9 @@ a new test belongs, and update it when you add one or discover a gap.
 ```
 cargo test -p atomic_lib --features db-redb --lib # unit tests (needs the `db` feature)
 cargo test -p atomic-server --lib
-cargo test -p atomic-server --test sync          # integration test: real server, 2 agents, WS sync
+cargo test -p atomic-server --test it sync        # integration test: real server, 2 agents, WS sync
 cargo test -p atomic_lib --features "iroh,discovery,db-redb" --lib -- sync::tests  # Iroh sync tests (incl. live sync)
-cargo test -p atomic_lib --features "iroh,db-redb" --lib -- sync::iroh_e2e -- --test-threads=1  # Iroh e2e: bulk + live + folderId
+cargo test -p atomic_lib --features "iroh,db-redb" --lib -- sync::iroh_e2e --test-threads=1  # Iroh e2e: bulk + live + folderId
 cargo test -p atomic_lib --features db-redb,iroh --test identity_durability  # identity/peers survive an unclean kill
 cargo test -p atomic_lib --features db-redb,iroh --test cross_process_sync   # two OS processes reconcile over Iroh
 cargo test -p atomic-server --test it iroh_pairing  # two servers pair via POST /iroh-sync

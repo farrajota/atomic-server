@@ -230,6 +230,14 @@ export const AUTH_PROOF_MAX_AGE_MS = 5 * 60 * 1000;
 export const AUTH_PROOF_REFRESH_MS = 2 * 60 * 1000;
 
 /**
+ * How often a Store re-checks its same-origin session cookie. A proof is
+ * replaced once it is {@link AUTH_PROOF_REFRESH_MS} old, so checking at least
+ * every `AUTH_PROOF_MAX_AGE_MS - AUTH_PROOF_REFRESH_MS` keeps the cookie from
+ * ever ageing out; this stays well inside that window.
+ */
+export const SESSION_COOKIE_REFRESH_INTERVAL_MS = 60 * 1000;
+
+/**
  * Every parent domain a host-only cookie could have wrongly been scoped to.
  *
  * `staging.example.com` → `['staging.example.com', 'example.com']`. The TLD
@@ -314,6 +322,12 @@ const COOKIE_NAME_AUTH = 'atomic_session';
 export const setCookieAuthentication = async (
   serverURL: string,
   agent: Agent,
+  /**
+   * Checked once the proof is signed: signing is asynchronous, and a cookie
+   * for an agent that signed out (or a server that changed) in the meantime
+   * must not be installed.
+   */
+  stillCurrent?: () => boolean,
 ): Promise<void> => {
   // Returns a promise so callers (e.g. the HTTP request signing path
   // in client.fetchResourceHTTP) can await the cookie before issuing
@@ -327,6 +341,9 @@ export const setCookieAuthentication = async (
     // wide one would otherwise keep being sent alongside this one.
     clearParentDomainCookies(COOKIE_NAME_AUTH);
     const auth = await createAuthentication(serverURL, agent);
+
+    if (stillCurrent && !stillCurrent()) return;
+
     setCookieExpires(COOKIE_NAME_AUTH, btoa(JSON.stringify(auth)), serverURL);
   } catch (e) {
     console.warn('[Auth] cookie installation failed:', e);

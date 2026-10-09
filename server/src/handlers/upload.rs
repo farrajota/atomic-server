@@ -123,13 +123,21 @@ async fn save_file_and_create_resource(
     let byte_count: i64 = buffer.len() as i64;
 
     let mimetype = guess_mime_for_filename(&filename);
-    let subject_path = format!("files/{}", urlencoding::encode(&hash_str));
     // Build a proper Internal subject using Subject::new_local so that
     // Resource::save correctly identifies this as a local resource and applies
     // the commit in-process (instead of POSTing via HTTP, which fails with
     // "Incorrect signature" because of serialization differences).
-    let subject = Subject::new_local(&format!("/{}", subject_path), None);
-    let download_url = format!("{}/download/{}", origin, subject_path);
+    //
+    // The bytes are stored once, but every upload gets a File of its own: a
+    // second upload of identical bytes saved onto `/files/<hash>` would
+    // overwrite the first uploader's File and move it into the second
+    // uploader's drive. A fresh random suffix per upload, rather than "take
+    // /files/<hash> if free", leaves no window between checking and saving.
+    // The download URL stays content-addressed, so it is the same for every
+    // copy.
+    let unique = atomic_lib::utils::random_string(16);
+    let subject = Subject::new_local(&format!("/files/{hash_str}-{unique}"), None);
+    let download_url = format!("{origin}/download/files/{hash_str}");
 
     let mut resource = atomic_lib::Resource::new_instance(urls::FILE, store).await?;
     resource

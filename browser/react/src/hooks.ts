@@ -29,9 +29,9 @@ import {
   type ResourceSnapshot,
   ResourceEvents,
   LoroLoader,
+  StoreEvents,
   core,
   server,
-  isAtomicIdentifier,
 } from '@tomic/lib';
 import type { LoroDoc } from 'loro-crdt';
 import { useOnValueChange } from './helpers/useOnValueChange.js';
@@ -687,9 +687,41 @@ export function useStore(): Store {
 /**
  * Checks if the current agent has the appropriate rights to edit this resource.
  */
+const DRIVE_PROPERTY = 'https://atomicdata.dev/properties/drive';
+
+/**
+ * What `Resource.canWrite` reads from `subject` that can still change after a
+ * page mounts: whether it has loaded, and its grants and lineage. Read from
+ * the store only, so rendering never starts a fetch.
+ */
+function rightsState(store: Store, subject: unknown): unknown {
+  if (typeof subject !== 'string' || !subject) return null;
+
+  const resource = store.resources.get(store.normalizeSubject(subject));
+
+  if (!resource) return null;
+
+  return [
+    resource.loading,
+    !!resource.error,
+    resource.get(core.properties.write) ?? null,
+    resource.get(DRIVE_PROPERTY) ?? null,
+    resource.get(core.properties.parent) ?? null,
+  ];
+}
+
 export function useCanWrite(resource: Resource): boolean {
   const store = useStore();
-  const agent = store.getAgent();
+  // Subscribed: after a reload the agent is often set after the page mounts.
+  const subscribeAgent = useCallback(
+    (cb: () => void) => store.on(StoreEvents.AgentChanged, cb),
+    [store],
+  );
+  const agent = useSyncExternalStore(
+    subscribeAgent,
+    store.getAgent,
+    store.getAgent,
+  );
   // Initialize optimistically for brand-new local resources — they have no
   // parent on the server yet, so `resource.canWrite()` would be skipped by
   // the effect below. Without this, the ResourceForm shows "Agent does not
@@ -715,9 +747,39 @@ export function useCanWrite(resource: Resource): boolean {
     true,
   );
 
-  // Re-check write permissions when the subject or agent changes.
-  // Using resource.subject instead of the full proxy to avoid re-running
-  // on every property change.
+  // `canWrite` reads this resource, its drive and its parent. An answer from
+  // before they loaded (no grants yet) must not stick once they arrive, nor
+  // once their grants change, so re-check when any of them changes in a way
+  // that matters; other property edits do not re-run the check. Deeper
+  // ancestors are awaited by `canWrite` itself (`store.getResource`).
+  const driveSubject = resource.get(DRIVE_PROPERTY);
+  const parentSubject = resource.get(core.properties.parent);
+  const subscribeRights = useCallback(
+    (cb: () => void) => {
+      const unsubscribes = [resource.subject, driveSubject, parentSubject]
+        .filter((s): s is string => typeof s === 'string' && !!s)
+        .map(s => store.subscribe(s, () => cb()));
+
+      return () => unsubscribes.forEach(unsubscribe => unsubscribe());
+    },
+    [store, resource.subject, driveSubject, parentSubject],
+  );
+  const getRightsKey = () =>
+    JSON.stringify([
+      resource.loading,
+      !!resource.error,
+      resource.get(core.properties.write) ?? null,
+      driveSubject ?? null,
+      parentSubject ?? null,
+      rightsState(store, driveSubject),
+      rightsState(store, parentSubject),
+    ]);
+  const rightsKey = useSyncExternalStore(
+    subscribeRights,
+    getRightsKey,
+    getRightsKey,
+  );
+
   useEffect(() => {
     if (!agent || resource.new) return;
     // Cancellation guard: `canWrite` recurses across parents and can take
@@ -725,41 +787,32 @@ export function useCanWrite(resource: Resource): boolean {
     // in-flight check that writes a stale result after the effect re-ran
     // for the new subject.
     let cancelled = false;
+    // `canWrite` follows the same grants as the server (explicit, drive,
+    // parents), in any spelling of the agent. A DID subject grants nothing by
+    // itself: a reader of a shared DID drive must not get edit controls.
     resource
       .canWrite(agent.subject)
       .then(([result]) => {
         if (cancelled) return;
 
-        if (result) {
-          setCanWrite(true);
-        } else if (
-          isAtomicIdentifier(resource.subject) &&
-          isAtomicIdentifier(agent.subject ?? '')
-        ) {
-          // DID resources are self-sovereign — the owning agent always has write access.
-          // The normal canWrite check fails because DID drives don't have explicit write rights.
-          setCanWrite(true);
-        } else {
-          setCanWrite(false);
-        }
+        setCanWrite(result);
       })
-      .catch(() => {
+      .catch(e => {
         if (cancelled) return;
 
-        // Offline fallback: assume write access for DID resources
-        if (
-          isAtomicIdentifier(resource.subject) &&
-          isAtomicIdentifier(agent.subject ?? '')
-        ) {
-          setCanWrite(true);
-        }
+        // Unknown rights show read-only controls; the server decides anyway.
+        console.warn(
+          `[useCanWrite] could not check write rights for ${resource.subject}:`,
+          e,
+        );
+        setCanWrite(false);
       });
 
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resource.subject, agent?.subject]);
+  }, [resource.subject, agent?.subject, rightsKey]);
 
   return canWrite;
 }

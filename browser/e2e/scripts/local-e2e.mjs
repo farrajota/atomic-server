@@ -175,6 +175,9 @@ try {
       process.env.ATOMIC_WEBSITE_ORIGIN ??
       `http://sites.localhost:${serverPort}`,
     ATOMIC_INITIALIZE: 'true',
+    // Production gates content-addressed blob reads and private-media.spec.ts
+    // asserts it; ATOMIC_REQUIRE_BLOB_AUTH=false opts out.
+    ATOMIC_REQUIRE_BLOB_AUTH: process.env.ATOMIC_REQUIRE_BLOB_AUTH ?? 'true',
   };
   delete env.SKIP_WASM_BUILD;
   delete env.VITE_ATOMIC_SERVER_URL;

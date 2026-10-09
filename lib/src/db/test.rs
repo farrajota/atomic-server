@@ -1948,6 +1948,107 @@ async fn destroy_commit_removes_resource_and_keeps_envelope_atomically() {
     );
 }
 
+#[tokio::test]
+#[timeout(120000)]
+async fn canonical_custom_did_property_keys_are_readable_through_both_spellings() {
+    let store = Db::init_temp("custom_did_property_aliases").await.unwrap();
+
+    for (index, (stored_property, alias_property)) in [
+        (
+            "did:ad:property:customLegacyRead",
+            "atomic:property:customLegacyRead",
+        ),
+        (
+            "atomic:property:customCanonicalRead",
+            "did:ad:property:customCanonicalRead",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_value = format!("custom property value {index}");
+        let mut resource = crate::Resource::new("did:ad:placeholder".into());
+        resource
+            .set_unsafe(
+                stored_property.to_string(),
+                Value::String(expected_value.clone()),
+            )
+            .unwrap();
+        let response = resource.save_as_genesis(&store).await.unwrap();
+        let subject = response
+            .resource_new
+            .as_ref()
+            .unwrap()
+            .get_subject()
+            .clone();
+        let signed_update = response.commit.loro_update.clone().unwrap();
+        let before = crate::envelopes::latest_envelope(&store, subject.as_str()).unwrap();
+
+        let stored = store.get_resource(&subject).await.unwrap();
+        assert_eq!(
+            stored.get(stored_property).unwrap().to_string(),
+            expected_value,
+        );
+        assert_eq!(
+            stored.get(alias_property).unwrap().to_string(),
+            expected_value,
+        );
+
+        let after = crate::envelopes::latest_envelope(&store, subject.as_str()).unwrap();
+        assert_eq!(after.signature, before.signature);
+        assert_eq!(after.json.as_bytes(), before.json.as_bytes());
+        let envelope_resource = crate::parse::parse_json_ad_commit_resource(&after.json, &store)
+            .await
+            .unwrap();
+        let envelope_commit = crate::commit::Commit::from_resource(envelope_resource).unwrap();
+        envelope_commit.validate_signature(&store).await.unwrap();
+        assert_eq!(
+            envelope_commit.loro_update.as_deref(),
+            Some(signed_update.as_slice()),
+        );
+    }
+
+    let legacy_property = "did:ad:property:customConflictingAlias";
+    let canonical_property = "atomic:property:customConflictingAlias";
+    // Both spellings stored side by side, as old data or a peer on the other
+    // scheme can leave them. Written as raw propvals: the setters write
+    // through to whichever spelling is already stored.
+    let conflict_subject = "internal:/custom-property-alias-conflict";
+    let mut conflict = crate::Resource::new(conflict_subject.into());
+    conflict.set_propvals_unsafe(
+        [
+            (
+                legacy_property.to_string(),
+                Value::String("legacy spelling value".into()),
+            ),
+            (
+                canonical_property.to_string(),
+                Value::String("canonical spelling value".into()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    store
+        .add_resource_opts(&conflict, false, false, true)
+        .await
+        .unwrap();
+    let stored = store.get_propvals(conflict_subject).unwrap();
+    assert_eq!(
+        stored.get(legacy_property).unwrap().to_string(),
+        "legacy spelling value",
+    );
+    assert_eq!(
+        stored.get(canonical_property).unwrap().to_string(),
+        "canonical spelling value",
+    );
+    let loaded = store.get_resource(&conflict_subject.into()).await.unwrap();
+    for spelling in [legacy_property, canonical_property] {
+        let err = loaded.get(spelling).unwrap_err().to_string();
+        assert!(err.contains("different values"), "{spelling}: {err}");
+    }
+}
+
 /// A deleted resource must not leave its Loro snapshot orphaned in
 /// `Tree::LoroSnapshots`, and the subject must be tombstoned so bulk sync
 /// does not resurrect it.

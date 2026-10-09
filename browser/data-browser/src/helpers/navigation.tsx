@@ -37,9 +37,17 @@ export function constructOpenURL(
     return constructURL(paths.show, { subject, ...extraParams });
   }
 
-  const path = url.pathname + url.search;
+  if (Object.keys(extraParams).length === 0) {
+    return url.pathname + url.search;
+  }
 
-  return path;
+  const params = new URLSearchParams(url.search);
+
+  for (const [key, value] of Object.entries(extraParams)) {
+    params.set(key, value);
+  }
+
+  return `${url.pathname}?${params}`;
 }
 
 export function searchURL(query: string, scope?: string): string {

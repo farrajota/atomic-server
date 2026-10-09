@@ -721,6 +721,18 @@ impl HostCore {
             return Err("Plugin cannot edit plugin resources".to_string());
         }
 
+        // Rights and blob reference checks judge the installation's own agent,
+        // the signer, on purpose: a class extender acts with the authority the
+        // drive's writer approved at install time (`FullDriveAccess` grants it
+        // read and write on that drive), not the authority of whoever's commit
+        // triggered the hook. This host does not know that caller: one host is
+        // built per installation at load time and its grant's caller is the
+        // plugin agent. A caller's own commit has already passed the blob
+        // reference check for the caller before any hook runs, so the residual
+        // case is a plugin that copies a hash from some other caller-controlled
+        // field into `internalId`, `blob` or `chunks` of a resource the caller
+        // can read: that lends the caller bytes readable by the plugin's agent
+        // (its installer's drive, or public ones), and nothing else.
         let opts = CommitOpts {
             validate_schema: true,
             validate_signature: true,

@@ -93,7 +93,22 @@ test.describe('tables', async () => {
       }
 
       await expect(filter).toBeVisible({ timeout: 15000 });
+      // The popover focuses its filter after it mounts; keys typed before that
+      // land elsewhere and the filter stays empty. A person types once the
+      // caret is in the field.
+      await expect(filter).toBeFocused();
       await page.keyboard.type(name);
+      // Enter adds the highlighted option. A person sees the tag they typed
+      // highlighted before pressing it; the option only matches once the tag
+      // resource has loaded and its name is known. A tag's accessible name is
+      // `${emoji} ${title}` (components/Tag/Tag.tsx), so match the title as
+      // the whole last word rather than the whole name.
+      const title = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const option = page.getByRole('button', {
+        name: new RegExp(`(^|\\s)${title}$`),
+      });
+      await expect(option).toBeVisible();
+      await expect(option).toHaveClass(/selected-tag/);
       await page.keyboard.press('Enter');
       await page.keyboard.press('Escape');
       await expect(filter).not.toBeVisible();

@@ -390,6 +390,10 @@ if [[ "$MOCK_PROXY" == true ]]; then
   # integration provider. Those variables belong to a container this is not.
 fi
 
+# Production gates content-addressed blob reads (`--require-blob-auth`), and
+# `private-media.spec.ts` asserts that gate, so the suite runs with it too.
+# `ATOMIC_REQUIRE_BLOB_AUTH=false` opts out, for a run against the open
+# default where a content hash alone is the capability.
 SERVER_ENV=(
   ATOMIC_DATA_DIR="$STORE/data"
   ATOMIC_CONFIG_DIR="$STORE/config"
@@ -397,6 +401,7 @@ SERVER_ENV=(
   ATOMIC_PORT="$PORT"
   ATOMIC_DOMAIN=localhost
   ATOMIC_REPOPULATE_DEFAULTS=true
+  ATOMIC_REQUIRE_BLOB_AUTH="${ATOMIC_REQUIRE_BLOB_AUTH:-true}"
 )
 
 # Foreground rather than `exec` when there is a proxy to clean up afterwards:

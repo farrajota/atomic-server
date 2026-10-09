@@ -31,7 +31,8 @@ const DRIVE_WALK_LIMIT: usize = 32;
 
 /// The drive `resource` lives in: its `drive` propval, else the first one up
 /// its `parent` chain, else (for an HTTP-style top ancestor) its server prefix.
-/// `None` when none of those answer, which [FormScope] treats as "not ours".
+/// `None` when none of those answer, or the chain reaches a parent on another
+/// server, which [FormScope] treats as "not ours".
 pub async fn drive_of(store: &impl Storelike, resource: &Resource) -> Option<String> {
     let mut current = resource.clone();
 
@@ -43,7 +44,13 @@ pub async fn drive_of(store: &impl Storelike, resource: &Resource) -> Option<Str
         let Ok(parent) = current.get(atomic_lib::urls::PARENT) else {
             break;
         };
-        let Ok(next) = store.get_resource(&parent.to_string().into()).await else {
+        let parent: Subject = parent.to_string().into();
+        // A parent on another server names whatever drive it likes; nothing
+        // reached through one is this form's.
+        if store.normalize_subject(&parent).is_external() {
+            return None;
+        }
+        let Ok(next) = store.get_resource(&parent).await else {
             break;
         };
         current = next;
@@ -69,15 +76,20 @@ pub async fn drive_of(store: &impl Storelike, resource: &Resource) -> Option<Str
 /// table's rows as options, or serve another drive's private Files through
 /// `/form/{id}/image`. The rule: a form writes only into its own drive, and
 /// shows a visitor only resources from its own drive or ones anyone may read
-/// anyway (a public ontology's Tags, say).
+/// anyway (a public ontology's Tags, say). A File it serves must moreover be
+/// readable by the form's creator (see [FormScope::may_serve_file]).
 pub struct FormScope {
     drive: Option<String>,
+    /// The agent whose genesis certificate minted the form, verified against
+    /// its subject. Not the `createdBy` propval, which a commit may set.
+    creator: Option<String>,
 }
 
 impl FormScope {
     pub async fn of(store: &impl Storelike, form: &Resource) -> Self {
         FormScope {
             drive: drive_of(store, form).await,
+            creator: form.genesis_signer(),
         }
     }
 
@@ -95,6 +107,25 @@ impl FormScope {
             || atomic_lib::hierarchy::check_read(store, resource, &ForAgent::Public)
                 .await
                 .is_ok()
+    }
+
+    /// `file` may be served to an anonymous visitor of this form: the form
+    /// may show it, and the form's creator may read it. A drive's `append`
+    /// lets an agent create a form there without letting them read the
+    /// drive's Files, and the visitor's request reaches them through the
+    /// server's own agent. A form without a verified creator serves only
+    /// public Files.
+    pub async fn may_serve_file(&self, store: &impl Storelike, file: &Resource) -> bool {
+        if !self.may_show(store, file).await {
+            return false;
+        }
+        let reader = match &self.creator {
+            Some(creator) => ForAgent::from(creator.as_str()),
+            None => ForAgent::Public,
+        };
+        atomic_lib::hierarchy::check_read(store, file, &reader)
+            .await
+            .is_ok()
     }
 
     /// Like [FormScope::may_show], by subject. An unresolvable subject is not
@@ -2973,6 +3004,92 @@ mod tests {
         assert!(!scope.owns(&store, &other).await);
         // Private and elsewhere: not shown to a visitor either.
         assert!(!scope.may_show(&store, &other).await);
+    }
+
+    /// `/form/{id}/image` serves what [FormScope] lets the form show, and the
+    /// scope is the form's drive. Whoever edits a form must not be able to
+    /// move that scope into someone else's drive by rewriting `drive`.
+    #[tokio::test]
+    async fn a_form_cannot_borrow_another_drive_by_rewriting_its_drive() {
+        let store = Db::init_temp("form_scope_drive_rewrite").await.unwrap();
+        let (_alice, alice_drive) = store.setup("Alice").await.unwrap();
+        let private_file = store
+            .create_resource(urls::FILE, &alice_drive, "private.txt", None)
+            .await
+            .unwrap();
+        let (mallory, mallory_drive) = store.setup("Mallory").await.unwrap();
+        let form = store
+            .create_resource(urls::FOLDER, &mallory_drive, "form", None)
+            .await
+            .unwrap();
+
+        let mut edited = store.get_resource(&form.as_str().into()).await.unwrap();
+        edited
+            .set_unsafe(
+                urls::DRIVE_PROP.into(),
+                Value::AtomicUrl(alice_drive.as_str().into()),
+            )
+            .unwrap();
+        let commit = edited
+            .get_commit_builder()
+            .clone()
+            .sign(&mallory, &store, &edited)
+            .await
+            .unwrap();
+        let opts = atomic_lib::commit::CommitOpts {
+            validate_signature: true,
+            validate_rights: true,
+            validate_for_agent: Some(mallory.subject.to_string()),
+            update_index: true,
+            ..atomic_lib::commit::CommitOpts::no_validations_no_index()
+        };
+        // Refused or restamped: either way the form stays in Mallory's drive.
+        let _ = store.apply_commit(commit, &opts).await;
+
+        let form = store.get_resource(&form.as_str().into()).await.unwrap();
+        let private_file = store
+            .get_resource(&private_file.as_str().into())
+            .await
+            .unwrap();
+        assert!(
+            !FormScope::of(&store, &form)
+                .await
+                .may_show(&store, &private_file)
+                .await,
+            "the form must not serve Alice's private File"
+        );
+    }
+
+    /// A parent on another server names whatever drive it likes; a form's
+    /// scope must not follow it there.
+    #[tokio::test]
+    async fn form_scope_does_not_follow_an_external_parent() {
+        let store = init_store().await;
+        let theirs = resource_in_drive(&store, urls::TAG, "did:ad:drive-theirs").await;
+        let mut external = Resource::new("https://elsewhere.example/forms".into());
+        external
+            .set_unsafe(
+                urls::DRIVE_PROP.into(),
+                Value::AtomicUrl("did:ad:drive-theirs".into()),
+            )
+            .unwrap();
+        store
+            .add_resource_opts(&external, false, true, true)
+            .await
+            .unwrap();
+
+        let mut form = Resource::new_instance(urls::TAG, &store).await.unwrap();
+        form.set_unsafe(urls::SHORTNAME.into(), Value::Slug("form".into()))
+            .unwrap();
+        form.set_unsafe(
+            urls::PARENT.into(),
+            Value::AtomicUrl("https://elsewhere.example/forms".into()),
+        )
+        .unwrap();
+        form.save_locally(&store).await.unwrap();
+
+        let scope = FormScope::of(&store, &form).await;
+        assert!(!scope.owns(&store, &theirs).await);
     }
 
     #[tokio::test]

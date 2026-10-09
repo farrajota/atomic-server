@@ -3,7 +3,6 @@ import {
   useDrive,
   useResource,
   useStore,
-  isAtomicIdentifier,
   type Store,
 } from '@tomic/react';
 import { useCurrentSubject } from '../helpers/useCurrentSubject';
@@ -62,11 +61,9 @@ export async function buildActionContext(
     if (resource.new) {
       canWrite = true;
     } else {
+      // The same grants the server checks; a DID subject grants nothing.
       const [allowed] = await resource.canWrite(agent.subject);
-      canWrite =
-        !!allowed ||
-        (isAtomicIdentifier(input.subject) &&
-          isAtomicIdentifier(agent.subject));
+      canWrite = allowed;
     }
   }
 

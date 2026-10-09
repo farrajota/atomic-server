@@ -381,9 +381,9 @@ To access the Loro document for a resource, use `.getLoroDoc()`.
 The method returns `undefined` while the Loro WASM module is still loading.
 
 ```typescript
-import { LoroLoader } from '@tomic/lib';
+import { enableLoro } from '@tomic/lib';
 
-await LoroLoader.load();
+await enableLoro();
 
 const doc = resource.getLoroDoc();
 doc?.getMap('properties').set('https://atomicdata.dev/properties/name', 'Hello');

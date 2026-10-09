@@ -377,6 +377,28 @@
     "https://atomicdata.dev/properties/shortname": "mimetype"
   },
   {
+    "@id": "https://atomicdata.dev/properties/imageWidth",
+    "https://atomicdata.dev/properties/datatype": "https://atomicdata.dev/datatypes/integer",
+    "https://atomicdata.dev/properties/description": "The width of an image",
+    "https://atomicdata.dev/properties/isDynamic": true,
+    "https://atomicdata.dev/properties/parent": "https://atomicdata.dev/properties",
+    "https://atomicdata.dev/properties/isA": [
+      "https://atomicdata.dev/classes/Property"
+    ],
+    "https://atomicdata.dev/properties/shortname": "image-width"
+  },
+  {
+    "@id": "https://atomicdata.dev/properties/imageHeight",
+    "https://atomicdata.dev/properties/datatype": "https://atomicdata.dev/datatypes/integer",
+    "https://atomicdata.dev/properties/description": "The height of an image",
+    "https://atomicdata.dev/properties/isDynamic": true,
+    "https://atomicdata.dev/properties/parent": "https://atomicdata.dev/properties",
+    "https://atomicdata.dev/properties/isA": [
+      "https://atomicdata.dev/classes/Property"
+    ],
+    "https://atomicdata.dev/properties/shortname": "image-height"
+  },
+  {
     "@id": "https://atomicdata.dev/properties/internalId",
     "https://atomicdata.dev/properties/datatype": "https://atomicdata.dev/datatypes/string",
     "https://atomicdata.dev/properties/description": "An identifier used internally by the system.",

@@ -4,6 +4,14 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- Private images and files keep loading after the first five minutes: the session cookie is refreshed while a user is signed in (every minute and on focus), so same-origin media URLs stay authenticated.
+- `@tomic/lib`: `Resource.get` reads a `did:ad:`/`atomic:` property under either stored spelling; `set` and `remove` act on the spelling already stored, or on both when both are stored (an explicit edit settles a conflict, as on the server). When both spellings hold different values it returns the requested one, warns once, and `getPropertyAliasConflict` describes the conflict (the server refuses such a read).
+- `@tomic/lib`: new resources and uploads take their `drive` from the parent lineage (explicit `drive`, else the nearest Drive, at most 32 steps); when it is unknown no drive is stamped rather than the active drive or the parent.
+- The first genesis commit names the signing agent, so `createdBy` is right for resources made in the browser.
+- Edit controls follow the resource's actual write rights: a read-only member no longer sees "Edit content" on DID resources. A drive owner without an explicit `write` grant now sees read-only controls, matching what the server enforces for every agent except its own default agent, which the client cannot identify.
+- Opening a resource keeps the current page's query parameters (view, filter, drive) unless the link overrides them.
+- Tables: pressing Enter in a tag cell while no option matches no longer clears the cell. Tag options update as their tag resources load.
+- `@tomic/react`: local file previews (`useFileObjectUrl`) only keep allowlisted media types (raster images, video, audio, PDF); other bytes become `application/octet-stream`, SVG a `data:` URL, so an uploaded HTML or SVG file never opens as a page of the app.
 - Invites: opening an invite link uses the server in the link instead of whichever server the browser had saved, so an invitee with a stale saved server no longer gets "Unrecognized token '<'". When the link points at a host that runs no server, a plain message says so. Creating a link for a drive whose server runs no node fails up front.
 - Forms (beta): build a form or survey and share a link; guests fill it in
   without an account and each answer becomes a table row. Create one with
