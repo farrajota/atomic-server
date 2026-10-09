@@ -3,9 +3,14 @@ import { core, type Resource, type Store } from '@tomic/lib';
 import { openPrivateHome } from './openPrivateHome';
 import { deviceHasDriveData } from './driveData';
 import { restoreFromVault } from './managed/vaultAutoBackup';
+import { fetchManagedInfo } from './managedServer';
+const state = vi.hoisted(() => ({ originWithoutNode: true }));
 vi.mock('./driveData', () => ({ deviceHasDriveData: vi.fn() }));
-vi.mock('./originNode', () => ({ isOriginWithoutNode: () => true }));
+vi.mock('./originNode', () => ({
+  isOriginWithoutNode: () => state.originWithoutNode,
+}));
 vi.mock('./managed/vaultAutoBackup', () => ({ restoreFromVault: vi.fn() }));
+vi.mock('./managedServer', () => ({ fetchManagedInfo: vi.fn() }));
 
 const home = 'did:ad:home';
 let agent: { subject: string } | undefined;
@@ -14,6 +19,7 @@ let ensure: ReturnType<typeof vi.fn>;
 let agentName: string | undefined;
 beforeEach(() => {
   vi.resetAllMocks();
+  state.originWithoutNode = true;
   agent = { subject: 'did:ad:agent:test' };
   agentName = undefined;
   ensure = vi.fn().mockResolvedValue(undefined);
@@ -35,6 +41,11 @@ beforeEach(() => {
     status: 'no-backup',
     reason: 'no account session',
   });
+  vi.mocked(fetchManagedInfo).mockResolvedValue({
+    managed: false,
+    portalUrl: null,
+    acceptsNewDrives: true,
+  });
 });
 it('never synthesizes someone else’s workspace', async () => {
   expect(await openPrivateHome(store, 'did:ad:other')).toBeUndefined();
@@ -53,6 +64,31 @@ it('uses recovered data before considering creation', async () => {
   expect(await openPrivateHome(store, home)).toBe('existing');
   expect(restoreFromVault).toHaveBeenCalled();
   expect(ensure).not.toHaveBeenCalled();
+});
+it('does not create a missing home when the server refuses new drives', async () => {
+  state.originWithoutNode = false;
+  vi.mocked(fetchManagedInfo).mockResolvedValue({
+    managed: false,
+    portalUrl: null,
+    acceptsNewDrives: false,
+  });
+
+  expect(await openPrivateHome(store, home)).toBeUndefined();
+  expect(restoreFromVault).toHaveBeenCalled();
+  expect(ensure).not.toHaveBeenCalled();
+});
+it('still creates a local-only home on an origin without a node', async () => {
+  vi.mocked(fetchManagedInfo).mockResolvedValue({
+    managed: false,
+    portalUrl: null,
+    acceptsNewDrives: false,
+  });
+
+  expect(await openPrivateHome(store, home)).toBe('created');
+  expect(fetchManagedInfo).not.toHaveBeenCalled();
+  expect(ensure).toHaveBeenCalledExactlyOnceWith(undefined, {
+    localOnly: true,
+  });
 });
 it('creates one local home for concurrent route effects', async () => {
   expect(

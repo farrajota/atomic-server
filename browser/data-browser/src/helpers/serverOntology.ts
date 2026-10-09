@@ -18,6 +18,7 @@ export const serverProps = {
   /** `open` | `owner`. Absent on a node older than host mode — read as `open`. */
   hostMode: 'https://atomicdata.dev/properties/server/hostMode',
   acceptsNewDrives: 'https://atomicdata.dev/properties/server/acceptsNewDrives',
+  canCreateDrives: 'https://atomicdata.dev/properties/server/canCreateDrives',
   ownerSet: 'https://atomicdata.dev/properties/server/ownerSet',
 } as const;
 

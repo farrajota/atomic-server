@@ -2,6 +2,7 @@ import { core, type Store } from '@tomic/lib';
 import { deviceHasDriveData } from './driveData';
 import { isOriginWithoutNode } from './originNode';
 import { restoreFromVault } from './managed/vaultAutoBackup';
+import { fetchManagedInfo } from './managedServer';
 import { withDeadline } from './withDeadline';
 
 const pending = new WeakMap<
@@ -51,6 +52,19 @@ async function prepare(
     if (await deviceHasDriveData(store, subject)) return 'existing';
   }
 
+  const serverUrl = store.getServerUrl();
+  const localOnly = isOriginWithoutNode(serverUrl);
+
+  // Existing homes and recovered data were checked above. Creating one here
+  // is implicit sign-in behavior, so do not enroll a new drive on a host that
+  // globally refuses drive creation.
+  if (
+    !localOnly &&
+    (await fetchManagedInfo(serverUrl)).acceptsNewDrives === false
+  )
+    return;
+
+  if (store.getAgent() !== agent) return;
   const name = agent.subject
     ? await ownerName(store, agent.subject)
     : undefined;
@@ -72,7 +86,7 @@ async function prepare(
   // composes the same title from a component, where the catalog is up.
   await store.ensurePrivateDrive(
     name ? /* @wc-ignore */ `${name}'s Drive` : undefined,
-    { localOnly: isOriginWithoutNode(store.getServerUrl()) },
+    { localOnly },
   );
 
   return 'created';

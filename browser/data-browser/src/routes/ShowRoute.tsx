@@ -3,14 +3,17 @@ import {
   Client,
   core,
   dataBrowser,
+  server,
+  useArray,
   useResource,
   useStore,
   useString,
+  useSubject,
 } from '@tomic/react';
 import ResourcePage from '../views/ResourcePage';
 import { Search } from './Search/SearchRoute';
 import { About } from './AboutRoute';
-import { createRoute, useNavigate } from '@tanstack/react-router';
+import { createRoute, useLocation, useNavigate } from '@tanstack/react-router';
 import { appRoute } from './RootRoutes';
 import { pathNames, paths } from './paths';
 import { useSettings } from '../helpers/AppSettings';
@@ -57,6 +60,7 @@ export const ShowComponent: React.FunctionComponent = () => {
   const { agent, baseURL, drive, setDrive } = useSettings();
   const store = useStore();
   const navigate = useNavigate();
+  const location = useLocation();
 
   // A persisted identity can land here without running the welcome flow.
   // Hydrate/recover its own home before materializing it; other resources
@@ -80,11 +84,8 @@ export const ShowComponent: React.FunctionComponent = () => {
   }, [agent, subject, store, setDrive]);
 
   // Signed out on an origin that runs no node: nothing can load until a
-  // sign-in restores the data, so go straight to the sign-in step with the
-  // subject as `next`. Without this the page first fetches, shows
-  // "Loading…", fails as "not available locally" and only then redirects
-  // from ErrorPage — several seconds of a spinner between the portal link
-  // and the sign-in screen.
+  // sign-in restores the data, so go straight to sign-in with the local route
+  // and query as `next`, preserving the table view and workspace selection.
   const signInFirst =
     !agent &&
     Client.isValidSubject(subject) &&
@@ -108,6 +109,55 @@ export const ShowComponent: React.FunctionComponent = () => {
   // same address the table's own tab uses.
   const [viewParent] = useString(resource, core.properties.parent);
   const isTableView = resource.hasClasses(dataBrowser.classes.view);
+  const [containingDrive] = useSubject(
+    resource,
+    'https://atomicdata.dev/properties/drive',
+  );
+  const [resourceClasses] = useArray(resource, core.properties.isA);
+  const readableWorkspace =
+    containingDrive ??
+    (resourceClasses.includes(server.classes.drive) ? subject : undefined);
+
+  // Startup adoption cannot read a private link before sign-in. A local
+  // return path bypasses personal-home recovery, so adopt its existing
+  // readable workspace here once the restored identity can read the resource.
+  // Do not replace an established workspace or enroll a personal drive.
+  React.useEffect(() => {
+    if (
+      !agent ||
+      (drive && drive !== baseURL) ||
+      requestedDrive ||
+      signInFirst ||
+      signInRedirect ||
+      resource.error ||
+      !readableWorkspace
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    void selectReadableDrive(
+      store,
+      readableWorkspace,
+      setDrive,
+      () => !cancelled,
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    agent,
+    drive,
+    baseURL,
+    requestedDrive,
+    signInFirst,
+    signInRedirect,
+    resource.error,
+    readableWorkspace,
+    store,
+    setDrive,
+  ]);
 
   React.useEffect(() => {
     if (!isTableView || !viewParent || view) {
@@ -163,10 +213,13 @@ export const ShowComponent: React.FunctionComponent = () => {
 
     navigate({
       to: paths.welcome,
-      search: { next: subject, from_portal: undefined },
+      search: {
+        next: `${location.pathname}${location.searchStr}`,
+        from_portal: undefined,
+      },
       replace: true,
     });
-  }, [signInFirst, subject, navigate]);
+  }, [signInFirst, location.pathname, location.searchStr, navigate]);
 
   // Feeds the "recent" list the document `@` menu shows before typing.
   React.useEffect(() => {

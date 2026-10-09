@@ -10,7 +10,11 @@ import { useDevDrive } from '../hooks/useDevDrive';
 // past the first invocation in this page's lifetime.
 let inFlight: Promise<void> | null = null;
 
-const DevDriveRoute: React.FC = () => {
+// The dev/E2E route bootstraps its own identity. useDevDrive checks public
+// server admission before generating keys; an owner host goes to sign-in.
+const DevDriveRoute: React.FC = () => <DevDrivePage />;
+
+const DevDrivePage: React.FC = () => {
   const { createDevDrive } = useDevDrive();
   const startedRef = useRef(false);
 

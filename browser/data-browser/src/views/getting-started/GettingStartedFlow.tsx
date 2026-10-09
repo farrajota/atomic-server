@@ -28,7 +28,7 @@ import { openPrivateHome } from '../../helpers/openPrivateHome';
 import { privateHomeNudge } from '../../helpers/privateHomeNudge';
 import { withDeadline } from '../../helpers/withDeadline';
 import { constructOpenURL } from '../../helpers/navigation';
-import { paths } from '../../routes/paths';
+import { pathNames, paths } from '../../routes/paths';
 import { Button } from '../../components/Button';
 import { Column } from '../../components/Row';
 import { NewIdentitySection } from '../../components/NewIdentitySection';
@@ -225,11 +225,19 @@ export function GettingStartedFlow({
   const [pendingTemplate] = useState(() =>
     fromManaged && !inviteToken ? readPendingTemplate() : undefined,
   );
-  const nextDrive =
-    new URLSearchParams(window.location.search).get('next') ||
-    new URLSearchParams(window.location.search).get('drive') ||
-    new URLSearchParams(window.location.search).get('subject') ||
-    undefined;
+  const requestedNext = new URLSearchParams(window.location.search).get('next');
+  const nextPath =
+    requestedNext === pathNames.app ||
+    requestedNext?.startsWith(`${pathNames.app}/`) ||
+    requestedNext?.startsWith(`${pathNames.app}?`)
+      ? requestedNext
+      : undefined;
+  const nextDrive = nextPath
+    ? undefined
+    : requestedNext ||
+      new URLSearchParams(window.location.search).get('drive') ||
+      new URLSearchParams(window.location.search).get('subject') ||
+      undefined;
   // Only this named, internal destination is accepted; never navigate to an
   // arbitrary return URL supplied by a link. Adding a passkey needs the local
   // identity unlocked before the account settings can edit its backup.
@@ -237,6 +245,7 @@ export function GettingStartedFlow({
     !fromManaged &&
     !inviteToken &&
     !nextDrive &&
+    !nextPath &&
     new URLSearchParams(window.location.search).get('return_to') === 'agent';
   const signInRequested =
     new URLSearchParams(window.location.search).get('step') === 'signin';
@@ -255,6 +264,10 @@ export function GettingStartedFlow({
           ? 'signin'
           : initialStep,
   );
+  useEffect(() => {
+    if (step !== 'create' || createTarget?.kind !== 'unavailable') return;
+    setStep('signin');
+  }, [createTarget, step]);
   // Welcome is also the destination for lock, sign-out, recovery and resource
   // guards. A portal configuration is not a reason to leave an unlock flow.
   // Account creation and the explicit Back action can still open the portal.
@@ -619,6 +632,12 @@ export function GettingStartedFlow({
         return;
       }
 
+      if (nextPath) {
+        navigate(nextPath);
+
+        return;
+      }
+
       // Where this sign-in wants to end up: the drive it came from, or the
       // account's own. One target, so there is one gate below — an early
       // return for the guard case is an early return around the gate.
@@ -633,8 +652,19 @@ export function GettingStartedFlow({
       // it lands on the connect-device step, which is the screen for a device
       // holding none of your data — including its offer to restore from the
       // vault.
+      const acceptsNewDrives =
+        !nextDrive && !returnToAgent
+          ? await withDeadline(
+              fetchManagedInfo(baseURL).then(
+                info => info.acceptsNewDrives !== false,
+              ),
+              SIGN_IN_LOOKUP_TIMEOUT_MS,
+              false,
+            )
+          : false;
+
       setWorkspaceStage('local');
-      const target =
+      let target =
         nextDrive ??
         (await withDeadline(
           fetchPrivateDriveSubject(store, newAgent),
@@ -666,12 +696,21 @@ export function GettingStartedFlow({
       // secret minted after derivation carries no `initialDrive`.
       const legacyHome = newAgent.initialDrive;
 
-      let hasData =
-        !!target &&
-        ((await canRead(target)) ||
-          (!!legacyHome &&
-            legacyHome !== target &&
-            (await canRead(legacyHome))));
+      let hasData = !!target && (await canRead(target));
+
+      if (
+        !hasData &&
+        target &&
+        !nextDrive &&
+        legacyHome &&
+        legacyHome !== target
+      ) {
+        hasData = await canRead(legacyHome);
+
+        // Open nodes can materialize the derived home below. Owner nodes
+        // must open the readable existing home without enrolling a new one.
+        if (hasData && !acceptsNewDrives) target = legacyHome;
+      }
 
       // A device holding nothing may still be one download from holding
       // everything: every account on a managed origin gets an encrypted backup
@@ -715,37 +754,34 @@ export function GettingStartedFlow({
         store.registerLocalOnlyDrive(target);
       }
 
-      setDrive(target ?? '');
-
       // Recover first, but connecting a device is optional for the identity's
       // own home. A foreign requested workspace must never be synthesized.
       const home =
-        !hasData && target && !returnToAgent
+        !hasData && target && !returnToAgent && acceptsNewDrives
           ? await openPrivateHome(store, target, true)
           : undefined;
 
       if (home) {
         if (home === 'created') privateHomeNudge();
+        setDrive(target!);
         navigate(constructOpenURL(target!));
       } else if (hasData) {
-        // The home drive is derived from the key rather than looked up, so
-        // nothing else will ever write it — `fetchPrivateDriveSubject` above
-        // computes the subject but does not materialize it. Signing in is the
-        // one deliberate moment to do it; leaving it to whichever render-time
-        // resolver asked first is what let a bad derivation mint hundreds of
-        // drives instead of one.
-        //
-        // Here it usually finds the drive the gate just read and returns it
-        // untouched — but that path still seeds the switcher list and adopts
-        // drives from an older, pre-derivation home, which is why it runs on
-        // the "we have it" branch rather than only on the "we don't" one. It
-        // must not run before the gate: a drive written a moment ago is not
-        // evidence that this device has the account's data.
-        await withDeadline(
-          store.ensurePrivateDrive().then(() => undefined),
-          SIGN_IN_LOOKUP_TIMEOUT_MS,
-          undefined,
-        );
+        // A derived home name is not proof that this device can open it.
+        // Keep a fresh browser driveless (or its adopted readable workspace)
+        // until recovery succeeds instead of persisting a missing drive.
+        setDrive(target!);
+        // A private home is implicitly enrolled only when the node allows new
+        // Drives and sign-in is opening that identity's own home. Explicit
+        // destinations may be shared drives; write access does not grant
+        // authority to enroll another workspace on an owner-mode node.
+
+        if (acceptsNewDrives) {
+          await withDeadline(
+            store.ensurePrivateDrive().then(() => undefined),
+            SIGN_IN_LOOKUP_TIMEOUT_MS,
+            undefined,
+          );
+        }
 
         // Every account gets a backup, not only the ones onboarding made
         // here: this is the one moment an existing account is known to be on
@@ -1009,7 +1045,7 @@ export function GettingStartedFlow({
     <Shell>
       {step === 'welcome' && !createTarget ? (
         <div role='status' aria-label='Loading account'>
-          <Spinner />
+          <Spinner size='4rem' />
         </div>
       ) : step === 'opening-workspace' ? (
         <Swap key='opening-workspace'>
@@ -1661,6 +1697,15 @@ export function GettingStartedFlow({
               <Column gap='1.5rem'>
                 {fromManaged && !managedReady ? (
                   <p>Setting up your account…</p>
+                ) : !createTarget ? (
+                  <p role='status'>
+                    Checking whether this server allows account creation…
+                  </p>
+                ) : createTarget.kind === 'unavailable' ? (
+                  <p role='status'>
+                    This server does not allow new accounts. Sign in with an
+                    existing identity.
+                  </p>
                 ) : (
                   <NewIdentitySection
                     autoStart

@@ -82,3 +82,70 @@ test.describe('server-only fallback (no OPFS / Web Locks)', () => {
     });
   });
 });
+
+test('real worker OPFS denial keeps server-backed reads available', async ({
+  page,
+}) => {
+  let workerIntercepted = false;
+  await page.addInitScript(() => {
+    const channel = new BroadcastChannel('atomic-opfs-denial-test');
+
+    channel.onmessage = () => {
+      (window as Window & { opfsDenialObserved?: boolean }).opfsDenialObserved =
+        true;
+    };
+  });
+  await page.route('**/client-db.worker*.js*', async route => {
+    const response = await route.fetch();
+    const source = await response.text();
+    workerIntercepted = true;
+    await route.fulfill({
+      response,
+      body:
+        `Object.defineProperty(navigator.storage, 'getDirectory', { ` +
+        `configurable: true, value: async () => { ` +
+        `new BroadcastChannel('atomic-opfs-denial-test').postMessage('denied'); ` +
+        `throw new DOMException('Storage access denied by test', ` +
+        `'SecurityError'); } });\n` +
+        source,
+    });
+  });
+
+  await before({ page });
+
+  const drive = await page.evaluate(() => window.store.getDrive());
+  expect(drive).toBeTruthy();
+  expect(workerIntercepted).toBe(true);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(
+          (window as Window & { opfsDenialObserved?: boolean })
+            .opfsDenialObserved,
+        ),
+      ),
+    )
+    .toBe(true);
+
+  const degraded = await page.evaluate(() => {
+    const error = window.store.getClientDb()?.initError;
+
+    return {
+      message: error?.message,
+      name: error?.name,
+    };
+  });
+  expect(degraded.name).toBe('StorageBlockedError');
+  expect(degraded.message).toContain(
+    'Local caching and offline support are disabled',
+  );
+  expect(degraded.message).toContain('reading directly from the server');
+  expect(degraded.message).toContain('nothing is kept locally between reloads');
+
+  await page.goto(
+    `${FRONTEND_URL}/app/show?subject=${encodeURIComponent(drive!)}`,
+  );
+  await expect(page.getByText('Dev drive').first()).toBeVisible({
+    timeout: 12000,
+  });
+});

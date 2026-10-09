@@ -55,8 +55,8 @@ impl ResponseError for AtomicServerError {
         {
             return StatusCode::CONFLICT;
         }
-        // A managed node refusing enrollment/quota is an expected admission
-        // decision, not an internal failure or a request to sign in again.
+        // A policy refusing admission is an expected decision, not an internal
+        // failure or a request to sign in again.
         if atomic_lib::sync::protocol::classify_commit_error(&self.message)
             == atomic_lib::sync::protocol::error_code::SYNC_REJECTED
         {
@@ -228,6 +228,30 @@ mod admission_error_tests {
                 atomic_lib::sync::protocol::error_code::SYNC_REJECTED
             );
         }
+    }
+    #[test]
+    fn owner_policy_refusal_is_forbidden_with_a_blocking_code() {
+        use atomic_lib::sync::policy::{OwnerPolicy, SyncPolicy};
+
+        let policy = OwnerPolicy::new("did:ad:agent:owner");
+        let message = policy.not_enrolled_message("did:ad:drive:new");
+        let error: AtomicServerError = message.into();
+
+        assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            atomic_lib::sync::protocol::classify_commit_error(&error.message),
+            atomic_lib::sync::protocol::error_code::SYNC_REJECTED
+        );
+    }
+
+    #[test]
+    fn unrelated_commit_errors_remain_internal_unknown_errors() {
+        let error: AtomicServerError = "temporary transport failure".into();
+        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            atomic_lib::sync::protocol::classify_commit_error(&error.message),
+            atomic_lib::sync::protocol::error_code::UNKNOWN
+        );
     }
 
     #[test]

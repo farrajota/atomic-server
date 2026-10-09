@@ -141,6 +141,8 @@ pub const SERVER_HOST_MODE: &str = "https://atomicdata.dev/properties/server/hos
 pub const SERVER_ACCEPTS_NEW_DRIVES: &str =
     "https://atomicdata.dev/properties/server/acceptsNewDrives";
 pub const SERVER_OWNER_SET: &str = "https://atomicdata.dev/properties/server/ownerSet";
+pub const SERVER_CAN_CREATE_DRIVES: &str =
+    "https://atomicdata.dev/properties/server/canCreateDrives";
 
 // ... for Peers
 pub const PEER_NODE_ID: &str = "https://atomicdata.dev/properties/peer/nodeId";

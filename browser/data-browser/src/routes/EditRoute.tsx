@@ -14,11 +14,15 @@ import { FaArrowLeft } from 'react-icons/fa6';
 import { useNavigateWithTransition } from '../hooks/useNavigateWithTransition';
 import { createRoute } from '@tanstack/react-router';
 import { pathNames } from './paths';
-import { appRoute } from './RootRoutes';
+import { appRoute, RequireAgent } from './RootRoutes';
 
 export const EditRoute = createRoute({
   path: pathNames.edit,
-  component: () => <Edit />,
+  component: () => (
+    <RequireAgent>
+      <Edit />
+    </RequireAgent>
+  ),
   getParentRoute: () => appRoute,
 });
 

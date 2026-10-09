@@ -9,6 +9,7 @@ import {
   type RefObject,
 } from 'react';
 import { styled } from 'styled-components';
+import { SIDEBAR_BAR_HEIGHT, SIDEBAR_BAR_HEIGHT_TOUCH } from './SidebarCSSVars';
 import {
   FaBell,
   FaCirclePlus,
@@ -24,6 +25,7 @@ import {
   unknownSubject,
   useCurrentAgent,
   useResource,
+  useString,
 } from '@tomic/react';
 import { paths } from '../../routes/paths';
 import { shortcuts } from '../../actions/shortcuts';
@@ -36,7 +38,12 @@ import { ResourceGlyph } from '../ResourceGlyph';
 import { useCombineRefs } from '../../hooks/useCombineRefs';
 import { useFeedbackDialog } from './FeedbackButton';
 import { OPEN_FEEDBACK_EVENT } from '../../actions/appMenuItems';
-import { getSyncIcon, getSyncLabel, useSyncStatus } from './syncStatus';
+import {
+  getSyncIcon,
+  getSyncLabel,
+  hasSyncWarning,
+  useSyncStatus,
+} from './syncStatus';
 import {
   SideBarMenuRow,
   SideBarMenuRowIcon,
@@ -115,6 +122,16 @@ function AccountMenuRow({
   const unreadLabel =
     unread > 0 ? `Notifications, ${unread} unread` : undefined;
 
+  // A warning icon leads to the banner that explains it.
+  const goToSync = () => {
+    if (hasSyncWarning(syncStatus)) {
+      void navigate({ to: paths.sync, hash: 'sync-problem' });
+      onItemClick();
+    } else {
+      goTo(paths.sync)();
+    }
+  };
+
   const items: DropdownItem[] = [
     agent
       ? {
@@ -162,7 +179,7 @@ function AccountMenuRow({
       // item's accessible name "Sync".
       icon: <IconSlot aria-hidden>{getSyncIcon(syncStatus)}</IconSlot>,
       helper: getSyncLabel(syncStatus),
-      onClick: goTo(paths.sync),
+      onClick: goToSync,
     },
     {
       id: 'feedback',
@@ -220,7 +237,7 @@ function AccountMenuRow({
           title={`Sync: ${getSyncLabel(syncStatus)}`}
           aria-label='Sync'
           data-testid='sidebar-sync-button'
-          onClick={goTo(paths.sync)}
+          onClick={goToSync}
         >
           {getSyncIcon(syncStatus)}
         </IconButton>
@@ -251,8 +268,13 @@ function AccountTrigger({
   const combinedRef = useCombineRefs([ref, triggerRef]);
   const [agent] = useCurrentAgent();
   const agentResource = useResource(agent?.subject ?? unknownSubject);
+  // `useString`, not `agentResource.get(...)`: the resource object is stable
+  // across renders, so the compiler caches a plain read of it and the row kept
+  // the 'User' it first rendered, before the profile had loaded or after a
+  // rename.
+  const [agentName] = useString(agentResource, core.properties.name);
   const name = agent
-    ? (agentResource.get(core.properties.name) ?? 'User')
+    ? (agentName ?? (agentResource.loading ? '' : 'Signed in'))
     : 'Login / New User';
 
   return (
@@ -325,6 +347,7 @@ function useInstallPrompt(): [install: () => void, available: boolean] {
 
 const Row = styled.div`
   display: flex;
+  min-height: ${SIDEBAR_BAR_HEIGHT};
   align-items: center;
   gap: 0.25rem;
   box-sizing: border-box;
@@ -355,6 +378,11 @@ const TriggerButton = styled(SideBarMenuRow)`
   cursor: pointer;
   gap: 0.25rem;
   padding-inline-end: 0.5rem;
+  min-height: ${SIDEBAR_BAR_HEIGHT};
+
+  @media (pointer: coarse) {
+    min-height: ${SIDEBAR_BAR_HEIGHT_TOUCH};
+  }
 
   &:focus-visible {
     outline: 2px solid ${p => p.theme.colors.main};

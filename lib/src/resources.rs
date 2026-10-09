@@ -116,7 +116,7 @@ impl Resource {
             let tag = datatypes.get(&prop).map(String::as_str);
             if let Some(atomic_val) = crate::loro::loro_value_to_atomic_value_tagged(&loro_val, tag)
             {
-                propvals.insert(prop, atomic_val);
+                propvals.insert(prop.clone(), dedupe_rights(&prop, atomic_val));
             }
         }
 
@@ -589,6 +589,79 @@ impl Resource {
 
     pub(crate) fn export_open_state(&self) -> Option<Vec<u8>> {
         self.loro.as_ref().map(|doc| doc.export_snapshot())
+    }
+
+    /// The live Loro doc, loaded if needed. For edits no property setter
+    /// covers, such as a document's rich-text body. Follow with
+    /// [`Self::sign_pending`] or [`Self::sign_genesis_pending`].
+    pub fn live_doc(&mut self) -> AtomicResult<&crate::loro::AtomicLoroDoc> {
+        self.ensure_materialized()?;
+        Ok(self.loro())
+    }
+
+    /// Signs everything changed so far as `agent` and returns the commit
+    /// without applying it. For a caller that sends the commit through the
+    /// normal pipeline (signature, rights, subject ownership, broadcast)
+    /// instead of [`Self::save_as`], which skips the rights check. `None`
+    /// when nothing changed.
+    pub async fn sign_pending(
+        &mut self,
+        agent: &crate::agents::Agent,
+        store: &impl Storelike,
+    ) -> AtomicResult<Option<crate::Commit>> {
+        self.sync_loro_changes_to_commit_builder()?;
+        if !self.get_commit_builder().has_changes() {
+            self.reset_commit_builder();
+            return Ok(None);
+        }
+        let commit = self
+            .get_commit_builder()
+            .clone()
+            .sign(agent, store, self)
+            .await?;
+
+        Ok(Some(commit))
+    }
+
+    /// Like [`Self::sign_pending`], for a commit that destroys this resource
+    /// and, on the node, everything inside it.
+    pub async fn sign_destroy_pending(
+        &mut self,
+        agent: &crate::agents::Agent,
+        store: &impl Storelike,
+    ) -> AtomicResult<crate::Commit> {
+        self.commit.destroy(true);
+
+        self.get_commit_builder()
+            .clone()
+            .sign(agent, store, self)
+            .await
+    }
+
+    /// Like [`Self::sign_pending`], for a new DID resource: signs a genesis
+    /// commit and sets this resource's subject to the `did:ad:` it derives.
+    pub async fn sign_genesis_pending(
+        &mut self,
+        agent: &crate::agents::Agent,
+        store: &impl Storelike,
+    ) -> AtomicResult<crate::Commit> {
+        self.subject = Subject::from_raw("did:ad:placeholder", None);
+        self.commit.set_subject(self.subject.clone());
+        self.sync_loro_changes_to_commit_builder()?;
+
+        let mut builder = self.get_commit_builder().clone();
+        builder.is_genesis = true;
+        let mut commit = builder.sign(agent, store, self).await?;
+        let signature = commit
+            .signature
+            .as_ref()
+            .ok_or("No signature generated for genesis commit")?;
+        let did = Subject::from_raw(&crate::identifiers::resource_subject(signature), None);
+
+        self.subject = did.clone();
+        commit.subject = did;
+
+        Ok(commit)
     }
 
     /// Load versioned state before history reads (`get_history`, `view_at`).
@@ -2700,5 +2773,49 @@ mod test {
 
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].get_subject().to_string(), subject2);
+    }
+}
+
+/// Concurrent writers that rewrite a rights list in place (drain + insert) merge
+/// into a list that repeats every agent. A right is a set, so repeats carry no
+/// meaning: collapse them (first occurrence wins) when materializing.
+fn dedupe_rights(property: &str, value: Value) -> Value {
+    match value {
+        Value::ResourceArray(items) if property == urls::READ || property == urls::WRITE => {
+            let mut seen = std::collections::HashSet::new();
+            Value::ResourceArray(
+                items
+                    .into_iter()
+                    .filter(|i| seen.insert(i.to_string()))
+                    .collect(),
+            )
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod dedupe_rights_tests {
+    use super::*;
+
+    #[test]
+    fn rights_lists_collapse_repeats_but_other_lists_are_untouched() {
+        let list = || {
+            Value::ResourceArray(vec![
+                "did:ad:agent:a".into(),
+                "did:ad:agent:b".into(),
+                "did:ad:agent:a".into(),
+            ])
+        };
+        for prop in [urls::READ, urls::WRITE] {
+            match dedupe_rights(prop, list()) {
+                Value::ResourceArray(v) => assert_eq!(v.len(), 2),
+                _ => panic!("expected array"),
+            }
+        }
+        match dedupe_rights(urls::IS_A, list()) {
+            Value::ResourceArray(v) => assert_eq!(v.len(), 3),
+            _ => panic!("expected array"),
+        }
     }
 }

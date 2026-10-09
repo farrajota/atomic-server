@@ -80,6 +80,16 @@ export function startsWithAtomicScheme(raw: string): boolean {
   return raw.startsWith(ATOMIC_PREFIX) && !isLegacyAtomicLink(raw);
 }
 
+/**
+ * True for the client's `_new:…` placeholder subject, however the store or
+ * server has since spelled it (`_new:x`, `internal:/_new:x`,
+ * `https://host/_new:x`). A placeholder names something that never reached a
+ * server, so there is nothing to delete there.
+ */
+export function isNewPlaceholderSubject(raw: string): boolean {
+  return /^(?:[a-z][a-z0-9+.-]*:\/\/[^/]+\/|internal:\/|\/)?_new:/i.test(raw);
+}
+
 export function isAtomicIdentifier(raw: string): boolean {
   return startsWithAtomicScheme(raw) || raw.startsWith(DID_AD_PREFIX);
 }
@@ -224,6 +234,21 @@ export function nodeId(raw: string): string | undefined {
 
 export function agentSubject(pubkey: string): string {
   return ATOMIC_AGENT_PREFIX + pubkey;
+}
+
+/**
+ * The agent a pre-DID `https://server/agents/{pubkey}` subject stands for.
+ *
+ * Old resources name their author by that URL. It is a different resource from
+ * the agent's current profile: it keeps whatever name the person had back
+ * then, and nothing a later rename touches. Anything that shows an author
+ * therefore has to go through the key to the live profile. Any other subject,
+ * including a DID agent, is returned unchanged.
+ */
+export function currentAgentSubject(subject: string): string {
+  const legacy = subject.match(/^https?:\/\/[^/]+\/agents\/([^/?#]+)$/);
+
+  return legacy ? agentSubject(decodeURIComponent(legacy[1])) : subject;
 }
 
 export function resourceSubject(genesisSig: string): string {

@@ -1,6 +1,9 @@
+import { driveDisplayName } from '../../helpers/driveDisplayName';
 import {
   ai,
   dataBrowser,
+  isAtomicIdentifier,
+  isNotFound,
   notifications,
   server,
   useCanWrite,
@@ -11,7 +14,7 @@ import {
   useSubject,
   useTitle,
 } from '@tomic/react';
-import { canonicalizeScheme } from '@tomic/lib';
+import { canonicalizeScheme, isUnauthorized } from '@tomic/lib';
 import { Fragment, useEffect, useMemo, useState, type JSX } from 'react';
 import { styled } from 'styled-components';
 import { useSettings } from '../../helpers/AppSettings';
@@ -38,6 +41,7 @@ import { LoaderInline } from '../Loader';
 import { QuickCreateRow } from '../NewInstanceButton';
 import { ResourceGlyph } from '../ResourceGlyph';
 import { useIsPrivateDrive } from '../../hooks/useIsPrivateDrive';
+import { paths } from '../../routes/paths';
 
 interface SideBarDriveProps {
   onItemClick: () => unknown;
@@ -121,9 +125,19 @@ export function SideBarDrive({
     });
   }, [store, currentResource.stable]);
 
-  const driveName = driveResource.isUnauthorized()
-    ? 'Unauthorized'
-    : title || drive;
+  // Read the reactive error, not a method on the stable Resource proxy: the
+  // compiler can retain a method result after the access denial arrives.
+  const inaccessibleDrive = isUnauthorized(driveResource.error);
+  const anonymousPrivateDrive = !agent && inaccessibleDrive;
+  const missingDrive =
+    !!driveResource.error &&
+    isAtomicIdentifier(drive) &&
+    isNotFound(driveResource.error);
+  const driveName = anonymousPrivateDrive
+    ? 'Sign in to open a workspace'
+    : inaccessibleDrive
+      ? 'This account does not have access'
+      : driveDisplayName(driveResource.error ? undefined : title, drive);
 
   return (
     <>
@@ -147,7 +161,9 @@ export function SideBarDrive({
           </DriveGlyph>
           <DriveTitle data-testid='current-drive-title'>{driveName}</DriveTitle>
         </TitleButton>
-        <DriveSwitcher Trigger={DriveSwitcherTrigger} />
+        {!anonymousPrivateDrive && (
+          <DriveSwitcher Trigger={DriveSwitcherTrigger} />
+        )}
       </SideBarHeader>
       <DndContext
         onDragStart={handleDragStart}
@@ -204,11 +220,44 @@ export function SideBarDrive({
               <SideBarLoader />
             ) : driveResource.error ? (
               <SideBarErr>
-                {driveResource.isUnauthorized()
-                  ? agent
-                    ? 'unauthorized'
-                    : 'This drive is private, sign in to view it'
-                  : driveResource.error.message}
+                {inaccessibleDrive ? (
+                  <>
+                    {agent
+                      ? 'You’re signed in, but this account cannot read this resource.'
+                      : 'This drive is private, sign in to view it'}
+                    <Button
+                      subtle
+                      onClick={() => {
+                        onItemClick();
+
+                        const searchParams = new URLSearchParams({
+                          step: 'signin',
+                          next: constructOpenURL(drive),
+                        });
+
+                        navigate({
+                          to: `${paths.welcome}?${searchParams.toString()}`,
+                        });
+                      }}
+                    >
+                      {agent ? 'Use another account' : 'Sign in'}
+                    </Button>
+                  </>
+                ) : missingDrive ? (
+                  agent ? (
+                    <>
+                      This drive is not available on this device. Restore it
+                      from your account or connect another device.
+                    </>
+                  ) : (
+                    <>
+                      This drive is not available on this device. Sign in or
+                      connect a device that has it.
+                    </>
+                  )
+                ) : (
+                  driveResource.error.message
+                )}
               </SideBarErr>
             ) : null}
             {totalChildren > allChildren.length && (

@@ -1439,6 +1439,7 @@
       "https://atomicdata.dev/properties/isUninitialized",
       "https://atomicdata.dev/properties/server/hostMode",
       "https://atomicdata.dev/properties/server/acceptsNewDrives",
+      "https://atomicdata.dev/properties/server/canCreateDrives",
       "https://atomicdata.dev/properties/server/ownerSet",
       "https://atomicdata.dev/properties/server/homeDrive"
     ],
@@ -1724,6 +1725,16 @@
     ],
     "https://atomicdata.dev/properties/parent": "https://atomicdata.dev/properties",
     "https://atomicdata.dev/properties/shortname": "accepts-new-drives"
+  },
+  {
+    "@id": "https://atomicdata.dev/properties/server/canCreateDrives",
+    "https://atomicdata.dev/properties/datatype": "https://atomicdata.dev/datatypes/boolean",
+    "https://atomicdata.dev/properties/description": "True when this caller may create a new Drive on this node. In owner mode this is true only for the configured owner (and Sudo requests). Global acceptsNewDrives continues to report whether the node is open, independently of this caller-specific value.",
+    "https://atomicdata.dev/properties/isA": [
+      "https://atomicdata.dev/classes/Property"
+    ],
+    "https://atomicdata.dev/properties/parent": "https://atomicdata.dev/properties",
+    "https://atomicdata.dev/properties/shortname": "can-create-drives"
   },
   {
     "@id": "https://atomicdata.dev/properties/server/ownerSet",

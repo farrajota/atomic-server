@@ -30,6 +30,24 @@ it('reports initialization failure before account creation', async () => {
   await expect(checkOnboardingStorage(store)).rejects.toThrow('Storage denied');
 });
 
+it('allows sign-in when OPFS is denied and the worker reports server-only mode', async () => {
+  const storageBlocked = Object.assign(
+    new Error(
+      'Local caching and offline support are disabled; the app still reads directly from the server, and nothing is kept locally between reloads.',
+    ),
+    { name: 'StorageBlockedError' },
+  );
+  const store = {
+    waitForClientDb: async () => true,
+    getClientDb: () => ({
+      waitForInit: async () => false,
+      initError: storageBlocked,
+    }),
+  };
+
+  await expect(checkOnboardingStorage(store)).resolves.toBeUndefined();
+});
+
 it('does not hang indefinitely if no database attaches', async () => {
   const store = {
     waitForClientDb: async () => false,

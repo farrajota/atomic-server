@@ -168,6 +168,13 @@ fn handle_get(
     info: ServerInfo,
 ) -> BoxFuture<'_, AtomicResult<ResourceResponse>> {
     Box::pin(async move {
+        let can_create_drives = match context.for_agent {
+            atomic_lib::agents::ForAgent::Sudo => true,
+            atomic_lib::agents::ForAgent::Public => !info.host_mode.is_owner_mode(),
+            atomic_lib::agents::ForAgent::AgentSubject(agent) => {
+                !info.host_mode.is_owner_mode() || info.host_mode.is_owner(agent.as_str())
+            }
+        };
         let HandleGetContext { subject, .. } = context;
 
         // `set_unsafe` rather than `set`: the latter validates each value against
@@ -226,6 +233,10 @@ fn handle_get(
             urls::SERVER_OWNER_SET.into(),
             Value::Boolean(info.host_mode.owner_agent.is_some()),
         )?;
+        resource.set_unsafe(
+            urls::SERVER_CAN_CREATE_DRIVES.into(),
+            Value::Boolean(can_create_drives),
+        )?;
 
         let managed = info.managed.load(std::sync::atomic::Ordering::Relaxed);
         resource.set_unsafe(urls::SERVER_MANAGED.into(), Value::Boolean(managed))?;
@@ -249,4 +260,92 @@ fn handle_get(
 
         Ok(resource.into())
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::{server_info_endpoint, ServerInfo};
+    use atomic_lib::{agents::ForAgent, endpoints::HandleGetContext, urls, Value};
+    use std::sync::{atomic::AtomicBool, Arc, RwLock};
+
+    const CAN_CREATE_DRIVES: &str = "https://atomicdata.dev/properties/server/canCreateDrives";
+    const OWNER: &str = "atomic:agent:metadata-owner";
+    const OWNER_ALIAS: &str = "did:ad:agent:metadata-owner";
+    const NONOWNER: &str = "atomic:agent:metadata-nonowner";
+
+    fn info(mode: crate::host_mode::HostMode, owner_agent: Option<&str>) -> ServerInfo {
+        ServerInfo {
+            managed: Arc::new(AtomicBool::new(false)),
+            managed_dashboard_url: Arc::new(RwLock::new(None)),
+            home_drive: None,
+            host_mode: crate::host_mode::HostModeConfig {
+                mode,
+                owner_agent: owner_agent.map(str::to_owned),
+            },
+        }
+    }
+
+    async fn request(
+        endpoint: &atomic_lib::endpoints::Endpoint,
+        store: &atomic_lib::Db,
+        for_agent: &ForAgent,
+    ) -> atomic_lib::storelike::ResourceResponse {
+        let context = HandleGetContext {
+            subject: url::Url::parse("http://localhost/server").unwrap(),
+            store,
+            for_agent,
+        };
+        endpoint.handle.as_ref().unwrap()(context).await.unwrap()
+    }
+
+    fn capability(response: &atomic_lib::storelike::ResourceResponse) -> Option<bool> {
+        match response.to_single().get(CAN_CREATE_DRIVES) {
+            Ok(Value::Boolean(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[actix_rt::test]
+    async fn server_metadata_reports_caller_specific_drive_creation() {
+        let store = atomic_lib::Db::init_temp(&atomic_lib::utils::random_string(12))
+            .await
+            .unwrap();
+        let open = server_info_endpoint(info(crate::host_mode::HostMode::Open, None));
+        let public = request(&open, &store, &ForAgent::Public).await;
+        assert_eq!(capability(&public), Some(true));
+        assert!(matches!(
+            public.to_single().get(urls::SERVER_ACCEPTS_NEW_DRIVES),
+            Ok(Value::Boolean(true))
+        ));
+        for for_agent in [
+            ForAgent::from(OWNER),
+            ForAgent::from(OWNER_ALIAS),
+            ForAgent::from(NONOWNER),
+            ForAgent::Sudo,
+        ] {
+            let response = request(&open, &store, &for_agent).await;
+            assert_eq!(capability(&response), Some(true));
+        }
+
+        let owner_host = server_info_endpoint(info(crate::host_mode::HostMode::Owner, Some(OWNER)));
+        let callers = [
+            (ForAgent::Public, false),
+            (ForAgent::from(OWNER), true),
+            (ForAgent::from(OWNER_ALIAS), true),
+            (ForAgent::from(NONOWNER), false),
+            (ForAgent::Sudo, true),
+        ];
+
+        for (for_agent, expected) in callers {
+            let response = request(&owner_host, &store, &for_agent).await;
+            assert_eq!(capability(&response), Some(expected));
+            assert!(matches!(
+                response.to_single().get(urls::SERVER_ACCEPTS_NEW_DRIVES),
+                Ok(Value::Boolean(false))
+            ));
+            assert!(matches!(
+                response.to_single().get(urls::SERVER_OWNER_SET),
+                Ok(Value::Boolean(true))
+            ));
+        }
+    }
 }

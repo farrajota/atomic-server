@@ -16,6 +16,7 @@ import { buildTheme } from '../../styling';
 const state = vi.hoisted(() => ({
   portal: 'https://portal.example',
   hosted: false,
+  acceptsNewDrives: true,
   navigate: vi.fn(),
   setAgent: vi.fn(),
   setDrive: vi.fn(),
@@ -23,7 +24,9 @@ const state = vi.hoisted(() => ({
   recovery: vi.fn(),
   account: null as { email: string } | null,
   hasData: true,
+  driveData: undefined as Record<string, boolean> | undefined,
   agent: { subject: 'did:ad:agent:test' },
+  rootAgent: undefined as { subject: string } | undefined,
   agentName: 'Robin' as string | undefined,
   store: {
     ensurePrivateDrive: vi.fn(async () => undefined),
@@ -51,6 +54,7 @@ vi.mock('@tomic/react', async original => ({
 vi.mock('../../helpers/AppSettings', () => ({
   useSettings: () => ({
     baseURL: 'https://node.example',
+    agent: state.rootAgent,
     setAgent: state.setAgent,
     setDrive: state.setDrive,
     setServer: state.setServer,
@@ -80,10 +84,18 @@ vi.mock('../../helpers/managed/session', () => ({
     account.address ?? account.email,
 }));
 vi.mock('../../helpers/managedServer', () => ({
-  fetchManagedInfo: async () => null,
+  fetchManagedInfo: async () => ({
+    managed: false,
+    portalUrl: null,
+    acceptsNewDrives: state.acceptsNewDrives,
+  }),
   isHostedDistribution: () => state.hosted,
   accountCreationTarget: () =>
-    state.portal ? { kind: 'portal', url: state.portal } : { kind: 'local' },
+    state.acceptsNewDrives === false
+      ? { kind: 'unavailable', reason: 'node-has-owner' }
+      : state.portal
+        ? { kind: 'portal', url: state.portal }
+        : { kind: 'local' },
 }));
 vi.mock('../../helpers/managed/recovery', () => ({
   getUnlockableRecoverySecret: () => state.recovery(),
@@ -116,7 +128,8 @@ vi.mock('../../helpers/privateDrive', () => ({
   fetchPrivateDriveSubject: async () => 'did:ad:home',
 }));
 vi.mock('../../helpers/driveData', () => ({
-  deviceHasDriveData: async () => state.hasData,
+  deviceHasDriveData: async (_store: unknown, subject: string) =>
+    state.driveData ? state.driveData[subject] === true : state.hasData,
 }));
 vi.mock('../../helpers/originNode', () => ({
   isOriginWithoutNode: () => false,
@@ -166,13 +179,32 @@ vi.mock('./chrome', () => ({
 }));
 import { GettingStartedFlow } from './GettingStartedFlow';
 import { logoutManagedSession } from '../../helpers/managed';
+import { FullScreenNewIdentityPage } from '../FullScreenNewIdentityPage';
+import { RootWelcomeGate } from '../RootWelcomeGate';
 
-const show = async (query = '') => {
+const show = async (
+  query = '',
+  initialStep: 'welcome' | 'create' = 'welcome',
+) => {
   window.history.replaceState(null, '', `/app/welcome${query}`);
   await act(async () => {
     render(
       <ThemeProvider theme={buildTheme(false, '#336699', false)}>
-        <GettingStartedFlow subject='https://node.example' />
+        <GettingStartedFlow
+          subject='https://node.example'
+          initialStep={initialStep}
+        />
+      </ThemeProvider>,
+    );
+  });
+};
+
+const showOnboarding = async () => {
+  window.history.replaceState(null, '', '/app/onboarding');
+  await act(async () => {
+    render(
+      <ThemeProvider theme={buildTheme(false, '#336699', false)}>
+        <FullScreenNewIdentityPage />
       </ThemeProvider>,
     );
   });
@@ -180,11 +212,14 @@ const show = async (query = '') => {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  state.portal = 'https://portal.example';
   state.hosted = false;
+  state.rootAgent = undefined;
+  state.portal = 'https://portal.example';
+  state.acceptsNewDrives = true;
   state.recovery.mockResolvedValue(null);
   state.account = null;
   state.hasData = true;
+  state.driveData = undefined;
   state.restoreVault.mockResolvedValue({
     status: 'no-backup',
     reason: 'no backup',
@@ -192,11 +227,29 @@ beforeEach(() => {
   vi.spyOn(Agent, 'fromSecret').mockResolvedValue({
     subject: 'did:ad:agent:test',
   } as Agent);
+  state.identityProps = undefined;
 });
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it('offers device recovery for an existing identity with no server home', async () => {
+  state.rootAgent = state.agent;
+  state.acceptsNewDrives = false;
+  window.history.replaceState(null, '', '/');
+  await act(async () => {
+    render(
+      <ThemeProvider theme={buildTheme(false, '#336699', false)}>
+        <RootWelcomeGate subject='https://node.example' />
+      </ThemeProvider>,
+    );
+  });
+
+  expect(screen.getByText('Connect device')).toBeTruthy();
+  expect(screen.queryByText('Create identity')).toBeNull();
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
 });
 
 it('keeps secret sign-in reachable when a portal is configured', async () => {
@@ -285,6 +338,21 @@ it('returns a drive link to that drive after secret sign-in', async () => {
   expect(state.navigate).toHaveBeenCalledWith(
     '/app/show?subject=did:ad:shared',
   );
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+});
+
+it('returns to an internal guarded route with its query after sign-in', async () => {
+  const destination =
+    '/app/new?parentSubject=did%3Aad%3Ashared&classSubject=https%3A%2F%2Fatomicdata.dev%2Fclasses%2FResource';
+  await show(`?step=signin&next=${encodeURIComponent(destination)}`);
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.navigate).toHaveBeenCalledWith(destination);
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
 });
 
 it('keeps an unreadable foreign workspace on the recovery step', async () => {
@@ -352,6 +420,85 @@ it('opens its own home without requiring another device', async () => {
   );
   expect(state.navigate).toHaveBeenCalledWith('/app/show?subject=did:ad:home');
   expect(screen.queryByText('Connect device')).toBeNull();
+});
+
+it('opens an existing home without enrolling another drive on an owner host', async () => {
+  state.acceptsNewDrives = false;
+  await show('?step=signin');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+  expect(state.navigate).toHaveBeenCalledWith('/app/show?subject=did:ad:home');
+  expect(state.setDrive).toHaveBeenCalledWith('did:ad:home');
+});
+
+it('opens the readable legacy home without synthesizing a derived home on an owner host', async () => {
+  state.acceptsNewDrives = false;
+  state.driveData = { 'did:ad:home': false, 'did:ad:legacy': true };
+  vi.mocked(Agent.fromSecret).mockResolvedValue({
+    subject: 'did:ad:agent:test',
+    initialDrive: 'did:ad:legacy',
+  } as Agent);
+  await show('?step=signin');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.navigate).toHaveBeenCalledWith(
+    '/app/show?subject=did:ad:legacy',
+  );
+  expect(state.setDrive).toHaveBeenCalledWith('did:ad:legacy');
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+});
+
+it('does not substitute a readable legacy home for an unreadable requested workspace', async () => {
+  state.acceptsNewDrives = false;
+  state.driveData = { 'did:ad:foreign': false, 'did:ad:legacy': true };
+  vi.mocked(Agent.fromSecret).mockResolvedValue({
+    subject: 'did:ad:agent:test',
+    initialDrive: 'did:ad:legacy',
+  } as Agent);
+  await show('?next=did%3Aad%3Aforeign');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(screen.getByText('Connect device')).toBeTruthy();
+  expect(state.navigate).not.toHaveBeenCalled();
+  expect(state.setDrive).not.toHaveBeenCalled();
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+});
+
+it('offers device connection instead of creating a home on an owner host', async () => {
+  state.acceptsNewDrives = false;
+  state.hasData = false;
+  await show('?step=signin');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+  expect(state.navigate).not.toHaveBeenCalled();
+  expect(screen.getByText('Connect device')).toBeTruthy();
+  expect(state.setDrive).not.toHaveBeenCalled();
+});
+it('offers existing-identity sign-in from direct onboarding on an owner host', async () => {
+  state.acceptsNewDrives = false;
+  await showOnboarding();
+
+  expect(await screen.findByLabelText('Agent secret')).toBeTruthy();
+  expect(state.identityProps).toBeUndefined();
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
 });
 
 const pasteOtherAgentsSecret = async () => {

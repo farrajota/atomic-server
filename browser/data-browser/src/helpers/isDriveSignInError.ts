@@ -34,7 +34,7 @@ export function isDriveSignInError(
   baseURL: string,
   options: { originWithoutNode?: boolean } = {},
 ): boolean {
-  if (agent || isRootWelcomeResourceError(resource, agent, baseURL)) {
+  if (agent || isRootWelcomeResourceError(resource, baseURL)) {
     return false;
   }
 

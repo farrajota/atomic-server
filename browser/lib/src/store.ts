@@ -73,6 +73,14 @@ import { withDeadline } from './withDeadline.js';
 
 /** How long a connected store waits on its local database before asking the server. */
 const LOCAL_READ_DEADLINE_MS = 1_000;
+/**
+ * The same deadline while a drive sync runs. The sync keeps the local
+ * database's worker busy writing what the server sends, so a read queues
+ * behind those writes for most of the second above, and a device opening a
+ * large drive painted each sidebar item a second late. The server answers in
+ * tens of milliseconds, so it is asked almost at once.
+ */
+const LOCAL_READ_DEADLINE_DURING_SYNC_MS = 150;
 import { BLOB, endpoints, INTERNAL_ID } from './urls.js';
 import { SERVER_MANAGED_PROPS } from './server-managed-props.js';
 import { initOntologies } from './ontologies/index.js';
@@ -108,6 +116,7 @@ import {
   isTerminalCommitError,
   isUnrecoverableCommitError,
   isBenignTerminalCommitError,
+  isMissingParentMessage,
   isNotEnrolledMessage,
   type OutboxEntry,
 } from './local-outbox.js';
@@ -136,6 +145,18 @@ export interface RepeatedCommitFailure {
   failures: number;
   /** Origin the writes are sent to. */
   server: string;
+  /** Drive the store was on when the write kept failing. */
+  drive?: string;
+  /** Milliseconds since the write first became dirty. */
+  ageMs: number;
+  /** Writes still waiting in the outbox, this one included. */
+  outboxSize: number;
+  /** Whether the websocket to the server was up. */
+  connected: boolean;
+  /** The write creates the resource, so it can fail for its parent. */
+  isGenesis: boolean;
+  /** A finished drive resync already re-armed this write once. */
+  rearmedAfterResync: boolean;
 }
 
 type RepeatedCommitFailureCallback = (failure: RepeatedCommitFailure) => void;
@@ -1109,8 +1130,8 @@ export class Store {
 
   /**
    * Whether the server in use refuses `drive` outright because it does not
-   * host it: a managed node answering "not enrolled" to our pushes, seen
-   * either on the last drive sync or on a parked outbox entry of that drive.
+   * host it: either a managed node's enrollment refusal or owner-mode refusal
+   * of a new workspace, seen on the last drive sync or a parked outbox entry.
    */
   public isDriveRefusedByServer(drive: string | undefined): boolean {
     if (!drive || this.isLocalOnlyDrive(drive)) return false;
@@ -1369,6 +1390,10 @@ export class Store {
       await db.flush();
 
       try {
+        // A first upload's reconcile can still be sending its root. GET
+        // has a correlated, quiet NotFound response; inventory requires a
+        // readable root and would otherwise be refused and time out.
+        await ws.fetch(drive);
         const remote = await ws.driveInventory(drive, '');
         const local = await db.getVersionVectorsForDrive(drive);
         const remoteBySubject = new Map(remote.map(i => [i.subject, i.vv]));
@@ -1559,6 +1584,12 @@ export class Store {
             error: e instanceof Error ? e : new Error(String(e)),
             failures: entry.failures ?? 0,
             server: this.getServerUrl(),
+            drive: this.getDrive(),
+            ageMs: Math.max(0, Date.now() - entry.enqueuedAt),
+            outboxSize: this.outbox.size,
+            connected: this._serverConnected,
+            isGenesis: entry.signedGenesis !== undefined,
+            rearmedAfterResync: entry.rearmedAfterResync === true,
           });
         },
         onBlocked: (entry, e) => {
@@ -3601,24 +3632,46 @@ export class Store {
     // Local hits come from the durable KV index in ClientDb (title,
     // description, Loro body, 1-edit prefix fuzzy, PropValSub filters).
     const clientDb = this.clientDb;
-    const kvResults =
+    const offline = !this._serverConnected && !opts.serverOnly;
+    const limit = opts.limit ?? 30;
+
+    // The local OPFS search can take a while on a large drive, so it must not
+    // delay the hosted request: both start now and run concurrently.
+    const localSearch: Promise<string[]> =
       !opts.serverOnly &&
       clientDb?.isReady &&
       typeof clientDb.search === 'function'
-        ? await clientDb.search(query, {
-            limit: opts.limit ?? 30,
-            parents: parentScope,
-            filters: opts.filters,
-          })
-        : [];
+        ? Promise.resolve()
+            .then(() =>
+              clientDb.search(query, {
+                limit,
+                parents: parentScope,
+                filters: opts.filters,
+              }),
+            )
+            .then(hits => {
+              if (hits.length > 0) {
+                searchDebug('[search] local kv →', hits.length, hits);
+                opts.onPartial?.(this.withoutDestroyed(hits));
+              }
 
-    if (kvResults.length > 0) {
-      searchDebug('[search] local kv →', kvResults.length, kvResults);
-    }
+              return hits;
+            })
+            .catch(e => {
+              // When the server can still answer, a broken local index must
+              // not take the whole search down.
+              if (offline) throw e;
+
+              searchDebug('[search] local kv failed', e);
+
+              return [] as string[];
+            })
+        : Promise.resolve([]);
 
     // Offline: hosted `/search` is unreachable. Return whatever the local
     // index has (empty if ClientDb is down).
-    if (!this._serverConnected && !opts.serverOnly) {
+    if (offline) {
+      const kvResults = await localSearch;
       searchDebug('[search] OFFLINE kv →', kvResults.length, kvResults);
 
       return this.withoutDestroyed(kvResults);
@@ -3634,15 +3687,21 @@ export class Store {
     // returns new matches. Evict only the in-memory synthetic resource so every
     // retry observes the server's current result set.
     this._resources.delete(this.resolveSubject(searchSubject));
-    const searchResource = await this.fetchResourceFromServer(searchSubject, {
+    const serverSearch = this.fetchResourceFromServer(searchSubject, {
       noWebSocket: true,
     });
+    // Avoid an unhandled rejection if the server fails while we still await
+    // the local search.
+    serverSearch.catch(() => undefined);
+
+    const kvResults = await localSearch;
+    const searchResource = await serverSearch;
     const results = searchResource.get(server.properties.results) ?? [];
     searchDebug('[search] server search returned', results.length);
 
     return this.withoutDestroyed([
       ...new Set([...kvResults, ...results]),
-    ]).slice(0, opts.limit ?? 30);
+    ]).slice(0, limit);
   }
 
   /**
@@ -4177,7 +4236,7 @@ export class Store {
     let local = this._serverConnected
       ? await withDeadline<boolean | undefined>(
           this.hydrateFromLocalDb(subject),
-          LOCAL_READ_DEADLINE_MS,
+          this.localReadDeadlineMs(),
           undefined,
         )
       : await this.hydrateFromLocalDb(subject);
@@ -4726,6 +4785,8 @@ export class Store {
     }
   }
 
+  private warnedSchemeMismatch = new Set<string>();
+
   /** Opens a Websocket for some subject URL, or returns the existing one. */
   public getWebSocketForSubject(subject: string): WSClient | undefined {
     try {
@@ -4741,7 +4802,34 @@ export class Store {
         origin = new URL(this.serverUrl).origin;
       }
 
-      return this.webSockets.get(origin);
+      const ws = this.webSockets.get(origin);
+
+      if (ws) return ws;
+
+      // The same host under another scheme (`http://` subject, `https://`
+      // server) is this server, not a missing one: a proxy-terminated
+      // deployment whose server still names itself `http://`. Returning
+      // undefined here silently turns off subscriptions and live sync.
+      const serverOrigin = this.serverUrl
+        ? new URL(this.serverUrl).origin
+        : undefined;
+
+      if (
+        serverOrigin &&
+        origin !== serverOrigin &&
+        new URL(origin).host === new URL(serverOrigin).host
+      ) {
+        if (!this.warnedSchemeMismatch.has(origin)) {
+          this.warnedSchemeMismatch.add(origin);
+          console.warn(
+            `Subject origin ${origin} differs from the server URL ${serverOrigin} only by scheme; using the server's WebSocket. Set ATOMIC_SERVER_URL on the server to its public https URL.`,
+          );
+        }
+
+        return this.webSockets.get(serverOrigin) ?? this.getDefaultWebSocket();
+      }
+
+      return undefined;
     } catch (e) {
       throw new Error(
         `Could not open websocket for subject ${subject}: ${e.message}`,
@@ -5210,18 +5298,21 @@ export class Store {
     return propery;
   }
 
-  /** Drives whose "not enrolled" refusal was already reported this session. */
+  /** Drives whose server-hosting refusal was already reported this session. */
   private _notifiedRefusedDrives = new Set<string>();
+
+  /** Drives whose "server lacks the parent" refusal was already reported. */
+  private _notifiedMissingParentDrives = new Set<string>();
 
   /**
    * Tell the person a write stopped syncing. The entry stays queued and
    * visible, and a fresh edit re-arms it.
    *
-   * A node refusing a whole drive as "not enrolled" is one condition, not one
-   * per resource: every create and every comment in that drive is refused the
-   * same way, and a toast for each buried the person under errors that name
-   * resources they never see. Say it once per drive, in terms of the drive,
-   * and say what happens to their edits.
+   * A server refusing a whole drive it does not host is one condition, not
+   * one per resource: every create and every comment in that drive is refused
+   * the same way, and a toast for each buried the person under errors that
+   * name resources they never see. Say it once per drive, in terms of the
+   * drive, and say what happens to their edits.
    */
   private notifyBlockedSync(subject: string, message: string): void {
     if (isNotEnrolledMessage(message)) {
@@ -5235,12 +5326,40 @@ export class Store {
       if (this._notifiedRefusedDrives.has(drive)) return;
 
       this._notifiedRefusedDrives.add(drive);
+      const ownerModeRefusal = message.includes(
+        'This server does not host new Drives',
+      );
+      const nextStep = ownerModeRefusal
+        ? `Sign in with an existing identity to use a workspace hosted here.`
+        : `Ask the server's operator to enrol the workspace, or turn on ` +
+          `browser-only sync for it in the sync settings.`;
       this.notifyError(
         new Error(
           `This server does not host this workspace (${message.trim()}) ` +
             `Your changes are kept on this device and are not being sent. ` +
-            `Ask the server's operator to enrol the workspace, or turn on ` +
-            `browser-only sync for it in the sync settings.`,
+            nextStep,
+        ),
+      );
+
+      return;
+    }
+
+    if (isMissingParentMessage(message)) {
+      // Every write under a workspace the server does not hold is refused the
+      // same way, and each one used to toast on every page load. Say it once
+      // per workspace, in terms of the workspace, and say what to do.
+      const drive = this.driveOf(this.normalizeSubject(subject)) ?? subject;
+
+      if (this._notifiedMissingParentDrives.has(drive)) return;
+
+      this._notifiedMissingParentDrives.add(drive);
+      this.notifyError(
+        new Error(
+          `Some changes could not be sent: the server does not have the ` +
+            `workspace they belong to (${drive.slice(0, 40)}…). They are ` +
+            `kept on this device and are not being retried. Once the workspace ` +
+            `is back on the server, syncing it sends them; if it is gone, ` +
+            `discard them on the Sync page.`,
         ),
       );
 
@@ -5453,6 +5572,19 @@ export class Store {
       if (this._lastDriveSyncError?.drive === drive) {
         this._lastDriveSyncError = undefined;
       }
+
+      // Writes the server refused for a missing parent (a drive root it never
+      // received) were parked after their retries. This resync is what offers
+      // that parent, so try them once more.
+      const syncedDrive = this.normalizeSubject(drive);
+      const rearmed = this.outbox.rearmParentBlocked(
+        subject =>
+          this.normalizeSubject(
+            this.driveOf(this.normalizeSubject(subject)),
+          ) === syncedDrive,
+      );
+
+      if (rearmed > 0) this.scheduleOutboxDrain();
     }
 
     this.emitSyncStatus();
@@ -5477,6 +5609,14 @@ export class Store {
     }
 
     this.emitSyncStatus();
+  }
+
+  /** How long a read waits for the local database before asking the
+   *  connected server instead. */
+  public localReadDeadlineMs(): number {
+    return this._driveSyncInProgress
+      ? LOCAL_READ_DEADLINE_DURING_SYNC_MS
+      : LOCAL_READ_DEADLINE_MS;
   }
 
   /** True once a drive sync has finished FOR THIS DRIVE in this session.

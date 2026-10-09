@@ -5,11 +5,11 @@
 You can run AtomicServer in different ways:
 
 1. Using docker (probably the quickest): `docker run -p 80:80 -p 443:443 -v atomic-storage:/atomic-storage ghcr.io/ontola/atomic-server`
-2. From a published [binary](https://github.com/atomicdata-dev/atomic-server/releases)
+2. From a published [binary](https://github.com/ontola/atomic-server/releases)
 3. Using [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) from crates.io: `cargo install atomic-server`
 4. Manually from source
 
-If you want to run AtomicServer locally as a developer / contributor, check out [the Contributors guide](https://github.com/atomicdata-dev/atomic-server/blob/develop/CONTRIBUTING.md).
+If you want to run AtomicServer locally as a developer / contributor, check out [the Contributors guide](https://github.com/ontola/atomic-server/blob/develop/CONTRIBUTING.md).
 
 ## Privacy: your server never phones home
 
@@ -62,7 +62,7 @@ The `dockerfile` is located in the project root, above this `server` folder.
 
 ## 2. Run pre-compiled binary
 
-Get the binaries from the [releases page](https://github.com/atomicdata-dev/atomic-server/releases) and copy them to your `bin` folder.
+Get the binaries from the [releases page](https://github.com/ontola/atomic-server/releases) and copy them to your `bin` folder.
 
 ## 3. Install using cargo
 
@@ -97,7 +97,7 @@ sudo apt-get install -y build-essential pkg-config libssl-dev --fix-missing
 
 - You can configure the server by passing arguments (see `atomic-server --help`), or by setting ENV variables.
 - The server loads the `.env` from the current path by default. Create a `.env` file from the default template in your current directory with `atomic-server generate-dotenv`
-- After running the server, check the logs and take note of the `Agent Subject` and `Private key`. You should use these in the [`atomic-cli`](https://crates.io/crates/atomic-cli) and [atomic-data-browser](https://github.com/atomicdata-dev/atomic-data-browser) clients for authorization.
+- After running the server, check the logs and take note of the `Agent Subject` and `Private key`. You should use these in the [`atomic-cli`](https://crates.io/crates/atomic-cli) and [atomic-data-browser](https://github.com/ontola/atomic-server/tree/develop/browser) clients for authorization.
 - A directory is made: `~/.config/atomic`, which stores your newly created Agent keys, the HTTPS certificates other configuration. Depending on your OS, the actual data is stored in different locations. See use the `show-config` command to find out where, if you need the files.
 - Visit `http://localhost:9883/setup` to **register your first (admin) user**. You can use an existing Agent, or create a new one. Note that if you create a `localhost` agent, it cannot be used on the web (since, well, it's local). More info and steps in [getting started with the GUI](gui.md).
 
@@ -116,7 +116,7 @@ If your server hosts a single site, wiki or dataset that the public should just
 ATOMIC_HOME_DRIVE=internal:/
 
 # ...or a specific Drive
-# ATOMIC_HOME_DRIVE=did:ad:drive:hqfpna7s5ke
+# ATOMIC_HOME_DRIVE=atomic:{genesis}
 ```
 
 Visiting `/` then opens that Drive directly, for signed-out visitors too.
@@ -159,7 +159,22 @@ It's the easiest way to get your server to run on the web, yet still have full c
 
 - Create an account on some tunneling service, such as [tunnelto.dev](https://tunnelto.dev/) (which we will use here). Make sure to reserve a subdomain, you want it to remain stable.
 - `tunnelto --port 9883 --subdomain joepio --key YOUR_API_KEY`
-- `atomic-server --domain joepio.tunnelto.dev --custom-server-url 'https://joepio.tunnelto.dev' --initialize`
+- `atomic-server --domain joepio.tunnelto.dev --server-url 'https://joepio.tunnelto.dev' --initialize`
+
+## Behind a reverse proxy (nginx, Caddy, Traefik, Ferron, Cloudflare Tunnel)
+
+`--https` means that atomic-server terminates TLS itself. Behind a proxy that does it for you, leave it off, and tell the server its public URL instead:
+
+```ini
+ATOMIC_PORT=80
+ATOMIC_HTTPS=false
+ATOMIC_DOMAIN=atomic.example.com
+ATOMIC_SERVER_URL=https://atomic.example.com
+```
+
+Without `ATOMIC_SERVER_URL` (or `--server-url`) the server builds its own address from `--https` and `--domain`, so it calls itself `http://atomic.example.com`. Resources it names itself, such as `/query` and everything delivered over the WebSocket, then reach your `https://` page as `http://` links, which the browser blocks as mixed content. Child resources of a Drive fail to load and real-time sync stops. The server logs a warning at boot when it sees a public-looking `ATOMIC_DOMAIN` with `ATOMIC_HTTPS` off and no server URL.
+
+For requests that arrive through the proxy the server also honours `X-Forwarded-Proto` and `X-Forwarded-Host`, for hosts it is configured to serve, so make your proxy send them. `ATOMIC_SERVER_URL` is what applies where there is no request, and is the fallback when the headers are missing.
 
 ## HTTPS Setup on a VPS (static IP required)
 
@@ -218,7 +233,7 @@ as private as their permissions say. It is about who may put *new* data here.
 ### Name yourself as the owner
 
 You need your Agent ID: a public identifier that looks like
-`did:ad:agent:AbCd...`. If you do not have one yet, run the server on your own
+`atomic:agent:AbCd...`. If you do not have one yet, run the server on your own
 machine first, click **Create account**, and copy the Agent ID from Settings.
 Your phone or the desktop app work equally well — an identity is a keypair, it
 does not belong to any particular server.
@@ -226,13 +241,13 @@ does not belong to any particular server.
 Then set it on the server that will be public:
 
 ```ini
-ATOMIC_OWNER_AGENT=did:ad:agent:AbCd...
+ATOMIC_OWNER_AGENT=atomic:agent:AbCd...
 ```
 
 That is the whole setup. Restart, and the server will say so at boot:
 
 ```text
-Only its owner can create new Drives here (did:ad:agent:AbCd...).
+Only its owner can create new Drives here (atomic:agent:AbCd...).
 ```
 
 > **Use the Agent ID, never the secret.** The ID is public and safe to put in a
@@ -255,6 +270,24 @@ or by people you invited.
 New Drives you create are enrolled automatically, because you are the owner. Your
 second device is the same Agent, so it needs nothing extra.
 
+In owner mode, the browser reads `canCreateDrives` from `GET /server` after
+signing that request with the existing Agent identity. The server synthesizes
+this capability for that caller; it does not reveal the configured owner ID.
+The browser uses it to show or withhold workspace-creation actions, not to grant
+access: workspace admission and resource ACLs are unchanged and remain enforced
+by the server.
+If a browser tries to start a new Drive here under an identity that is not the
+owner, the owner-policy admission refusal is an HTTP `403` (not a server
+`500`). This is specifically the owner-policy refusal, not a rule that every
+`403` means the same thing. In the browser, that definitive refusal stops
+automatic retries for the current live outbox entry; its local edit is kept,
+and it is not resent by timer or reconnect drains. Sign in with the existing
+owner identity to create a Drive here, or with an existing identity that
+already has access to a hosted workspace to use it. This keeps the edit in the
+current local store; it does not promise the parked entry survives a reload,
+or that edits are durable when browser local storage is unavailable.
+
+
 ### If you are behind a reverse proxy or a tunnel
 
 **The server cannot detect this, and will not warn you.** With nginx, Caddy,
@@ -264,6 +297,9 @@ still `localhost`. As far as the process can tell, it is a private machine.
 
 If your server is reachable from the internet by any route, set
 `ATOMIC_OWNER_AGENT`. Nothing else infers it for you.
+
+Also set `ATOMIC_SERVER_URL` to the public address, see
+[Behind a reverse proxy](#behind-a-reverse-proxy-nginx-caddy-traefik-ferron-cloudflare-tunnel).
 
 ### Running an open server on purpose
 
@@ -291,9 +327,10 @@ key. Open the secret and use the `subject` field inside it, or copy the Agent ID
 from Settings.
 
 **"This server does not host new Drives"** — someone (possibly you, in another
-browser) tried to create an account. Sign in with the owner's secret instead. If
-you meant to let this person in, invite them to a specific Drive rather than
-giving them one of their own.
+browser) tried to create a Drive under an identity that is not the owner. Sign
+in with the existing owner identity to create a Drive here. If you meant to
+let this person in, invite them to a specific Drive rather than giving them
+one of their own.
 
 **I locked myself out.** You did not: `ATOMIC_OWNER_AGENT` is read fresh at every
 boot and is never stored. Change it and restart, or remove it to go back to an

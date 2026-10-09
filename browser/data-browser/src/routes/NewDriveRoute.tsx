@@ -1,7 +1,7 @@
 import { server, useResource, useStore } from '@tomic/react';
 import { createRoute } from '@tanstack/react-router';
 import toast from 'react-hot-toast';
-import { appRoute } from './RootRoutes';
+import { appRoute, RequireAgent } from './RootRoutes';
 import { pathNames, paths } from './paths';
 import { useSettings } from '../helpers/AppSettings';
 import { useNavigateWithTransition } from '../hooks/useNavigateWithTransition';
@@ -22,8 +22,22 @@ let previewIdentity: Promise<unknown> | undefined;
 export const NewDriveRoute = createRoute({
   path: pathNames.newDrive,
   getParentRoute: () => appRoute,
-  component: () => <NewDrivePage />,
+  component: () => <NewDriveRouteComponent />,
 });
+
+function NewDriveRouteComponent(): JSX.Element {
+  const preview =
+    import.meta.env.VITE_E2E === 'true' &&
+    new URLSearchParams(window.location.search).has('template_preview');
+
+  return preview ? (
+    <NewDrivePage />
+  ) : (
+    <RequireAgent>
+      <NewDrivePage />
+    </RequireAgent>
+  );
+}
 
 // Reached from the managed portal's dashboard ("+ New drive"). The drive is
 // created *here* rather than in the portal because the portal only ever holds
@@ -153,7 +167,6 @@ function NewDrivePage(): JSX.Element {
                 },
               );
             setDrive(resource.subject);
-            toast.success('Drive created');
             navigate(constructOpenURL(resource.subject));
           }}
         />

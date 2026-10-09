@@ -1,5 +1,5 @@
 import { useCallback, useState, type JSX } from 'react';
-import { Resource } from '@tomic/react';
+import { Resource, useCanWrite } from '@tomic/react';
 import { useDropzone } from 'react-dropzone';
 import { Button } from '../Button';
 import FilePill from '../FilePill';
@@ -17,7 +17,8 @@ interface UploadFormProps {
 /** Shows a Button + drag and drop interface for uploading files */
 export default function UploadForm({
   parentResource,
-}: UploadFormProps): JSX.Element {
+}: UploadFormProps): JSX.Element | null {
+  const canWrite = useCanWrite(parentResource);
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const { upload, isUploading, error } = useUpload(parentResource);
 
@@ -31,6 +32,10 @@ export default function UploadForm({
   );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop });
+
+  if (!canWrite) {
+    return null;
+  }
 
   if (parentResource.new) {
     return <p>You can add attachments after saving the resource.</p>;

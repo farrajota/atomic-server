@@ -62,7 +62,7 @@ export function DriveTemplateSetup({
 }) {
   const store = useStore();
   const navigate = useNavigateWithTransition();
-  const { setDrive, setSideBarLocked } = useSettings();
+  const { agent, setDrive, setSideBarLocked } = useSettings();
   const search = new URLSearchParams(window.location.search);
   const initial = search.get('template');
   const [selected, setSelected] = useState<TemplateDefinition | undefined>(() =>
@@ -83,19 +83,46 @@ export function DriveTemplateSetup({
   const [error, setError] = useState<Error>();
   const [partial, setPartial] = useState<Resource>();
   // Known up front so the name step can say an account comes next.
-  const [signUpFirst, setSignUpFirst] = useState(false);
+  const [signUpFirst, setSignUpFirst] = useState<boolean | undefined>();
   useEffect(() => {
     let active = true;
     guestSignUpUrl(store)
       .then(url => {
         if (active) setSignUpFirst(!!url);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (active) setSignUpFirst(false);
+      });
 
     return () => {
       active = false;
     };
   }, [store]);
+  const [canCreateDrives, setCanCreateDrives] = useState<boolean>();
+  useEffect(() => {
+    let active = true;
+    const currentAgent = store.getAgent();
+
+    if (!currentAgent) {
+      setCanCreateDrives(false);
+
+      return () => {
+        active = false;
+      };
+    }
+
+    void fetchManagedInfo(store.getServerUrl(), currentAgent).then(info => {
+      if (active) setCanCreateDrives(info.canCreateDrives === true);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [agent?.subject, store]);
+  const canProceedToDriveSetup =
+    signUpFirst === true || (canCreateDrives === true && signUpFirst === false);
+  const checkingCreationAccess =
+    canCreateDrives === undefined || signUpFirst === undefined;
   const createLabel = busy
     ? signUpFirst
       ? 'Opening sign-up…'
@@ -150,6 +177,27 @@ export function DriveTemplateSetup({
     if (!name.trim() || partial) return;
     await run(async () => {
       if (await sendGuestToSignUp()) return;
+
+      const currentAgent = store.getAgent();
+
+      if (!currentAgent) {
+        setCanCreateDrives(false);
+        setSignUpFirst(false);
+
+        return;
+      }
+
+      const info = await fetchManagedInfo(store.getServerUrl(), currentAgent);
+
+      if (info.canCreateDrives !== true) {
+        setCanCreateDrives(false);
+        setSignUpFirst(false);
+
+        return;
+      }
+
+      setCanCreateDrives(true);
+
       await prepareTemplateDrive(store);
 
       if (keepEdits && matchingDemo) {
@@ -210,6 +258,28 @@ export function DriveTemplateSetup({
     await new Promise(() => undefined);
 
     return true;
+  }
+
+  if (!canProceedToDriveSetup) {
+    return (
+      <Column gap='1.5rem'>
+        {renderBar?.({
+          naming,
+          back: () => setNaming(false),
+          busy: busy || !!partial,
+          create: {
+            form: FORM_ID,
+            disabled: true,
+            label: createLabel,
+          },
+        })}
+        <p role='status'>
+          {checkingCreationAccess
+            ? 'Checking whether this account can create drives…'
+            : 'This server does not allow this account to create drives.'}
+        </p>
+      </Column>
+    );
   }
 
   return (

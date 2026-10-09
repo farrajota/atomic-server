@@ -180,7 +180,7 @@ Flags: `0x01` `SNAPSHOT` (`loro_bytes` is a full Loro snapshot; clear means a
 delta), `0x02` `HAS_COMMIT_ID` (the two commit-id fields are present),
 `0x04` `PUSH` (a subscription-driven push, not a `GET` response).
 
-`commit_id` is the full `did:ad:commit:<signature>` DID, which the receiver
+`commit_id` is the full `atomic:commit:<signature>` DID, which the receiver
 stores as `lastCommit` and uses as `previousCommit` on its next write.
 
 ### SYNC (0x30)
@@ -311,7 +311,7 @@ deserializer has no defaults):
 
 ```json
 {
-  "https://atomicdata.dev/properties/auth/agent": "did:ad:agent:<pubkey>",
+  "https://atomicdata.dev/properties/auth/agent": "atomic:agent:<pubkey>",
   "https://atomicdata.dev/properties/auth/requestedSubject": "<subject>",
   "https://atomicdata.dev/properties/auth/publicKey": "<base64 ed25519>",
   "https://atomicdata.dev/properties/auth/timestamp": 1756900000000,
@@ -441,6 +441,14 @@ Everything else is open to an anonymous socket and gated per subject by
 | `9` | `INVALID_SIGNATURE` | A `COMMIT` whose signature does not verify against its signer's key, or that has none. Terminal for that envelope: sign again. |
 | `10` | `IMMUTABLE_COMMIT` | The commit's subject is itself a Commit, which can never be edited. Terminal: drop the entry; nothing is lost. |
 
+For the browser's definitive owner-policy admission refusal, the HTTP commit
+response is `403`, while WebSocket reports the shared `SYNC_REJECTED (6)` code.
+The browser stops automatic timer and reconnect retries for that live outbox
+entry and keeps the local edit. This is specific to the owner-policy refusal;
+it does not make every HTTP `403` terminal or change retry handling for other
+errors. The retained edit is local state, not a promise that its parked status
+survives reload or that edits are durable without browser local storage.
+
 Codes `1` to `4`, `9` and `10` come from `classify_commit_error`, which pattern-matches the
 underlying error text where the frame is built. Many other engine failures
 are **not** classified and go out as `UNKNOWN` with a descriptive message: an
@@ -511,7 +519,7 @@ id instead, and resolves its caller with the commit it signed plus that id.
 The payload is the same signed JSON-AD body HTTP `POST /commit` accepts, so
 deterministic signing and commit parsing are unaffected by the transport.
 `created_commit_json_ad` is the created commit resource
-(`did:ad:commit:<sig>`) that `/commit` also returns. On failure the responder
+(`atomic:commit:<sig>`) that `/commit` also returns. On failure the responder
 answers `ERROR` with the matching `request_id` and a classified code. HTTP
 `POST /commit` remains the fallback path.
 
@@ -973,7 +981,7 @@ step when you touch any of them.
 
 ## Known gaps
 
-Tracked in [`planning/unified-sync.md`](https://github.com/atomicdata-dev/atomic-server/blob/master/planning/unified-sync.md),
+Tracked in [`planning/unified-sync.md`](https://github.com/ontola/atomic-server/blob/master/planning/unified-sync.md),
 "Remaining work".
 
 - **`SUB` / `UNSUB` are engine-owned.** Parse and `check_read` live in

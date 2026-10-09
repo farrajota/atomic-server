@@ -6,7 +6,7 @@ interface OnboardingStore {
     | undefined;
 }
 
-/** Check the actual storage engine, including worker OPFS access, before signup. */
+/** Allow onboarding once storage is ready or the worker selected server-only reads. */
 export async function checkOnboardingStorage(
   store: OnboardingStore,
   nativeNodeOrigin?: string,
@@ -52,7 +52,13 @@ export async function checkOnboardingStorage(
           await store.waitForClientDb(20_000);
           const db = store.getClientDb();
 
-          if (!db || !(await db.waitForInit())) {
+          // StorageBlockedError selects supported server reads without persistence.
+          // Other initialization failures still prevent onboarding.
+          if (
+            !db ||
+            (!(await db.waitForInit()) &&
+              db.initError?.name !== 'StorageBlockedError')
+          ) {
             throw (
               db?.initError ??
               new Error('Local storage could not be initialized.')

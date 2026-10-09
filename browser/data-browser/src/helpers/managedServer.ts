@@ -46,6 +46,8 @@ export type ManagedInfo = {
    * `false` would hide account creation on every server currently running.
    */
   acceptsNewDrives?: boolean;
+  /** Whether the requesting caller may create a Drive on this node. */
+  canCreateDrives?: boolean;
 };
 
 /** What a node reports when it is unreachable, or says nothing about itself. */
@@ -65,20 +67,28 @@ const readString = (value: unknown): string | null =>
 
 export async function fetchManagedInfo(
   serverUrl: string,
+  agent?: Agent,
 ): Promise<ManagedInfo> {
-  if (!serverUrl) return DEFAULT;
+  const failureInfo = agent ? { ...DEFAULT, canCreateDrives: false } : DEFAULT;
+  if (!serverUrl) return failureInfo;
 
   // Already asked at boot and answered "not a node" — the Sync page re-polls
   // this every few seconds, and index.html does not change its mind.
-  if (isOriginWithoutNode(serverUrl)) return DEFAULT;
+  if (isOriginWithoutNode(serverUrl)) return failureInfo;
 
   try {
-    const res = await fetch(new URL('/server', serverUrl).toString(), {
-      headers: { Accept: 'application/ad+json' },
+    const url = new URL('/server', serverUrl).toString();
+    const headers = agent
+      ? await signRequest(url, agent, { Accept: 'application/ad+json' })
+      : { Accept: 'application/ad+json' };
+    const res = await fetch(url, {
+      headers,
+      // Cookies are shared across localhost ports. Metadata about another node
+      // must never inherit credentials from the active server.
+      credentials: 'omit',
     });
 
-    if (!res.ok) return DEFAULT;
-
+    if (!res.ok) return failureInfo;
     const data = await res.json();
 
     const rawPortalUrl = readString(data?.[serverProps.portalUrl]);
@@ -144,19 +154,29 @@ export async function fetchManagedInfo(
     // `tauri://localhost` has no same-origin `/api`. See rememberManagedPortalUrl.
     rememberManagedPortalUrl(portalUrl);
 
+    const acceptsNewDrives = data?.[serverProps.acceptsNewDrives] !== false;
+    const rawCanCreateDrives = data?.[serverProps.canCreateDrives];
+
     return {
       managed: Boolean(data?.[serverProps.managed]),
       portalUrl,
       nodeId: readString(data?.[serverProps.nodeId]),
       version: readString(data?.[serverProps.version]),
       peers,
-      // Only an explicit `false` closes this. Absent means an older node, which
-      // accepts new Drives.
-      acceptsNewDrives: data?.[serverProps.acceptsNewDrives] !== false,
+      // Only an explicit false closes global Drive admission on older nodes.
+      acceptsNewDrives,
+      // Older nodes expose only the global admission value to an authenticated
+      // caller; a public response must not invent caller-specific capability.
+      canCreateDrives:
+        typeof rawCanCreateDrives === 'boolean'
+          ? rawCanCreateDrives
+          : agent
+            ? acceptsNewDrives
+            : undefined,
     };
   } catch {
     // Older/self-hosted nodes have no such endpoint — treat as non-managed.
-    return DEFAULT;
+    return failureInfo;
   }
 }
 

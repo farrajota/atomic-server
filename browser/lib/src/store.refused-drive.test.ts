@@ -89,6 +89,29 @@ describe('a drive the server refuses as not enrolled', () => {
     expect(seen[0]).toContain('does not host this workspace');
     expect(seen[0]).toContain('kept on this device');
   });
+  it('explains an owner-mode refusal and offers existing-identity sign-in', ({
+    expect,
+  }) => {
+    const store = new Store({ serverUrl: 'http://localhost:9883' });
+    const seen: string[] = [];
+    store.on(StoreEvents.Error, error => seen.push(error.message));
+    const ownerRefusal =
+      'This server does not host new Drives. Its owner runs it for their own data, so you cannot create a workspace here.';
+
+    store.failDriveSync(DRIVE, ownerRefusal);
+    const internals = store as unknown as {
+      notifyBlockedSync: (subject: string, message: string) => void;
+    };
+    internals.notifyBlockedSync(DRIVE, ownerRefusal);
+
+    expect(store.isDriveRefusedByServer(DRIVE)).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('does not host this workspace');
+    expect(seen[0].toLowerCase()).toContain(
+      'sign in with an existing identity',
+    );
+    expect(seen[0]).toContain('kept on this device');
+  });
 
   it('still reports every other blocked write', ({ expect }) => {
     const store = new Store({ serverUrl: 'http://localhost:9883' });

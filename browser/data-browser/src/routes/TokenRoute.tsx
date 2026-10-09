@@ -5,12 +5,16 @@ import { createAuthentication, useServerURL } from '@tomic/react';
 import { useSettings } from '../helpers/AppSettings';
 import { Main } from '../components/Main';
 import { pathNames } from './paths';
-import { appRoute } from './RootRoutes';
+import { appRoute, RequireAgent } from './RootRoutes';
 import { createRoute } from '@tanstack/react-router';
 
 export const TokenRoute = createRoute({
   path: pathNames.token,
-  component: () => <TokenRoutePage />,
+  component: () => (
+    <RequireAgent>
+      <TokenRoutePage />
+    </RequireAgent>
+  ),
   getParentRoute: () => appRoute,
 });
 

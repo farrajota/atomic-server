@@ -35,11 +35,11 @@ function ErrorPage({ resource }: ResourcePageProps): JSX.Element {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const isHomeWelcome = isRootWelcomeResourceError(resource, agent, baseURL);
+  const isHomeWelcome = isRootWelcomeResourceError(resource, baseURL);
   // Not signed in + can't read this (non-home) resource → send to the welcome
-  // panel's sign-in step, carrying the resource as `next` so we return the user
-  // here once they sign in. (Already signed in? No redirect — that agent just
-  // lacks access, handled below.)
+  // panel's sign-in step, carrying the local route and query as `next` so the
+  // selected table view and workspace survive sign-in. (Already signed in? No
+  // redirect — that agent just lacks access, handled below.)
   const isDriveSignIn = isDriveSignInError(resource, agent, baseURL, {
     originWithoutNode: isOriginWithoutNode(store.getServerUrl()),
   });
@@ -52,24 +52,24 @@ function ErrorPage({ resource }: ResourcePageProps): JSX.Element {
     navigate({
       to: paths.welcome,
       search: {
-        next: isDriveSignIn ? resource.subject : undefined,
+        next: isDriveSignIn
+          ? `${location.pathname}${location.searchStr}`
+          : undefined,
         from_portal: undefined,
       },
       replace: true,
     });
   }, [
     location.pathname,
+    location.searchStr,
     navigate,
     shouldGoToWelcome,
     isDriveSignIn,
     resource.subject,
   ]);
 
-  if (
-    shouldGoToWelcome ||
-    isRootWelcomeResourceError(resource, agent, baseURL)
-  ) {
-    // Redirect effect above will handle the URL; render something safe meanwhile.
+  if (shouldGoToWelcome || isHomeWelcome) {
+    // Visitors redirect; an existing identity recovers its data in place.
     return <RootWelcomeGate subject={baseURL || resource.subject} />;
   }
 

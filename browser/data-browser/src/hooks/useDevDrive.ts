@@ -5,6 +5,8 @@ import { useSettings } from '../helpers/AppSettings';
 import { saveAgentToIDB } from '../helpers/agentStorage';
 import { constructOpenURL } from '../helpers/navigation';
 import { useNavigateWithTransition } from './useNavigateWithTransition';
+import { fetchManagedInfo, isAtomicServer } from '../helpers/managedServer';
+import { paths } from '../routes/paths';
 
 /** Default dev server. Used as a fallback when the page wasn't loaded from
  *  an atomic-server origin (e.g. when developing the data-browser via Vite
@@ -54,7 +56,26 @@ export function useDevDrive() {
     setLoading(true);
 
     try {
-      setServer(resolveDevServer());
+      const serverUrl = resolveDevServer();
+      // This helper creates a NEW identity, even when an owner is signed in.
+      // Its admission must therefore be public/Open, not the current caller's
+      // permission to create a drive with their existing identity.
+      const info = await fetchManagedInfo(serverUrl);
+
+      if (!isAtomicServer(info) || info.acceptsNewDrives !== true) {
+        const searchParams = new URLSearchParams({
+          step: 'signin',
+          next: `${window.location.pathname}${window.location.search}`,
+        });
+        navigate({
+          to: `${paths.welcome}?${searchParams.toString()}`,
+          replace: true,
+        });
+
+        return;
+      }
+
+      setServer(serverUrl);
 
       const agentKeys = await Agent.generateKeyPair();
       const agentDID = agentSubject(agentKeys.publicKey);

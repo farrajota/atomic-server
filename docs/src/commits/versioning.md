@@ -48,13 +48,13 @@ caller may read:
 
 ```json
 {
-  "subject": "did:ad:…",
+  "subject": "atomic:…",
   "retention": "all",
   "attribution_source": "change-ids",
   "complete": true,
   "attributions": [
     {
-      "signer": "did:ad:agent:…",
+      "signer": "atomic:agent:…",
       "created_at": 1757060000000,
       "signature": "…",
       "commit_id": "did:ad:commit:…",

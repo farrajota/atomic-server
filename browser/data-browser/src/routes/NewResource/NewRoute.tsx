@@ -1,4 +1,5 @@
 import {
+  useCanWrite,
   useResource,
   useStore,
   useServerSearch,
@@ -14,9 +15,8 @@ import {
   FaMagnifyingGlass,
   FaXmark,
 } from 'react-icons/fa6';
-import toast from 'react-hot-toast';
 import { createRoute } from '@tanstack/react-router';
-import { appRoute } from '../RootRoutes';
+import { appRoute, RequireAgent } from '../RootRoutes';
 import { pathNames } from '../paths';
 import { ContainerNarrow, ContainerWide } from '../../components/Containers';
 import { Main } from '../../components/Main';
@@ -64,7 +64,11 @@ export interface NewRouteSearchParams {
 
 export const NewRoute = createRoute({
   path: pathNames.new,
-  component: () => <NewRoutePage />,
+  component: () => (
+    <RequireAgent>
+      <NewRoutePage />
+    </RequireAgent>
+  ),
   getParentRoute: () => appRoute,
   validateSearch: (search: Record<string, unknown>): NewRouteSearchParams => ({
     classSubject: (search.classSubject as string) ?? undefined,
@@ -96,6 +100,7 @@ function NewResourceSelector() {
   const { drive, hideTemplates } = useSettings();
   const destination = parentSubject || parent || drive;
   const parentResource = useResource(destination);
+  const canWrite = useCanWrite(parentResource);
   const store = useStore();
   const navigate = useNavigateWithTransition();
   const showNewResourceUI = useNewResourceUI();
@@ -161,7 +166,6 @@ function NewResourceSelector() {
 
   const onUploadComplete = useCallback(
     (files: string[]) => {
-      toast.success(`Uploaded ${files.length} files.`);
       navigate(constructOpenURL(files.length === 1 ? files[0] : destination));
     },
     [destination, navigate],
@@ -231,6 +235,26 @@ function NewResourceSelector() {
       setCreating(false);
     }
   };
+
+  if (!canWrite) {
+    return (
+      <CatalogContainer>
+        <Column gap='1.75rem'>
+          <Column gap='0.4rem'>
+            <h1>This destination is read-only</h1>
+            <Destination>
+              <span>In</span>
+              <ResourceInline subject={destination} />
+            </Destination>
+          </Column>
+          <p role='status'>
+            You can view this destination, but you don't have permission to
+            create resources or upload files here.
+          </p>
+        </Column>
+      </CatalogContainer>
+    );
+  }
 
   return (
     <CatalogContainer ref={catalogRef}>

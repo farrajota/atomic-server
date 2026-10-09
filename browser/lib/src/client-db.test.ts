@@ -469,3 +469,67 @@ describe('ClientDbWorker with a precompiled WebAssembly module', () => {
     }
   });
 });
+describe('ClientDbWorker when OPFS is denied', () => {
+  it('parks in server-only mode with an actionable message instead of hanging', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn((_name, _options, callback) => {
+      void callback().catch(() => {});
+
+      return Promise.resolve();
+    });
+    vi.stubGlobal('navigator', { locks: { request } });
+    vi.stubGlobal(
+      'BroadcastChannel',
+      class {
+        postMessage() {}
+        close() {}
+      },
+    );
+    vi.stubGlobal(
+      'Worker',
+      class {
+        onmessage?: (event: unknown) => void;
+        postMessage(message: { id: string; type?: string }) {
+          if (message.type !== 'init') return;
+
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: {
+                id: message.id,
+                type: 'error',
+                message:
+                  'OPFS unavailable [ATOMIC_DB_STORAGE_BLOCKED]: ' +
+                  'SecurityError: storage access denied',
+              },
+            }),
+          );
+        }
+        terminate() {}
+      },
+    );
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const db = new ClientDbWorker('wasm-url', 'worker-url');
+
+    try {
+      const initialized = db.init('https://example.com');
+      await vi.advanceTimersByTimeAsync(3000);
+      await expect(initialized).resolves.toBeUndefined();
+      await expect(db.waitForReady()).resolves.toBe(false);
+      expect(db.initError?.name).toBe('StorageBlockedError');
+      expect(db.initError?.message).toContain(
+        'Local caching and offline support are disabled',
+      );
+      expect(db.initError?.message).toContain(
+        'reading directly from the server',
+      );
+      expect(db.initError?.message).toContain(
+        'nothing is kept locally between reloads',
+      );
+    } finally {
+      db.destroy();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+});

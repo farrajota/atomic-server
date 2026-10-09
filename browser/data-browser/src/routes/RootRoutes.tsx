@@ -6,7 +6,7 @@ import {
   useLocation,
 } from '@tanstack/react-router';
 import { useStore } from '@tomic/react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { pathNames, paths } from './paths';
 // import { TanStackRouterDevtools } from '@tanstack/router-devtools';
 import { Providers } from '../Providers';
@@ -22,15 +22,79 @@ import { isDev } from '../config';
 import { getLocalServerOrigin, isRunningInTauri } from '../helpers/tauri';
 import { fetchPrivateDriveSubject } from '../helpers/privateDrive';
 import { constructOpenURL } from '../helpers/navigation';
+import { deviceHasDriveData } from '../helpers/driveData';
+import { fetchManagedInfo } from '../helpers/managedServer';
+import { withDeadline } from '../helpers/withDeadline';
 import { getHomeDrive } from '../helpers/homeDrive';
 import { useNavigateWithTransition } from '../hooks/useNavigateWithTransition';
 
 export const appRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: pathNames.app,
-  component: () => <Outlet />,
+  component: () => <AppRouteContent />,
   notFoundComponent: () => <p>404 Not found</p>,
 });
+
+function AppRouteContent(): React.JSX.Element | null {
+  const { pathname, searchStr } = useLocation();
+  const { agent } = useSettings();
+  const store = useStore();
+  const signedIn = agent ?? store.getAgent();
+  const navigate = useNavigateWithTransition();
+  const isBareApp =
+    pathname === pathNames.app || pathname === `${pathNames.app}/`;
+
+  useEffect(() => {
+    if (!isBareApp) return;
+
+    if (signedIn) {
+      navigate({ to: '/', replace: true });
+    } else {
+      const searchParams = new URLSearchParams({
+        step: 'signin',
+        next: `${pathname}${searchStr}`,
+      });
+      navigate({
+        to: `${paths.welcome}?${searchParams.toString()}`,
+        replace: true,
+      });
+    }
+  }, [isBareApp, navigate, pathname, searchStr, signedIn]);
+
+  return isBareApp ? null : <Outlet />;
+}
+
+export function RequireAgent({
+  children,
+}: {
+  children: React.ReactNode;
+}): React.JSX.Element | null {
+  const { agent } = useSettings();
+  const store = useStore();
+  const signedIn = agent ?? store.getAgent();
+  const { pathname, searchStr } = useLocation();
+  const navigate = useNavigateWithTransition();
+  const redirected = useRef(false);
+
+  useEffect(() => {
+    // The outgoing guard can observe its destination before it unmounts.
+    // Redirect once per mounted authorization boundary, retaining the first
+    // protected location rather than wrapping the sign-in URL in another next.
+    if (signedIn || redirected.current) return;
+    redirected.current = true;
+
+    const searchParams = new URLSearchParams({
+      step: 'signin',
+      next: `${pathname}${searchStr}`,
+    });
+    navigate({
+      to: `${paths.welcome}?${searchParams.toString()}`,
+      replace: true,
+    });
+  }, [navigate, pathname, searchStr, signedIn]);
+
+  return signedIn ? <>{children}</> : null;
+}
 
 export const rootRoute = createRootRoute({
   component: () => (
@@ -138,26 +202,41 @@ const TopRouteComponent: React.FC = () => {
     // when it's still the initial default that equals the server root, since
     // that's the subject we're specifically trying to avoid landing on.
     if (drive && drive !== baseURL) {
-      navigate(constructOpenURL(drive));
+      navigate({ to: constructOpenURL(drive), replace: true });
 
       return;
     }
 
     let cancelled = false;
 
-    fetchPrivateDriveSubject(store, agent)
-      .then(resolved => {
-        if (cancelled) return;
+    void (async () => {
+      const [resolved, acceptsNewDrives] = await Promise.all([
+        fetchPrivateDriveSubject(store, agent),
+        withDeadline(
+          fetchManagedInfo(baseURL).then(
+            info => info.acceptsNewDrives !== false,
+          ),
+          8_000,
+          false,
+        ),
+      ]);
 
-        if (resolved && resolved !== baseURL) {
-          navigate(constructOpenURL(resolved));
+      if (cancelled) return;
+
+      if (resolved && resolved !== baseURL) {
+        if (acceptsNewDrives || (await deviceHasDriveData(store, resolved))) {
+          if (!cancelled) {
+            navigate({ to: constructOpenURL(resolved), replace: true });
+          }
         } else {
           setResolvingRoot(false);
         }
-      })
-      .catch(() => {
-        if (!cancelled) setResolvingRoot(false);
-      });
+      } else {
+        setResolvingRoot(false);
+      }
+    })().catch(() => {
+      if (!cancelled) setResolvingRoot(false);
+    });
 
     return () => {
       cancelled = true;

@@ -320,10 +320,12 @@ pub fn classify_commit_error(message: &str) -> u16 {
         return error_code::CAUSALITY_CONFLICT;
     }
 
-    // Admission refusals are not transport failures. They can recover after
-    // enrollment/quota changes, so keep the write but stop unlimited retries.
+    // Admission refusals are not transport failures. They can recover when
+    // enrollment, quota, or owner-mode policy changes, so keep the write but
+    // stop unlimited retries.
     if message.contains("is not enrolled for sync on this node")
         || message.contains("has reached its storage quota on this node")
+        || message.contains("This server does not host new Drives")
     {
         return error_code::SYNC_REJECTED;
     }
@@ -1899,6 +1901,23 @@ mod tests {
         let code = u16::from_be_bytes([encoded[3], encoded[4]]);
         assert_eq!(code, error_code::UNAUTHORIZED_WRITE);
         assert_eq!(&encoded[5..], b"Not found");
+    }
+
+    #[test]
+    fn owner_policy_refusal_is_structured_for_websocket_errors() {
+        use crate::sync::policy::{OwnerPolicy, SyncPolicy};
+
+        let policy = OwnerPolicy::new("did:ad:agent:owner");
+        let message = policy.not_enrolled_message("did:ad:drive:new");
+
+        let code = classify_commit_error(&message);
+        assert_eq!(code, error_code::SYNC_REJECTED);
+
+        let frame = encode_error(7, code, &message);
+        let decoded = decode_error(&frame[1..]).expect("decode websocket error");
+        assert_eq!(decoded.request_id, 7);
+        assert_eq!(decoded.code, error_code::SYNC_REJECTED);
+        assert_eq!(decoded.message, message);
     }
 
     #[test]

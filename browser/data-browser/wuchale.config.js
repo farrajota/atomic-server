@@ -59,6 +59,7 @@ const IGNORE_MESSAGES = [
   'Ctrl',
   'Alt',
   'SHA-256',
+  'StorageBlockedError',
 ];
 
 // Any strings defined in these functions will not be translated.
