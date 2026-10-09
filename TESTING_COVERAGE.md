@@ -2470,6 +2470,10 @@ Existing genesis, migration, sign-out/content preservation and successful
 Vault restoration tests remain. The E2E fixture installs the commit watcher
 so document persistence is checked for both HTTP and WebSocket saves.
 
+On an owner-mode hosted node, sign-in must not implicitly initialize a missing
+personal Drive. The owner-mode matrix below covers explicit identity unlock
+and shared-drive handover without an HTTP or WebSocket enrollment commit.
+
 Still missing: late failed reads invalidating a newly initialized home;
 reconciliation preserving both old content and new fallback work; integrated
 sign-in variants for empty Vault, failed restore, read timeout, offline nodes
@@ -2636,3 +2640,28 @@ managed node, reads a saved child directly over HTTP, queues an edit with WS
 disconnected, reconnects, then signs in on a fresh browser and verifies the
 edited child after reload. It does not certify real billing or a full network
 partition.
+
+## Owner-mode sign-in and storage availability (2026-10-09)
+
+- `server/src/errors.rs`, `lib/src/sync/protocol.rs` and owner-policy commit tests
+  cover HTTP403/structured sync rejection6 for the definitive owner refusal,
+  while unrelated failures keep their existing classifications.
+- `browser/lib/src/local-outbox.test.ts` and `store.refused-drive.test.ts` cover
+  retained edits and immediate automatic retry parking, without reload durability.
+- `server/src/plugins/server_info.rs` tests cover caller-specific `canCreateDrives`
+  for Open/public/owner/nonowner/Sudo and canonical owner aliases.
+- `helpers/managedServer.metadata.test.ts` covers signed metadata request inputs,
+  cookie omission, caller capability, legacy responses and signed-error denial.
+- Mounted onboarding, sidebar, new-resource and drive-template permission tests
+  cover complete local destinations, understandable errors and denied creation UI.
+- `helpers/onboardingStorage.test.ts` permits normalized `StorageBlockedError`
+  server-only startup but keeps generic database initialization failures fatal.
+- Opt-in `browser/e2e/tests/owner-mode-navigation.spec.ts` requires both synthetic
+  fixture JSON files and an owner-mode/blob-auth/P2P-off server. Its65 scenarios
+  exercise eight routes, three visitor states, desktop/mobile, history/reload,
+  both served hostnames, actual HTTP/WS refusal and35-second retry observation.
+- `server-only-fallback.spec.ts` separately exercises storage API unavailability
+  and denial inside the actual client worker on an Open-mode dev-route fixture.
+  Worker simulation is not physical Firefox-private-mode certification; these
+  checks do not promise offline storage or retained edits across a reload.
+
