@@ -85,7 +85,29 @@ test.describe('server-only fallback (no OPFS / Web Locks)', () => {
 
 test('real worker OPFS denial keeps server-backed reads available', async ({
   page,
+  browserDiagnostics,
 }) => {
+  const storageExplanation =
+    'Local caching and offline support are disabled: this browser is not ' +
+    'giving this site access to local storage right now.';
+
+  browserDiagnostics.expect(
+    'error',
+    new RegExp(`^StorageBlockedError: ${storageExplanation}`),
+    'The deliberately denied worker reports its normalized initError through the existing UI error handler.',
+    1,
+    /\/assets\/chunk_useNewResourceUI-[^/]+\.js$/,
+  );
+
+  browserDiagnostics.expect(
+    'warning',
+    new RegExp(`^\\[ClientDb\\] ${storageExplanation}`),
+    'A denied init can finish after leader election; at most one explanation per worker in this two-document test.',
+    2,
+    /\/assets\/chunk_dist-[^/]+\.js$/,
+    { optional: true },
+  );
+
   let workerIntercepted = false;
   await page.addInitScript(() => {
     const channel = new BroadcastChannel('atomic-opfs-denial-test');

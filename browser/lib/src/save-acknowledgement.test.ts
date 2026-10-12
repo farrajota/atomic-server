@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { core } from './ontologies/core.js';
-import { Resource } from './resource.js';
-import { testStore } from './test-store.js';
+import { attachSnapshotDb, testStore } from './test-store.js';
 import { AtomicError, ErrorType, RequestCancelledError } from './error.js';
-import { BLOCK_AFTER_FAILURES } from './local-outbox.js';
+import {
+  BLOCK_AFTER_FAILURES,
+  LocalOutbox,
+  type OutboxDatabase,
+  type OutboxEntry,
+} from './local-outbox.js';
 import { ErrorCode } from './ws-v2.js';
 import { StoreEvents } from './store.js';
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 describe('explicit save acknowledgement', () => {
   it.each([
@@ -47,6 +54,22 @@ describe('explicit save acknowledgement', () => {
 
   it('keeps transport failures queued and returns offline', async () => {
     const { store, postCommitSpy } = await testStore();
+    const snapshots = new Map<
+      string,
+      { jsonAd: string; snapshot: Uint8Array }
+    >();
+    store.setClientDb({
+      isOpen: true,
+      unsupportedEnvironment: false,
+      putResourceWithSnapshot: async (
+        subject: string,
+        jsonAd: string,
+        snapshot?: Uint8Array,
+      ) => {
+        if (!snapshot) throw new Error('Expected a durable resource snapshot');
+        snapshots.set(subject, { jsonAd, snapshot: snapshot.slice() });
+      },
+    } as never);
     const doc = await store.newResource({
       isA: 'https://atomicdata.dev/classes/Drive',
       noParent: true,
@@ -55,21 +78,85 @@ describe('explicit save acknowledgement', () => {
 
     await expect(doc.save()).resolves.toBe('offline');
     expect(store.outbox.hasPending(doc.subject)).toBe(true);
+    expect(snapshots.get(doc.subject)?.snapshot).toBeInstanceOf(Uint8Array);
     expect(store.serverConnected).toBe(false);
   });
+  it('rejects an offline save when its required snapshot cannot persist', async () => {
+    const { store, postCommitSpy } = await testStore();
+    const doc = await store.newResource({
+      isA: 'https://atomicdata.dev/classes/Drive',
+      noParent: true,
+    });
+    postCommitSpy.mockRejectedValue(new TypeError('Failed to fetch'));
+    const { db } = attachSnapshotDb(store);
+    const denied = new Error('storage denied');
+    db.putResourceWithSnapshot.mockRejectedValue(denied);
+    const saved = vi.spyOn(store, 'notifyResourceSaved');
+
+    await expect(doc.save()).rejects.toThrow('storage denied');
+    expect(db.putResourceWithSnapshot).toHaveBeenCalledWith(
+      doc.subject,
+      expect.any(String),
+      expect.any(Uint8Array),
+      undefined,
+    );
+    expect(store.outbox.hasPending(doc.subject)).toBe(false);
+    expect(saved).not.toHaveBeenCalled();
+    expect(store.serverConnected).toBe(false);
+  });
+
+  it('rejects offline persistence without a database before queueing or notifying saved', async () => {
+    const { store, postCommitSpy } = await testStore();
+    const doc = await store.newResource({
+      isA: 'https://atomicdata.dev/classes/Drive',
+      noParent: true,
+    });
+    postCommitSpy.mockRejectedValue(new TypeError('Failed to fetch'));
+    const saved = vi.spyOn(store, 'notifyResourceSaved');
+
+    await expect(doc.save()).rejects.toThrow(/database|storage/i);
+    expect(store.outbox.hasPending(doc.subject)).toBe(false);
+    expect(saved).not.toHaveBeenCalled();
+  });
+
   it('still reports a save the server acknowledged when the local mirror fails', async () => {
     const { store } = await testStore();
     const doc = await store.newResource({
       isA: 'https://atomicdata.dev/classes/Drive',
       noParent: true,
     });
-    vi.spyOn(Resource.prototype, 'persistToClientDb').mockRejectedValue(
+    const { db } = attachSnapshotDb(store);
+    db.putResourceWithSnapshot.mockRejectedValue(
       new Error('ClientDb unavailable: parked'),
     );
 
     await expect(doc.save()).resolves.toBe('persisted');
+    expect(db.putResourceWithSnapshot).toHaveBeenCalledWith(
+      doc.subject,
+      expect.any(String),
+      expect.any(Uint8Array),
+      undefined,
+    );
     expect(doc.commitError).toBeUndefined();
     store.setServerConnected(false);
+  });
+  it('keeps an acknowledged online save successful without denied local RPCs', async () => {
+    const { store, postCommitSpy } = await testStore();
+    const doc = await store.newResource({
+      isA: 'https://atomicdata.dev/classes/Drive',
+      noParent: true,
+    });
+    const putResourceWithSnapshot = vi.fn();
+    store.setClientDb({
+      initError: new Error('Local storage denied'),
+      unsupportedEnvironment: true,
+      isOpen: false,
+      putResourceWithSnapshot,
+    } as never);
+
+    await expect(doc.save()).resolves.toBe('persisted');
+    expect(postCommitSpy).toHaveBeenCalledOnce();
+    expect(putResourceWithSnapshot).not.toHaveBeenCalled();
   });
 
   it('does not hold an acknowledged save on a local mirror that never answers', async () => {
@@ -78,13 +165,36 @@ describe('explicit save acknowledgement', () => {
       isA: 'https://atomicdata.dev/classes/Drive',
       noParent: true,
     });
-    vi.spyOn(Resource.prototype, 'persistToClientDb').mockReturnValue(
-      new Promise(() => {}),
-    );
+    const { db } = attachSnapshotDb(store);
+    const writing = Promise.withResolvers<void>();
+    const reached = Promise.withResolvers<void>();
+    db.putResourceWithSnapshot.mockImplementation(() => {
+      reached.resolve();
 
-    await expect(doc.save()).resolves.toBe('persisted');
+      return writing.promise;
+    });
+    vi.useFakeTimers();
+    let outcome: string | undefined;
+    const saving = doc.save().then(result => {
+      outcome = result;
+
+      return result;
+    });
+    await reached.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(db.putResourceWithSnapshot).toHaveBeenCalledWith(
+      doc.subject,
+      expect.any(String),
+      expect.any(Uint8Array),
+      undefined,
+    );
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(outcome).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(saving).resolves.toBe('persisted');
+    expect(doc.commitError).toBeUndefined();
     store.setServerConnected(false);
-  }, 10_000);
+  });
 
   it('clears the error after a successful retry', async () => {
     const { store, postCommitSpy } = await testStore();
@@ -120,6 +230,150 @@ describe('explicit save acknowledgement', () => {
     await expect(doc.save()).rejects.toBe(error);
     expect(postCommitSpy).toHaveBeenCalledTimes(attempts);
     store.setServerConnected(false);
+  });
+  it('rejects a save refused by the drive-wide owner-mode response', async () => {
+    const { store, postCommitSpy } = await testStore();
+    const errors: string[] = [];
+    store.on(StoreEvents.Error, error => errors.push(error.message));
+    const doc = await store.newResource({
+      isA: 'https://atomicdata.dev/classes/Drive',
+      noParent: true,
+      propVals: { [core.properties.name]: 'Refused workspace' },
+    });
+    const refusal = new AtomicError(
+      'This server does not host new Drives. Its owner runs it for their own data, so you cannot create a workspace here.',
+      ErrorType.Server,
+      ErrorCode.SYNC_REJECTED,
+    );
+    store.failDriveSync(doc.subject, refusal.message, refusal.code);
+
+    await expect(doc.save()).rejects.toMatchObject({
+      message: refusal.message,
+      code: ErrorCode.SYNC_REJECTED,
+    });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('kept on this device');
+    expect(errors[0].toLowerCase()).toContain(
+      'sign in with an existing identity',
+    );
+
+    const entry = store.outbox.getEntry(doc.subject)!;
+    expect(entry.blocked).toBe(true);
+    expect(entry.lastAttemptError).toBe(refusal.message);
+    expect(entry.lastAttemptFailure?.cause).toMatchObject({
+      message: refusal.message,
+      code: ErrorCode.SYNC_REJECTED,
+    });
+    expect(entry.signedGenesis).toBeDefined();
+    expect(postCommitSpy).not.toHaveBeenCalled();
+    store.setServerConnected(false);
+  });
+  it('keeps an owner-refused genesis parked across a local Loro callback', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const { store, postCommitSpy, agentDID } = await testStore();
+      const rows = new Map<string, string>();
+      let durableRows = new Map<string, string>();
+      const database: OutboxDatabase = {
+        outboxEntries: async agent =>
+          agent === agentDID ? [...rows.values()] : [],
+        outboxWrite: async (write, durable) => {
+          if (write.agent !== agentDID) return;
+          for (const subject of write.deletes) rows.delete(subject);
+          for (const { subject, value } of write.puts) rows.set(subject, value);
+          if (durable) durableRows = new Map(rows);
+        },
+      };
+      store.outbox.expectDatabase();
+      await store.outbox.attachDatabase(agentDID, database);
+      const doc = await store.newResource({
+        isA: 'https://atomicdata.dev/classes/Drive',
+        noParent: true,
+        propVals: { [core.properties.name]: 'Refused workspace' },
+      });
+      const refusal = new AtomicError(
+        'This server does not host new Drives. Its owner runs it for their own data, so you cannot create a workspace here.',
+        ErrorType.Server,
+        ErrorCode.SYNC_REJECTED,
+      );
+      postCommitSpy.mockRejectedValue(refusal);
+
+      await expect(doc.save()).rejects.toBe(refusal);
+      const entry = store.outbox.getEntry(doc.subject)!;
+      const firstAttemptCount = postCommitSpy.mock.calls.length;
+      const signedGenesis = entry.signedGenesis;
+      const saveCursor = doc.getEncodedSaveCursor();
+      expect(entry.blocked).toBe(true);
+      expect(signedGenesis).toBeDefined();
+      expect(saveCursor).toBeDefined();
+      // The editor writes directly into the Loro body and commits that local
+      // transaction; no Resource.set() or save() follows the refusal.
+      doc.getLoroDoc()!.getMap('doc').set('body', 'Retained local edit');
+      doc.getLoroDoc()!.commit();
+
+      expect(doc.hasLoroBody()).toBe(true);
+      expect(doc.get(core.properties.name)).toBe('Refused workspace');
+      expect(entry.signedGenesis).toBe(signedGenesis);
+      expect(doc.getEncodedSaveCursor()).toBe(saveCursor);
+
+      await store.syncDirtyResources();
+
+      expect(postCommitSpy).toHaveBeenCalledTimes(firstAttemptCount);
+      expect(store.outbox.getEntry(doc.subject)?.blocked).toBe(true);
+      expect(store.outbox.hasPending(doc.subject)).toBe(true);
+
+      await store.outbox.flush();
+
+      const reopenedRows = new Map(durableRows);
+      const reopenedDatabase: OutboxDatabase = {
+        outboxEntries: async agent =>
+          agent === agentDID ? [...reopenedRows.values()] : [],
+        outboxWrite: async (write, durable) => {
+          if (write.agent !== agentDID) return;
+          for (const subject of write.deletes) reopenedRows.delete(subject);
+          for (const { subject, value } of write.puts)
+            reopenedRows.set(subject, value);
+          if (durable) durableRows = new Map(reopenedRows);
+        },
+      };
+      const reloaded = new LocalOutbox();
+      reloaded.expectDatabase();
+      reloaded.rebind(agentDID);
+      await reloaded.attachDatabase(agentDID, reopenedDatabase);
+      expect(reloaded.hasPending(doc.subject)).toBe(true);
+      expect(reloaded.getEntry(doc.subject)?.signedGenesis).toBeDefined();
+      const reloadDrain = vi.fn(async () => {
+        throw refusal;
+      });
+      const reloadContext = {
+        sort: (entries: readonly OutboxEntry[]) => [...entries],
+        drainSubject: reloadDrain,
+        isBlockingError: (_entry: OutboxEntry, error: unknown) =>
+          error instanceof AtomicError &&
+          error.code === ErrorCode.SYNC_REJECTED,
+      };
+      // The Resource's local-update callback calls markDirty; after hydration
+      // it must leave the retained edit parked until policy explicitly changes.
+      reloaded.markDirty(doc.subject);
+      expect(reloaded.getEntry(doc.subject)?.blocked).toBe(true);
+      await reloaded.drain(reloadContext);
+      expect(reloadDrain).not.toHaveBeenCalled();
+      expect(reloaded.hasPending(doc.subject)).toBe(true);
+
+      expect(reloaded.rearmOwnerModeBlocked()).toBe(1);
+      await reloaded.drain(reloadContext);
+      expect(reloadDrain).toHaveBeenCalledOnce();
+      // An explicit server change is a supported re-arm; ordinary callbacks
+      // on the refusing server above are not.
+      store.setServerUrl('https://another.example', { connect: false });
+      await store.syncDirtyResources();
+      expect(postCommitSpy).toHaveBeenCalledTimes(firstAttemptCount + 1);
+      expect(store.outbox.getEntry(doc.subject)?.blocked).toBe(true);
+      store.setServerConnected(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('re-arms a write parked for a missing parent when its drive finishes a resync', async () => {

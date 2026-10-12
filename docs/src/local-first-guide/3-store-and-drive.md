@@ -2,13 +2,47 @@
 
 A `Store` is the in-memory graph your app reads and writes.
 It used to need a `serverUrl`; now that is optional.
-Give it the Agent from step 1 and it can create, sign and edit data on its own.
+Give it the signing Agent from step 1 and it can create, sign and edit data on its own, provided the SDK supports explicitly parentless creation without a server URL.
+
+This no-server flow requires that SDK capability as well as an actually opened client database. An SDK that still tries to normalize a missing `serverUrl` during parentless creation cannot run the Drive example below; initializing storage does not fix that creation limitation.
 
 ```ts
-import { Store, core } from '@tomic/lib';
+import { ClientDbWorker, Store, core } from '@tomic/lib';
+import workerUrl from '@tomic/lib/client-db.worker.js?url'; // Vite syntax
 
 const store = new Store({ agent });
 ```
+
+Before creating the Drive or saving a Book, configure and open the client database as shown in [the persistence step](4-persist.md). A local-only or offline save requires a real usable database; attaching a worker or starting `init()` alone does not prove that storage opened. Do not proceed to the first required save until the actual-open check succeeds.
+
+## Initialize and check local storage first
+
+Build and serve the WASM module as described in [the persistence step](4-persist.md), then attach the database before creating local data:
+
+```ts
+const clientDb = new ClientDbWorker(
+  `${location.origin}/wasm/atomic_wasm.js`,
+  workerUrl,
+  {
+    // One file per Agent, so two identities on the same origin never share a
+    // cache. Derive the name from the subject however you like.
+    dbName: `reading-list.${hash(agent.subject)}.redb`,
+    // Keep the key with the secret; without it the file is unreadable.
+    dbKey: loadOrCreateDbKey(agent.subject),
+  },
+);
+
+store.setClientDb(clientDb);
+await clientDb.init();
+
+if (!(await clientDb.whenOpen())) {
+  throw new Error(clientDb.initError?.message ?? 'Local database did not open');
+}
+```
+
+`whenOpen()` checks actual database open, not overall readiness that may also depend on bootstrap seeding. If a seed producer waits for `isReady`/seeded readiness while it is responsible for completing that seed, it waits on itself. This guide has no seed step; it waits only for the database to open.
+
+Only after this check succeeds, and with SDK support for parentless no-server creation, should the examples below create and save the local Drive and Book. If storage is unsupported or denied, stop before those required local-only saves; there is no optional in-memory durability fallback.
 
 ## Create a Drive
 
@@ -51,8 +85,7 @@ console.log(book.subject); // atomic:… (a fresh identifier, minted here)
 ```
 
 `newResource` mints a `atomic:` identifier from a genesis certificate signed by your Agent.
-`save()` writes to the Resource's Loro document, marks it dirty in the outbox, and applies it locally at once.
-There is no server to wait for, so the Promise resolves as soon as the local write is done.
+On this local-only Drive, `save()` persists a durable Resource snapshot in the already-open client database without enrolling the edit in the server-drain outbox. The Promise resolves after the required snapshot write; if that write fails, it rejects and the in-memory edit remains unsaved.
 
 Editing is the same call:
 
@@ -77,8 +110,7 @@ The callback does not care which.
 
 ## What you have
 
-An identity, a Drive and a Book, all signed, all created without a network request.
-Reload the page, though, and the Store starts empty again: this step keeps everything in memory.
-Fixing that is the next step.
+An identity, a Drive and a Book, all signed and created without a network request. Because the client database was opened before the first save, their snapshots survive reloads.
+The Drive is local-only, so its saves are not sent to a server or queued for drain until you promote it.
 
-Next: [persisting across reloads](4-persist.md).
+Next: [persisting across reloads](4-persist.md) explains the client database this step already opened and what it persists.

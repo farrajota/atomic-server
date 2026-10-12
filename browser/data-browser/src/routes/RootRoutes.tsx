@@ -50,10 +50,11 @@ function AppRouteContent(): React.JSX.Element | null {
     if (signedIn) {
       navigate({ to: '/', replace: true });
     } else {
-      const searchParams = new URLSearchParams({
-        step: 'signin',
-        next: `${pathname}${searchStr}`,
-      });
+      const next = new URL(
+        `${pathname}${searchStr}${window.location.hash}`,
+        window.location.origin,
+      ).toString();
+      const searchParams = new URLSearchParams({ step: 'signin', next });
       navigate({
         to: `${paths.welcome}?${searchParams.toString()}`,
         replace: true,
@@ -83,10 +84,11 @@ export function RequireAgent({
     if (signedIn || redirected.current) return;
     redirected.current = true;
 
-    const searchParams = new URLSearchParams({
-      step: 'signin',
-      next: `${pathname}${searchStr}`,
-    });
+    const next = new URL(
+      `${pathname}${searchStr}${window.location.hash}`,
+      window.location.origin,
+    ).toString();
+    const searchParams = new URLSearchParams({ step: 'signin', next });
     navigate({
       to: `${paths.welcome}?${searchParams.toString()}`,
       replace: true,

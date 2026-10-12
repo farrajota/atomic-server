@@ -2,6 +2,7 @@ import {
   conversations,
   core,
   Datatype,
+  RequestCancelledError,
   server,
   type Agent,
   type Resource,
@@ -44,9 +45,9 @@ function requireSubject(agent: Agent | undefined): string {
 }
 
 /**
- * Publishes the agent's `encryptionKey` on its Agent resource, so others can
- * start a conversation with it. Does nothing when it is already there. The key
- * is derived from the agent's own key, so every device publishes the same one.
+ * Publishes the agent's derived `encryptionKey` on its Agent resource. Matching
+ * cached keys need no read; otherwise compare an independent signed response,
+ * without merging it over pending profile edits. Local-only Agents stay local.
  */
 export async function ensureEncryptionKey(
   store: Store,
@@ -61,6 +62,33 @@ export async function ensureEncryptionKey(
   }
 
   if (agentResource.get(conversations.properties.encryptionKey) !== key) {
+    if (!store.isLocalOnlySubject(subject)) {
+      const serverURL = store.getServerUrl();
+      // Store refreshes merge into the cache; that merged key is not the
+      // authoritative value needed to decide whether publication is necessary.
+      const { resource: authoritativeAgentResource, cancelled } =
+        await agent.client.fetchResourceHTTP(subject, {
+          signInfo: { agent, serverURL },
+          serverURL,
+        });
+
+      if (cancelled) {
+        throw new RequestCancelledError(`Resource fetch cancelled: ${subject}`);
+      }
+
+      if (authoritativeAgentResource.error) {
+        throw authoritativeAgentResource.error;
+      }
+
+      if (
+        authoritativeAgentResource.get(
+          conversations.properties.encryptionKey,
+        ) === key
+      ) {
+        return key;
+      }
+    }
+
     await agentResource.set(conversations.properties.encryptionKey, key, false);
     await agentResource.save();
   }
@@ -97,6 +125,11 @@ export function hasMembers(conversation: Resource, members: string[]): boolean {
 /**
  * Creates a conversation between the signed-in agent and `others`, and
  * returns it saved. The caller lists it on the private drive.
+ *
+ * An empty `others` is a note to yourself. Nobody else needs a host for it, so
+ * it stays on this device like a browser-only drive and never reaches a server
+ * (a managed node would refuse it as "not enrolled" anyway). A non-empty
+ * `others` that holds nothing but yourself is a mistake and throws.
  */
 export async function startConversation(
   store: Store,
@@ -105,8 +138,9 @@ export async function startConversation(
   const agent = store.getAgent();
   const me = requireSubject(agent);
   const memberSubjects = [me, ...others.filter(other => other !== me)];
+  const noteToSelf = others.length === 0;
 
-  if (memberSubjects.length < 2) {
+  if (memberSubjects.length < 2 && !noteToSelf) {
     throw new Error('Pick someone to message.');
   }
 
@@ -136,6 +170,11 @@ export async function startConversation(
       [conversations.properties.conversationKeys]: Datatype.STRING,
     },
   });
+
+  // Before the first save: registration is what keeps the genesis out of the
+  // outbox. `makeDriveLocal` is for a drive a server may already hold, and
+  // verifies its copy against that server first; this one does not exist yet.
+  if (noteToSelf) store.registerLocalOnlyDrive(conversation.subject);
 
   await conversation.save();
   // The server grants the creator `write` at genesis. Give it up, or the

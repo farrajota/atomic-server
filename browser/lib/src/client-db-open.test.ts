@@ -81,6 +81,36 @@ describe('isWrongKeyDbError', () => {
     expect(isWrongKeyDbError(undefined)).toBe(false);
   });
 });
+describe('isStorageBlockedDbError', () => {
+  it('recognizes the legacy WASM wrapper around storage access denial', () => {
+    expect(
+      isStorageBlockedDbError(
+        new Error(
+          'check legacy: JsValue(SecurityError: Storage access denied by test\nundefined)',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('does not classify unrelated migration failures or wrong-key recovery as storage refusal', () => {
+    expect(
+      isStorageBlockedDbError(new Error('legacy data is unsupported')),
+    ).toBe(false);
+    expect(
+      isStorageBlockedDbError(
+        new Error(
+          'check legacy: JsValue(SecurityError: Operation is insecure)',
+        ),
+      ),
+    ).toBe(false);
+    expect(isStorageBlockedDbError(new Error(wrongKeyMessage))).toBe(false);
+    expect(
+      isStorageBlockedDbError(
+        new Error(`OPFS unavailable [${STORAGE_BLOCKED_MARKER}]: denied`),
+      ),
+    ).toBe(true);
+  });
+});
 
 describe('openClientDb', () => {
   it('opens normally without touching anything', async () => {

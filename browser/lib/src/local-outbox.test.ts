@@ -14,7 +14,9 @@ import {
   BLOCK_AFTER_FAILURES,
   REPORT_AFTER_FAILURES,
   type OutboxEntry,
+  type OutboxDatabase,
 } from './local-outbox.js';
+
 import { commitToJsonADObject, type Commit } from './commit.js';
 import { ErrorCode } from './ws-v2.js';
 
@@ -709,6 +711,84 @@ describe('LocalOutbox blocking', () => {
       await outbox.drain(ctx);
       assert(drainSubject).toHaveBeenCalledTimes(1);
       assert(outbox.size).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('keeps a code-6 owner-policy park through durable same-agent hydration', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const agent = 'did:ad:agent:owner-park=';
+      const rows = new Map<string, string>();
+      let durableRows = new Map<string, string>();
+      const database: OutboxDatabase = {
+        outboxEntries: async requestedAgent =>
+          requestedAgent === agent ? [...rows.values()] : [],
+        outboxWrite: async (write, durable) => {
+          if (write.agent !== agent) return;
+          for (const subject of write.deletes) rows.delete(subject);
+          for (const { subject, value } of write.puts) rows.set(subject, value);
+          if (durable) durableRows = new Map(rows);
+        },
+      };
+      const outbox = new LocalOutbox();
+      outbox.expectDatabase();
+      outbox.rebind(agent);
+      await outbox.attachDatabase(agent, database);
+      outbox.setGenesisCommit(SUBJECT, fakeCommit(SUBJECT));
+
+      const refusal = new AtomicError(
+        'This server does not host new Drives. Its owner runs it for their own data, so you cannot create a workspace here.',
+        ErrorType.Server,
+        ErrorCode.SYNC_REJECTED,
+      );
+      const drainSubject = vi.fn(async () => {
+        throw refusal;
+      });
+      const ctx = {
+        sort: (entries: readonly OutboxEntry[]) => [...entries],
+        drainSubject,
+        isBlockingError: (_entry: OutboxEntry, error: unknown) =>
+          error instanceof AtomicError &&
+          isUnrecoverableCommitError(error.message, error.code),
+      };
+
+      await outbox.drain(ctx);
+      assert(outbox.getEntry(SUBJECT)?.blocked).toBe(true);
+      assert(outbox.getEntry(SUBJECT)?.signedGenesis).toBeDefined();
+      await outbox.flush();
+
+      const reopenedRows = new Map(durableRows);
+      const reopenedDatabase: OutboxDatabase = {
+        outboxEntries: async requestedAgent =>
+          requestedAgent === agent ? [...reopenedRows.values()] : [],
+        outboxWrite: async (write, durable) => {
+          if (write.agent !== agent) return;
+          for (const subject of write.deletes) reopenedRows.delete(subject);
+          for (const { subject, value } of write.puts)
+            reopenedRows.set(subject, value);
+          if (durable) durableRows = new Map(reopenedRows);
+        },
+      };
+      const reloaded = new LocalOutbox();
+      reloaded.expectDatabase();
+      reloaded.rebind(agent);
+      await reloaded.attachDatabase(agent, reopenedDatabase);
+
+      assert(reloaded.hasPending(SUBJECT)).toBe(true);
+      assert(reloaded.getEntry(SUBJECT)?.signedGenesis).toBeDefined();
+      // Resource's ordinary local-update callback calls markDirty; neither
+      // that callback nor a normal drain changes an explicit owner-policy park.
+      reloaded.markDirty(SUBJECT);
+      await reloaded.drain(ctx);
+      assert(drainSubject).toHaveBeenCalledTimes(1);
+      assert(reloaded.hasPending(SUBJECT)).toBe(true);
+
+      // Changing the server policy is the explicit supported re-arm.
+      assert(reloaded.rearmOwnerModeBlocked()).toBe(1);
+      await reloaded.drain(ctx);
+      assert(drainSubject).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

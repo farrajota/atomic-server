@@ -336,6 +336,8 @@ describe('offline persistence', () => {
     const dbState = new Map<string, DbEntry>();
     (store as unknown as { clientDb: unknown }).clientDb = {
       isReady: true,
+      isOpen: true,
+      whenOpen: async () => true,
       isInitialized: true,
       initError: undefined,
       flush: async () => undefined,

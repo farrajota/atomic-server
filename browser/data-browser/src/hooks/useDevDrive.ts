@@ -138,9 +138,8 @@ export function useDevDrive() {
       );
 
       await saveAgentToIDB(finalSecret);
-      const updatedAgent = await Agent.fromSecret(finalSecret);
-      store.setAgent(updatedAgent);
-      setAgent(updatedAgent);
+      newAgent.initialDrive = driveResource.subject;
+      setAgent(newAgent);
       setDrive(driveResource.subject);
       navigate(constructOpenURL(driveResource.subject));
     } finally {

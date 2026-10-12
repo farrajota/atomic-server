@@ -6,6 +6,7 @@ import {
   encodeEphemeral as encodePeerEphemeral,
   decodeEphemeral as decodePeerEphemeral,
   EphemeralKind as PeerEphemeralKind,
+  ErrorCode,
 } from './ws-v2.js';
 import { serializeDeterministically as serializePeerCommit } from './commit.js';
 import { taskSchema } from './task-schema.js';
@@ -88,11 +89,22 @@ import { decodeB64, encodeB64Url } from './base64.js';
 import {
   canonicalizeScheme,
   isAgentSubject,
+  agentPublicKey,
   isAtomicIdentifier,
   isBlobSubject,
+  isLensSubject,
+  isPropertySubject,
   commitSubject,
   blobSubject,
 } from './subject.js';
+import { propertyId } from './property-identity.js';
+import {
+  LensIndex,
+  lensId,
+  parseTransform,
+  readTransformValue,
+  verifyLensId,
+} from './lens.js';
 import {
   encodeGenesisCert,
   GENESIS_VERSION_V1,
@@ -132,6 +144,15 @@ type LoroEphemeralCallback = (update: Uint8Array) => void;
 /** Callback for drive-scoped presence updates */
 type PresenceCallback = (update: Uint8Array) => void;
 type SubjectCallback = (subject: string) => void;
+
+/** The public key an agent subject names, whatever its spelling. */
+function agentKeyOf(subject: string): string {
+  return (agentPublicKey(subject) ?? subject)
+    .replace(/=+$/, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
 /** Callback called when the stores agent changes */
 type AgentCallback = (agent: Agent | undefined) => void;
 type ErrorCallback = (e: Error) => void;
@@ -160,6 +181,18 @@ export interface RepeatedCommitFailure {
 }
 
 type RepeatedCommitFailureCallback = (failure: RepeatedCommitFailure) => void;
+
+/**
+ * Lets the app deal with a drive the server refuses as "not enrolled" before
+ * the store reports it. `drive` is the drive the refusal names. Resolve `true`
+ * when the drive was handled (for instance switched to browser-only), so
+ * there is nothing left to report. Resolve `false`, or reject, to leave the
+ * report as it is. Called at most once per drive per session.
+ */
+export type RefusedDriveHandler = (
+  drive: string,
+  message: string,
+) => boolean | Promise<boolean>;
 
 type ServerURLCallback = (serverURL: string) => void;
 type DriveCallback = (drive: string) => void;
@@ -193,6 +226,25 @@ type CreateResourceOptions = {
   genesisCert?: GenesisCert;
   /** Seed a body or other state before the first save signs its genesis. */
   deferGenesis?: boolean;
+  /**
+   * Create a Property under its content-addressed ID, `atomic:prop:{blake3}`,
+   * derived from `parent`, `propVals[shortname]` and `propVals[datatype]`
+   * (see docs/src/schema/property-identity.md). No genesis cert is minted; the
+   * resource is still signed as a genesis commit. Returns the existing Property
+   * when the store already has it.
+   *
+   * This is an explicit opt-in rather than inferred from `isA`: the ID is
+   * immutable and the three inputs must be known up front, so a caller that
+   * builds a Property draft in steps must not silently get a hashed subject.
+   */
+  contentAddressedProperty?: boolean;
+  /**
+   * Create a Lens under its content-addressed ID, `atomic:lens:{blake3}`,
+   * derived from `propVals[lensFrom]`, `propVals[lensTo]` and
+   * `propVals[lensTransform]` (see docs/src/schema/lenses.md). Returns the
+   * existing Lens when the store already has it.
+   */
+  contentAddressedLens?: boolean;
 };
 
 export interface StoreOpts {
@@ -587,24 +639,39 @@ const VV_SLICE = 500;
 async function readDriveVersionVectors(
   db: ClientDbWorker,
   drive: string,
+  assertCurrent: () => void,
 ): Promise<Record<string, Record<string, number>>> {
+  assertCurrent();
+
   if (!db.getDriveSubjects || !db.getVersionVectorsForSubjects) {
-    return db.getVersionVectorsForDrive(drive);
+    const vectors = await db.getVersionVectorsForDrive(drive);
+
+    assertCurrent();
+
+    return vectors;
   }
 
   const subjects = await db.getDriveSubjects(drive);
 
+  assertCurrent();
+
   if (subjects.length <= VV_SLICE) {
-    return db.getVersionVectorsForDrive(drive);
+    const vectors = await db.getVersionVectorsForDrive(drive);
+
+    assertCurrent();
+
+    return vectors;
   }
 
   const all: Record<string, Record<string, number>> = {};
 
   for (let i = 0; i < subjects.length; i += VV_SLICE) {
-    Object.assign(
-      all,
-      await db.getVersionVectorsForSubjects(subjects.slice(i, i + VV_SLICE)),
+    const vectors = await db.getVersionVectorsForSubjects(
+      subjects.slice(i, i + VV_SLICE),
     );
+
+    assertCurrent();
+    Object.assign(all, vectors);
   }
 
   return all;
@@ -663,10 +730,9 @@ export class Store {
    *  one per term. */
   private _proxiedOrigins: Set<string> = new Set();
 
-  /** Subjects with a gap-recovery fetch in flight. A delta that cannot apply
-   *  triggers one full-state fetch; this stops a burst of unappliable deltas
-   *  for the same subject from firing one fetch each. */
-  private _gapRecoveries: Set<string> = new Set();
+  /** One gap recovery per subject and owner. A replacement session may start
+   *  its own repair without waiting for the outgoing worker to answer. */
+  private _gapRecoveries = new Map<string, () => boolean>();
 
   /** The updates that could not apply, per subject under recovery, to be
    *  replayed once a base is in place. */
@@ -813,6 +879,7 @@ export class Store {
     message: string;
     timestamp: number;
   };
+  private _lastDriveSyncErrorCode?: number;
   private _lastDriveSync?: {
     drive: string;
     count: number;
@@ -992,33 +1059,40 @@ export class Store {
    * or a newer database overtook stops.
    */
   private async bindOutboxDatabase(): Promise<void> {
-    const agent = this.agent?.subject;
+    const agent = this.agent;
     const attached = await this.waitForClientDb(CLIENT_DB_ATTACH_GRACE);
 
-    if (this.agent?.subject !== agent) return;
+    if (this.agent !== agent) return;
 
     const db = this.clientDb;
 
     if (!attached || !db || !isOutboxDatabase(db)) {
       // Nothing to move into (yet). A later `setClientDb` binds it then.
-      if (!db) this.outbox.databaseUnavailable(agent);
+      if (!db) this.outbox.databaseUnavailable(agent?.subject);
 
       return;
     }
 
     const ready = await db.waitForInit();
 
-    if (this.agent?.subject !== agent || this.clientDb !== db) return;
+    if (this.agent !== agent || this.clientDb !== db) return;
 
     if (!ready) {
-      this.outbox.databaseUnavailable(agent);
+      this.outbox.databaseUnavailable(agent?.subject);
 
       return;
     }
 
-    const added = await this.outbox.attachDatabase(agent, db);
+    const added = await this.outbox.attachDatabase(agent?.subject, db);
 
-    for (const entry of added) this.hydrateCommitLogFromOutbox(entry);
+    if (this.agent !== agent || this.clientDb !== db) return;
+
+    for (const entry of added) {
+      if (this.agent !== agent || this.clientDb !== db) return;
+      this.hydrateCommitLogFromOutbox(entry);
+    }
+
+    if (this.agent !== agent || this.clientDb !== db) return;
 
     this.scheduleOutboxDrain();
   }
@@ -1210,6 +1284,7 @@ export class Store {
 
       if (this._lastDriveSyncError?.drive === drive) {
         this._lastDriveSyncError = undefined;
+        this._lastDriveSyncErrorCode = undefined;
       }
 
       this.emitSyncStatus();
@@ -1513,10 +1588,29 @@ export class Store {
     // Entries still in the database are invisible until it attaches. The
     // reconnect sequence refetches and reconciles after this resolves, and
     // must not do so over an offline edit the queue has not loaded yet.
-    if (!this.getAgent()) return;
-    await this.outbox.whenHydrated();
+    const agent = this.getAgent();
+    let clientDb = this.clientDb;
+    const current = () =>
+      this.getAgent() === agent && this.clientDb === clientDb;
 
-    if (this.outbox.size === 0 || !this.getAgent()) return;
+    if (!agent) return;
+    await this.outbox.whenHydrated();
+    // A cache absent at flush start may attach while hydration waits. Adopt it
+    // for this pass, but keep any existing worker as a fence against replacement.
+    if (!clientDb && this.getAgent() === agent) clientDb = this.clientDb;
+    const driveSyncError = this._lastDriveSyncError;
+
+    if (
+      current() &&
+      driveSyncError &&
+      this._lastDriveSyncErrorCode === ErrorCode.SYNC_REJECTED &&
+      isNotEnrolledMessage(driveSyncError.message) &&
+      driveSyncError.message.includes('This server does not host new Drives')
+    ) {
+      this.parkOwnerModeDrive(driveSyncError.drive, driveSyncError.message);
+    }
+
+    if (!current() || this.outbox.size === 0) return;
     perfMark('store.syncDirtyResources.subjects', { count: this.outbox.size });
     this.emitSyncStatus();
 
@@ -1524,7 +1618,15 @@ export class Store {
       await this.outbox.drain({
         sort: this.sortOutboxEntries,
         tierOf: this.outboxTierOf,
-        drainSubject: this.drainOutboxSubject,
+        drainSubject: async subject => {
+          if (!current()) {
+            throw new RequestCancelledError(
+              'Owner changed during outbox drain',
+            );
+          }
+
+          await this.drainOutboxSubject(subject);
+        },
         isTerminalError: (_entry, e) => {
           const msg = e instanceof Error ? e.message : String(e);
           const code = e instanceof AtomicError ? e.code : undefined;
@@ -1579,18 +1681,37 @@ export class Store {
           return isUnrecoverableCommitError(msg, code);
         },
         onRepeatedFailure: (entry, e) => {
-          this.eventManager.emit(StoreEvents.CommitRepeatedlyFailing, {
-            subject: entry.subject,
-            error: e instanceof Error ? e : new Error(String(e)),
-            failures: entry.failures ?? 0,
-            server: this.getServerUrl(),
-            drive: this.getDrive(),
-            ageMs: Math.max(0, Date.now() - entry.enqueuedAt),
-            outboxSize: this.outbox.size,
-            connected: this._serverConnected,
-            isGenesis: entry.signedGenesis !== undefined,
-            rearmedAfterResync: entry.rearmedAfterResync === true,
-          });
+          const error = e instanceof Error ? e : new Error(String(e));
+          const report = () =>
+            this.eventManager.emit(StoreEvents.CommitRepeatedlyFailing, {
+              subject: entry.subject,
+              error,
+              failures: entry.failures ?? 0,
+              server: this.getServerUrl(),
+              drive: this.getDrive(),
+              ageMs: Math.max(0, Date.now() - entry.enqueuedAt),
+              outboxSize: this.outbox.size,
+              connected: this._serverConnected,
+              isGenesis: entry.signedGenesis !== undefined,
+              rearmedAfterResync: entry.rearmedAfterResync === true,
+            });
+          const refused = this.refusedDriveOf(error.message);
+
+          // A refusal the app resolves (the drive moves to browser-only) is
+          // not a failure worth reporting: nothing keeps failing afterwards.
+          if (
+            !error.message.includes('This server does not host new Drives') &&
+            refused &&
+            this.refusedDriveHandler
+          ) {
+            void this.healRefusedDrive(refused, error.message).then(healed => {
+              if (!healed) report();
+            });
+
+            return;
+          }
+
+          report();
         },
         onBlocked: (entry, e) => {
           this.notifyBlockedSync(
@@ -1600,21 +1721,25 @@ export class Store {
         },
       });
 
+      if (!current()) return;
+
       // Children may call syncDirtyResources themselves. Start them only after
       // the parent's drain has completed, never from inside its drain callback.
       for (const parent of [...this.batchedResources.keys()]) {
         if (this.resources.get(parent)?.getLastCommitForChain()) {
           await this.saveBatchForParent(parent);
+
+          if (!current()) return;
         }
       }
     } finally {
-      this.emitSyncStatus();
+      if (current()) this.emitSyncStatus();
       // Re-arm for entries that remain — including ones skipped this pass
       // because they're still inside their backoff window (those fire no
       // `onChange`, so without this re-arm they would strand). `scheduleOutbox-
       // Drain` computes the next wake from `nextDueAt()`.
 
-      if (this.outbox.size > 0) {
+      if (current() && this.outbox.size > 0) {
         this.scheduleOutboxDrain();
       }
     }
@@ -1685,6 +1810,42 @@ export class Store {
     );
   }
 
+  /**
+   * Whether signing `resource` as `agent` would put another agent's name on a
+   * parentless Agent resource. Compared by key, not spelling: the same key
+   * appears as `atomic:agent:`, `did:ad:agent:`, base64url or padded base64.
+   * An Agent resource with a parent (an access key's profile, filed under
+   * its issuer's folder) is rightly written by someone else.
+   */
+  private signsForeignAgentResource(resource: Resource, agent: Agent): boolean {
+    if (!isAgentSubject(resource.subject) || !agent.subject) return false;
+    if (resource.get(core.properties.parent)) return false;
+
+    return agentKeyOf(resource.subject) !== agentKeyOf(agent.subject);
+  }
+
+  /** Subjects of Agent resources with edits waiting for their own agent, by
+   *  agent key. In memory: the resource itself still holds the ops. */
+  private heldForOwner = new Map<string, Set<string>>();
+
+  private holdForOwner(subject: string): void {
+    const key = agentKeyOf(subject);
+    const held = this.heldForOwner.get(key) ?? new Set<string>();
+    held.add(subject);
+    this.heldForOwner.set(key, held);
+  }
+
+  private releaseHeldFor(agent: Agent | undefined): void {
+    const key = agent?.subject ? agentKeyOf(agent.subject) : undefined;
+    const held = key ? this.heldForOwner.get(key) : undefined;
+
+    if (!key || !held) return;
+
+    this.heldForOwner.delete(key);
+
+    for (const subject of held) this.outbox.markDirty(subject);
+  }
+
   private outboxTierOf = (entry: OutboxEntry): string => {
     const [priority, depth] = this.outboxTier(entry.subject);
 
@@ -1724,6 +1885,17 @@ export class Store {
     let entry = this.outbox.getEntry(subject);
     if (!entry) return;
 
+    const clientDb = this.clientDb;
+    const agent = this.getAgent();
+
+    if (!agent) return;
+
+    const assertCurrent = () => {
+      if (this.clientDb !== clientDb || this.getAgent() !== agent) {
+        throw new RequestCancelledError('Owner changed during outbox drain');
+      }
+    };
+
     // A `_new:` subject has no derived DID yet — it must be sign-genesis'd
     // (which renames it to `did:ad:<sig>`) before it can be POSTed. The
     // current UI no longer creates these, but an outbox written by an older
@@ -1748,6 +1920,7 @@ export class Store {
     if (entry.signedDestroy) {
       await this.drainDestroy(subject, entry.signedDestroy, endpoint, {
         neverSynced: !!entry.signedGenesis,
+        assertCurrent,
       });
 
       return;
@@ -1775,6 +1948,8 @@ export class Store {
       }
 
       const created = await this.postCommit(genesis, endpoint);
+      assertCurrent();
+
       // Publish the acknowledgement before ResourceSaved listeners decide
       // whether this new resource can be subscribed on the server.
       this.outbox.clearGenesis(subject);
@@ -1786,6 +1961,8 @@ export class Store {
         resource.applyToStore('local-acked', { commitId });
         resource.markSynced();
         await this.maybePushBlobForResource(resource).catch(() => undefined);
+        assertCurrent();
+
         // wasNew pipeline — first-time subscribe + save batched children
         this.subscribeWebSocket(subject);
         // The genesis POST IS a save — fire `ResourceSaved` so listeners
@@ -1823,7 +2000,7 @@ export class Store {
       // server state instead would export an empty delta and clear the
       // dirty bit, silently dropping them. Until it's ready, leave the
       // entry dirty — the next drain pass retries.
-      if (this.clientDb && !this.clientDb.isReady) {
+      if (clientDb && !clientDb.isReady) {
         this.emitSyncStatus();
 
         return;
@@ -1832,6 +2009,7 @@ export class Store {
       // OPFS-first, then server. Throws on hard failure (offline DID,
       // network error) — the outbox failure/backoff machinery takes over.
       resource = await this.getResource(subject);
+      assertCurrent();
 
       if (resource.error) {
         throw resource.error;
@@ -1856,8 +2034,19 @@ export class Store {
       return;
     }
 
-    const agent = this.getAgent();
-    if (!agent) return;
+    // An Agent resource is created and written by that agent alone (the
+    // server rejects any other signer). The signer is picked here, at drain
+    // time, so an identity swap between the edit and this point would send
+    // agent A's profile signed as agent B. Hold the edit for its owner
+    // instead: it stays dirty on the resource, is not an error, and is
+    // re-queued when that agent is current again (see `setAgent`).
+    if (this.signsForeignAgentResource(resource, agent)) {
+      this.holdForOwner(resource.subject);
+      this.outbox.clearDirty(subject);
+      this.emitSyncStatus();
+
+      return;
+    }
 
     // Offline-edit recovery: if this subject went dirty while offline, the
     // outbox holds the last-synced version, and the ops past it live ONLY in
@@ -1883,16 +2072,17 @@ export class Store {
     let offlineSnapshotLoaded = false;
 
     if (entry.baseVersion) {
-      if (this.clientDb && !this.clientDb.isReady) {
+      if (clientDb && !clientDb.isReady) {
         this.emitSyncStatus();
 
         return;
       }
 
-      if (this.clientDb?.isReady) {
+      if (clientDb?.isReady) {
         try {
           const { jsonAd, snapshot } =
-            await this.clientDb.getResourceWithSnapshot(subject);
+            await clientDb.getResourceWithSnapshot(subject);
+          assertCurrent();
 
           if (jsonAd) {
             this.hydrateResourceFromJson(subject, JSON.parse(jsonAd));
@@ -1911,6 +2101,10 @@ export class Store {
 
           if (refreshed) resource = refreshed;
         } catch (e) {
+          assertCurrent();
+
+          if (e instanceof RequestCancelledError) throw e;
+
           console.warn(
             `[Outbox] OPFS rehydrate before offline drain failed for ${subject}:`,
             e,
@@ -1974,6 +2168,7 @@ export class Store {
     const builder = new CommitBuilder(subject);
     builder.setLoroUpdate(delta);
     const commit = await builder.sign(agent);
+    assertCurrent();
 
     // Registered before the POST, not after the ack: the server echoes the
     // commit to this connection too, and under load that echo lands before
@@ -1987,7 +2182,10 @@ export class Store {
 
     try {
       created = await this.postCommit(commit, endpoint);
+      assertCurrent();
     } catch (e) {
+      assertCurrent();
+
       // Pending-deps rejection: the delta we just sent starts past ops the
       // server never received (an earlier commit was lost after the save
       // cursor advanced). Retrying the same delta can never succeed — the
@@ -2050,6 +2248,7 @@ export class Store {
 
     this.notifyResourceSaved(resource);
     await this.maybePushBlobForResource(resource).catch(() => undefined);
+    assertCurrent();
 
     this.emitSyncStatus();
   };
@@ -2073,7 +2272,7 @@ export class Store {
     subject: string,
     destroy: Commit,
     endpoint: string,
-    opts: { neverSynced: boolean },
+    opts: { neverSynced: boolean; assertCurrent: () => void },
   ): Promise<void> {
     if (!opts.neverSynced) {
       // Registered before the POST like every own commit: should the server
@@ -2087,6 +2286,8 @@ export class Store {
       try {
         await this.postCommit(destroy, endpoint);
       } catch (e) {
+        opts.assertCurrent();
+
         const msg = e instanceof Error ? e.message : String(e);
 
         if (!isSettledDestroyErrorMessage(msg)) throw e;
@@ -2096,6 +2297,8 @@ export class Store {
         );
       }
     }
+
+    opts.assertCurrent();
 
     // Drops the whole entry: nothing else about this subject is worth
     // syncing. Then make sure the resource is gone locally too — `destroy()`
@@ -2115,6 +2318,8 @@ export class Store {
     drive: string,
     { sparse = false }: { sparse?: boolean } = {},
   ): Promise<DriveSyncState> {
+    const agent = this.agent;
+
     // Collect VVs from WASM DB (persisted snapshots)
     let allVVs: Record<string, Record<string, number>> = {};
 
@@ -2129,10 +2334,24 @@ export class Store {
       }
     }
 
-    if (this.clientDb) {
+    const clientDb = this.clientDb;
+
+    const assertCurrent = () => {
+      if (this.agent !== agent || this.clientDb !== clientDb) {
+        throw new RequestCancelledError('Owner changed during drive sync');
+      }
+    };
+
+    assertCurrent();
+
+    if (clientDb) {
       try {
-        if (!this.clientDb.isReady && !(await this.clientDb.waitForReady())) {
-          throw new Error('Local database is not ready');
+        if (!clientDb.isReady) {
+          const ready = await clientDb.waitForReady();
+
+          assertCurrent();
+
+          if (!ready) throw new Error('Local database is not ready');
         }
 
         // Scoped to THIS drive via the same parent-index walk the server uses
@@ -2142,9 +2361,11 @@ export class Store {
         // the drive as a pull/remove candidate, so an unscoped VV made every
         // single-drive sync reason about unrelated drives' resources.
         const endVV = perfSpan('clientdb.getVersionVectorsForDrive');
-        allVVs = await readDriveVersionVectors(this.clientDb, drive);
+        allVVs = await readDriveVersionVectors(clientDb, drive, assertCurrent);
         endVV({ count: Object.keys(allVVs).length });
       } catch (e) {
+        if (e instanceof RequestCancelledError) throw e;
+
         throw new Error(`Local database unavailable for sync: ${e}`);
       }
     }
@@ -2221,9 +2442,13 @@ export class Store {
         );
       }
 
+      const driveHash = await canonicalDriveHashV2(vvs);
+
+      assertCurrent();
+
       return {
         drive,
-        driveHash: await canonicalDriveHashV2(vvs),
+        driveHash,
         peers: [],
         resources: {},
         vvs,
@@ -2264,6 +2489,8 @@ export class Store {
     // `canonicalDriveHash` / planning/drive-reconciliation.md Phase 1).
     const driveHash = await canonicalDriveHash(resources);
 
+    assertCurrent();
+
     return { drive, driveHash, peers, resources };
   }
 
@@ -2299,17 +2526,29 @@ export class Store {
   private async fetchResourceFromClientDb(
     subject: string,
   ): Promise<Resource | null> {
-    if (!this.clientDb) return null;
+    const clientDb = this.clientDb;
+    const agent = this.getAgent();
 
-    if (!this.clientDb.isReady) {
-      const ready = await this.clientDb.waitForReady();
+    if (!clientDb) return null;
+
+    const assertCurrent = () => {
+      if (this.clientDb !== clientDb || this.getAgent() !== agent) {
+        throw new RequestCancelledError('Owner changed during local refresh');
+      }
+    };
+
+    if (!clientDb.isReady) {
+      const ready = await clientDb.waitForReady();
+      assertCurrent();
 
       if (!ready) return null;
     }
 
     try {
       const { jsonAd, snapshot } =
-        await this.clientDb.getResourceWithSnapshot(subject);
+        await clientDb.getResourceWithSnapshot(subject);
+      assertCurrent();
+
       if (!jsonAd) return null;
 
       return (
@@ -2319,7 +2558,11 @@ export class Store {
           snapshot ?? undefined,
         ) ?? null
       );
-    } catch {
+    } catch (error) {
+      assertCurrent();
+
+      if (error instanceof RequestCancelledError) throw error;
+
       return null;
     }
   }
@@ -2523,13 +2766,18 @@ export class Store {
     source: string | undefined,
     update: Uint8Array,
   ): void {
-    const updates = this._gapUpdates.get(subject) ?? [];
-    updates.push(update);
-    this._gapUpdates.set(subject, updates);
+    if (this._gapRecoveries.get(subject)?.()) {
+      this._gapUpdates.get(subject)?.push(update);
 
-    if (this._gapRecoveries.has(subject)) return;
+      return;
+    }
 
-    this._gapRecoveries.add(subject);
+    const clientDb = this.clientDb;
+    const agent = this.getAgent();
+    const current = () =>
+      this.clientDb === clientDb && this.getAgent() === agent;
+    this._gapUpdates.set(subject, [update]);
+    this._gapRecoveries.set(subject, current);
     this.getResolved(subject)?.setRecovering(true);
     console.info(
       `[Store] incomplete Loro import for ${subject.slice(0, 60)} ` +
@@ -2545,17 +2793,19 @@ export class Store {
     const gone = () =>
       this.isDestroyed(subject) || this.hasPendingDestroy(subject);
     const fromServer = () =>
-      gone()
+      !current() || gone()
         ? undefined
         : this.fetchResourceFromServer(subject, { forceOverride: true });
-    const repair: Promise<unknown> = this.clientDb
-      ? this.replayOnLocalBase(subject).then(done =>
+    const repair: Promise<unknown> = clientDb
+      ? this.replayOnLocalBase(subject, clientDb, current).then(done =>
           done ? undefined : fromServer(),
         )
       : Promise.resolve(fromServer());
 
     repair
       .catch(error => {
+        if (!current() || error instanceof RequestCancelledError) return;
+
         if (gone()) {
           console.info(
             `[Store] ${subject.slice(0, 60)} was deleted while its missing state was being recovered.`,
@@ -2577,8 +2827,13 @@ export class Store {
         }
       })
       .finally(() => {
+        if (this._gapRecoveries.get(subject) !== current) return;
+
         this._gapRecoveries.delete(subject);
         this._gapUpdates.delete(subject);
+
+        if (!current()) return;
+
         const resource = this.getResolved(subject);
 
         if (resource) {
@@ -2605,17 +2860,38 @@ export class Store {
    * waited on it and whatever was listed from it (the apps a table offers,
    * #1846) went stale.
    */
-  private async replayOnLocalBase(subject: string): Promise<boolean> {
-    const clientDb = this.clientDb;
+  private async replayOnLocalBase(
+    subject: string,
+    clientDb: ClientDbWorker,
+    current: () => boolean,
+  ): Promise<boolean> {
+    const assertCurrent = () => {
+      if (!current()) {
+        throw new RequestCancelledError(
+          'Owner changed during local-base repair',
+        );
+      }
+    };
 
-    if (!clientDb) return false;
-    if (!clientDb.isReady && !(await clientDb.waitForReady())) return false;
+    assertCurrent();
+
+    if (!clientDb.isReady) {
+      const ready = await clientDb.waitForReady();
+      assertCurrent();
+
+      if (!ready) return false;
+    }
 
     let snapshot: Uint8Array | null;
 
     try {
       ({ snapshot } = await clientDb.getResourceWithSnapshot(subject));
-    } catch {
+      assertCurrent();
+    } catch (error) {
+      assertCurrent();
+
+      if (error instanceof RequestCancelledError) throw error;
+
       return false;
     }
 
@@ -2937,6 +3213,13 @@ export class Store {
       // index as authoritative and never asked the server. A second device
       // could open a drive and show none of its contents for the whole
       // session. Remember them and write them when the database arrives.
+      const identity = this.agent?.subject;
+
+      if (this.pendingClientDbWritesIdentity !== identity) {
+        this.pendingClientDbWrites.clear();
+        this.pendingClientDbWritesIdentity = identity;
+      }
+
       this.pendingClientDbWrites.add(emitResource.subject);
     }
 
@@ -2947,12 +3230,19 @@ export class Store {
    *  written once one is. Bounded by the attach window, which is one cold load
    *  or one identity change. */
   private pendingClientDbWrites = new Set<string>();
+  private pendingClientDbWritesIdentity: string | undefined;
 
   /** Write what arrived while the local database was detached. A different
    *  worker is a different database file, so what {@link lastPersisted}
    *  says was already written does not apply to it. */
   private flushPendingClientDbWrites(): void {
     if (this.pendingClientDbWrites.size === 0) return;
+
+    if (this.pendingClientDbWritesIdentity !== this.agent?.subject) {
+      this.pendingClientDbWrites.clear();
+
+      return;
+    }
 
     const subjects = [...this.pendingClientDbWrites];
     this.pendingClientDbWrites.clear();
@@ -2970,16 +3260,12 @@ export class Store {
   /** Persist a resource's current state to the local database, if there is one
    *  and this state is worth writing. */
   private writeToClientDb(resource: Resource): void {
+    const clientDb = this.clientDb;
+    const identity = this.agent?.subject;
+
     if (
-      // Skip persisting when the worker has a known init failure (e.g.
-      // OPFS leader-election couldn't steal the lock — Firefox doesn't
-      // support `navigator.locks.request({ steal: true })`). Without this
-      // gate every single `addResource` would queue a `putResourceWithSnapshot`
-      // that fails with the same error, flooding the console with one
-      // stack trace per resource. The worker itself has already warned
-      // once when init failed — that single line is the actionable signal.
-      !this.clientDb ||
-      this.clientDb.initError ||
+      !clientDb ||
+      clientDb.unsupportedEnvironment ||
       !isPersistableState(resource) ||
       // Rebuilt from the local database's own JSON-AD: writing it back would
       // replace the history stored there with ops that have none (#1905).
@@ -2990,9 +3276,34 @@ export class Store {
       return;
     }
 
-    // Captured, because the write is reported asynchronously and the worker
-    // can be swapped out from under it by an identity change.
-    const clientDb = this.clientDb;
+    if (clientDb.isOpen !== true) {
+      if (clientDb.isOpen !== false) return;
+
+      void clientDb
+        .whenOpen()
+        .then(open => {
+          if (
+            !open ||
+            this.clientDb !== clientDb ||
+            this.agent?.subject !== identity
+          ) {
+            return;
+          }
+
+          const current = this._resources.get(
+            this.resolveSubject(resource.subject),
+          );
+          if (current) this.writeToClientDb(current);
+        })
+        .catch(e =>
+          console.warn(
+            `[ClientDb] waiting to cache ${resource.subject} failed:`,
+            e,
+          ),
+        );
+
+      return;
+    }
 
     try {
       const jsonAd = resource.toClientDbJsonAd();
@@ -3120,13 +3431,17 @@ export class Store {
     did,
     genesisCert,
     deferGenesis,
+    contentAddressedProperty,
+    contentAddressedLens,
   }: CreateResourceOptions = {}): Promise<Resource<C>> {
     const agentSubject = this.getAgent()?.subject;
     const shouldUseDid =
       did ?? !!(agentSubject && isAgentSubject(agentSubject));
     const normalizedParent = parent
       ? this.normalizeSubject(parent)
-      : this.normalizeSubject(this.serverUrl);
+      : noParent
+        ? ''
+        : this.normalizeSubject(this.serverUrl);
 
     const normalizedIsA = Array.isArray(isA) ? isA : [isA];
 
@@ -3151,7 +3466,53 @@ export class Store {
     let newSubject: string;
     let genesisCertB64: string | undefined;
 
-    if (genesisCert) {
+    if (contentAddressedProperty) {
+      const shortname = propVals?.[core.properties.shortname];
+      const datatype = propVals?.[core.properties.datatype];
+
+      if (
+        noParent ||
+        !parent ||
+        typeof shortname !== 'string' ||
+        typeof datatype !== 'string'
+      ) {
+        throw new Error(
+          'contentAddressedProperty needs parent, shortname and datatype',
+        );
+      }
+
+      newSubject = propertyId(normalizedParent, shortname, datatype);
+
+      // Two devices can mint the same Property. Reuse it instead of failing.
+      const existing = this.resources.get(newSubject);
+
+      if (existing && !existing.new) {
+        return existing as Resource<C>;
+      }
+    } else if (contentAddressedLens) {
+      const from = propVals?.[core.properties.lensFrom];
+      const to = propVals?.[core.properties.lensTo];
+
+      if (
+        noParent ||
+        !parent ||
+        typeof from !== 'string' ||
+        typeof to !== 'string'
+      ) {
+        throw new Error(
+          'contentAddressedLens needs parent, lensFrom, lensTo and lensTransform',
+        );
+      }
+
+      newSubject = lensId(from, to, propVals?.[core.properties.lensTransform]);
+
+      // Two devices can mint the same Lens. Reuse it instead of failing.
+      const existing = this.resources.get(newSubject);
+
+      if (existing && !existing.new) {
+        return existing as Resource<C>;
+      }
+    } else if (genesisCert) {
       const minted = await this.mintFromCert(genesisCert);
       newSubject = subject ?? minted.did;
       genesisCertB64 = minted.certB64;
@@ -3211,7 +3572,13 @@ export class Store {
     // only `save()` does (it moves the stash into the outbox). So a
     // created-but-never-saved resource (e.g. an unfilled `TableNewRow`) is never
     // POSTed. This is the only remaining `signChanges` call site.
-    if (!deferGenesis && ((shouldUseDid && !subject) || genesisCert)) {
+    if (
+      !deferGenesis &&
+      ((shouldUseDid && !subject) ||
+        genesisCert ||
+        contentAddressedProperty ||
+        contentAddressedLens)
+    ) {
       const genesisCommit = await resource.signChanges(this.getAgent()!);
       resource.stashGenesis(genesisCommit);
     }
@@ -3412,6 +3779,17 @@ export class Store {
       : localPointer;
 
     if (!agentResource || !agentResource.isReady()) {
+      return oldPointer && oldPointer !== drive.subject
+        ? oldPointer
+        : undefined;
+    }
+
+    // The fetch above can outlast a sign-in as another identity. The pointer
+    // is only a cache for older clients, so leave it rather than write
+    // agent A's resource while another agent is signed in.
+    const current = this.getAgent()?.subject;
+
+    if (!current || agentKeyOf(current) !== agentKeyOf(agentSubject)) {
       return oldPointer && oldPointer !== drive.subject
         ? oldPointer
         : undefined;
@@ -4043,7 +4421,8 @@ export class Store {
     // Hold the batch open while the database initializes. A reload mounts its
     // resources before the worker is ready, and everything asked for in that
     // window should ride the one round trip that follows.
-    if (this.clientDb) await this.clientDb.waitForInit();
+    const owner = { clientDb: this.clientDb, agent: this.agent };
+    if (owner.clientDb) await owner.clientDb.waitForInit();
 
     const batch = this._pendingLocalHydration;
     this._pendingLocalHydration = new Map();
@@ -4063,7 +4442,7 @@ export class Store {
     await Promise.all(
       chunks.map(async chunk => {
         try {
-          const hydrated = await this.hydrateManyFromLocalDb(chunk);
+          const hydrated = await this.hydrateManyFromLocalDb(chunk, owner);
 
           chunk.forEach((subject, index) =>
             batch.get(subject)!.resolve(hydrated?.[index]),
@@ -4094,6 +4473,13 @@ export class Store {
    */
   private async hydrateManyFromLocalDb(
     subjects: string[],
+    owner: {
+      clientDb: ClientDbWorker | undefined;
+      agent: Agent | undefined;
+    } = {
+      clientDb: this.clientDb,
+      agent: this.agent,
+    },
   ): Promise<boolean[] | undefined> {
     // Wait for the WASM DB to initialize (if one is set).
     // This is important on page reload: the DB may still be loading
@@ -4106,14 +4492,18 @@ export class Store {
     // bootstrap, so they don't depend on it. Gating useResource
     // cold-loads on the seed adds 200–500 ms of dead time on a
     // populated drive (70 sequential property puts + reseed loop).
-    if (this.clientDb) {
-      await this.clientDb.waitForInit();
+    const { clientDb, agent } = owner;
+
+    if (clientDb) {
+      await clientDb.waitForInit();
     }
+
+    if (this.clientDb !== clientDb || this.agent !== agent) return undefined;
 
     // No database to ask. Say so rather than reporting a miss: the caller
     // decides what to do about it, and "we never asked" and "it isn't there"
     // lead to opposite conclusions when offline.
-    if (!this.clientDb?.isInitialized) return undefined;
+    if (!clientDb?.isInitialized) return undefined;
 
     // JSON-AD and Loro snapshot for every subject in a single worker
     // round trip. Each postMessage costs milliseconds and queues behind
@@ -4123,16 +4513,20 @@ export class Store {
 
     try {
       // Older database adapters (and test fakes) only have the single read.
-      rows = this.clientDb.getResourcesWithSnapshots
-        ? await this.clientDb.getResourcesWithSnapshots(subjects)
+      rows = clientDb.getResourcesWithSnapshots
+        ? await clientDb.getResourcesWithSnapshots(subjects)
         : await Promise.all(
-            subjects.map(s => this.clientDb!.getResourceWithSnapshot(s)),
+            subjects.map(s => clientDb.getResourceWithSnapshot(s)),
           );
     } catch (e) {
+      if (this.clientDb !== clientDb || this.agent !== agent) return undefined;
+
       console.warn(`[ClientDb] OPFS lookup failed:`, e);
 
       return subjects.map(() => false);
     }
+
+    if (this.clientDb !== clientDb || this.agent !== agent) return undefined;
 
     return subjects.map((subject, index) => {
       const { jsonAd, snapshot } = rows[index] ?? {};
@@ -4198,6 +4592,15 @@ export class Store {
       !isEmbeddedVocabulary(subject) &&
       !this.isLocalOnlySubject(subject)
     ) {
+      // Show the cached copy while the authority answers. Without this a
+      // legacy `https://` drive (every profile, avatar and table on it) came
+      // up as `loading` after each reload even though OPFS held it, because
+      // the only thing that read OPFS was the offline fallback below. Not
+      // awaited: the server read must not wait for the database. Hydration
+      // merges the stored Loro state, so a late local answer cannot undo the
+      // server's.
+      void this.hydrateFromLocalDb(subject).catch(() => undefined);
+
       try {
         const remote = await this.fetchResourceFromServer(subject, opts);
         if (!isTransportError(remote.error)) return;
@@ -4852,12 +5255,33 @@ export class Store {
   public async getHistoryAttribution(
     subject: string,
   ): Promise<HistoryAttribution | null> {
+    const clientDb = this.clientDb;
+    const agent = this.getAgent();
+    const current = () =>
+      this.clientDb === clientDb && this.getAgent() === agent;
+
+    const readLocal = async (): Promise<HistoryAttribution | null> => {
+      if (!clientDb || clientDb.unsupportedEnvironment) return null;
+
+      if (!clientDb.isOpen) {
+        const opened = await clientDb.whenOpen();
+
+        if (!opened || !current()) return null;
+      }
+
+      if (!clientDb.isOpen || !current()) return null;
+
+      const local = await clientDb.historyAttribution(subject);
+
+      return current() ? local : null;
+    };
+
     const [remote, local] = await Promise.all([
       this.fetchHistoryAttributionFromServer(subject),
-      this.getClientDb()?.historyAttribution(subject) ?? Promise.resolve(null),
+      readLocal(),
     ]);
 
-    return mergeHistoryAttributions(remote, local);
+    return current() ? mergeHistoryAttributions(remote, local) : null;
   }
 
   private async fetchHistoryAttributionFromServer(
@@ -5304,6 +5728,62 @@ export class Store {
   /** Drives whose "server lacks the parent" refusal was already reported. */
   private _notifiedMissingParentDrives = new Set<string>();
 
+  private refusedDriveHandler: RefusedDriveHandler | undefined;
+
+  /** One attempt per drive per session, so a failing drive is not looked up
+   *  again by every entry that fails for it. */
+  private _refusedDriveAttempts = new Map<string, Promise<boolean>>();
+
+  /**
+   * Register how the app resolves a drive the server refuses as "not
+   * enrolled" ({@link RefusedDriveHandler}). Without one, or when it does not
+   * resolve the drive, the person is told as before. Returns a function that
+   * removes the handler.
+   */
+  public setRefusedDriveHandler(
+    handler: RefusedDriveHandler | undefined,
+  ): () => void {
+    this.refusedDriveHandler = handler;
+
+    return () => {
+      if (this.refusedDriveHandler === handler) {
+        this.refusedDriveHandler = undefined;
+      }
+    };
+  }
+
+  /** The drive a "not enrolled" refusal names, if `message` is one. The
+   *  refusal names the drive it refuses; that is the same for every resource
+   *  in it, where a resource's own drive may not be known yet. */
+  private refusedDriveOf(message: string): string | undefined {
+    if (!isNotEnrolledMessage(message)) return undefined;
+
+    return /Drive (\S+) is not enrolled/.exec(message)?.[1];
+  }
+
+  /** Ask the registered handler about a refused drive, once per drive. A
+   *  handler that throws counts as not resolved. */
+  private healRefusedDrive(drive: string, message: string): Promise<boolean> {
+    const key = this.normalizeSubject(drive);
+    const existing = this._refusedDriveAttempts.get(key);
+
+    if (existing) return existing;
+
+    const handler = this.refusedDriveHandler;
+    const attempt = (async () => {
+      try {
+        return !!(await handler?.(drive, message));
+      } catch (e) {
+        console.warn('[Store] refused drive handler failed:', e);
+
+        return false;
+      }
+    })();
+    this._refusedDriveAttempts.set(key, attempt);
+
+    return attempt;
+  }
+
   /**
    * Tell the person a write stopped syncing. The entry stays queued and
    * visible, and a fresh edit re-arms it.
@@ -5316,12 +5796,9 @@ export class Store {
    */
   private notifyBlockedSync(subject: string, message: string): void {
     if (isNotEnrolledMessage(message)) {
-      // The refusal names the drive it refuses; that is the same for every
-      // resource in it, where a resource's own drive may not be known yet.
+      const named = this.refusedDriveOf(message);
       const drive =
-        /Drive (\S+) is not enrolled/.exec(message)?.[1] ??
-        this.driveOf(this.normalizeSubject(subject)) ??
-        subject;
+        named ?? this.driveOf(this.normalizeSubject(subject)) ?? subject;
 
       if (this._notifiedRefusedDrives.has(drive)) return;
 
@@ -5329,17 +5806,39 @@ export class Store {
       const ownerModeRefusal = message.includes(
         'This server does not host new Drives',
       );
-      const nextStep = ownerModeRefusal
-        ? `Sign in with an existing identity to use a workspace hosted here.`
-        : `Ask the server's operator to enrol the workspace, or turn on ` +
-          `browser-only sync for it in the sync settings.`;
-      this.notifyError(
-        new Error(
-          `This server does not host this workspace (${message.trim()}) ` +
-            `Your changes are kept on this device and are not being sent. ` +
-            nextStep,
-        ),
+
+      if (ownerModeRefusal) {
+        this.notifyError(
+          new Error(
+            `This server does not host this workspace (${message.trim()}) ` +
+              `Your changes are kept on this device and are not being sent. ` +
+              `Sign in with an existing identity to use a workspace hosted here.`,
+          ),
+        );
+
+        return;
+      }
+
+      const refusalError = new Error(
+        `This server does not host this workspace (${message.trim()}) ` +
+          `Your changes are kept on this device and are not being sent. ` +
+          `Ask the server's operator to enrol the workspace, or turn on ` +
+          `browser-only sync for it in the sync settings.`,
       );
+
+      // The app may resolve other refused drives first (for example by
+      // switching an explicitly unhosted workspace to browser-only mode).
+      if (named && this.refusedDriveHandler) {
+        void this.healRefusedDrive(named, message)
+          .then(healed => {
+            if (!healed) this.notifyError(refusalError);
+          })
+          .catch(e => console.warn('[Store] could not report refusal:', e));
+
+        return;
+      }
+
+      this.notifyError(refusalError);
 
       return;
     }
@@ -5571,6 +6070,7 @@ export class Store {
 
       if (this._lastDriveSyncError?.drive === drive) {
         this._lastDriveSyncError = undefined;
+        this._lastDriveSyncErrorCode = undefined;
       }
 
       // Writes the server refused for a missing parent (a drive root it never
@@ -5590,6 +6090,34 @@ export class Store {
     this.emitSyncStatus();
   }
 
+  /** Park owner-policy writes refused through drive-wide SYNC_PUSH. */
+  private parkOwnerModeDrive(drive: string, message: string): void {
+    if (!drive) return;
+
+    const normalizedDrive = this.normalizeSubject(drive);
+    const refusal = new AtomicError(
+      message,
+      ErrorType.Server,
+      ErrorCode.SYNC_REJECTED,
+    );
+
+    for (const entry of this.outbox.pending()) {
+      const entryDrive = this.normalizeSubject(
+        this.driveOf(this.normalizeSubject(entry.subject)),
+      );
+
+      if (entryDrive !== normalizedDrive) continue;
+
+      entry.blocked = true;
+      entry.failures = 0;
+      entry.lastAttemptError = message;
+      this.outbox.markDirty(entry.subject);
+      entry.lastAttemptFailure = { cause: refusal };
+    }
+
+    this.notifyBlockedSync(drive, message);
+  }
+
   /**
    * The server refused our SYNC_PUSH for `drive` outright (`SYNC_REJECTED`).
    * Nothing we sent landed, so the drive is not recorded as synced —
@@ -5599,13 +6127,22 @@ export class Store {
    * Distinct from `finishDriveSync` so a UI can show "your changes were
    * refused" instead of a green check.
    */
-  public failDriveSync(drive: string, message: string): void {
+  public failDriveSync(drive: string, message: string, code?: number): void {
     this._driveSyncInProgress = false;
     this._driveSyncPulling = false;
     this._lastDriveSyncError = { drive, message, timestamp: Date.now() };
+    this._lastDriveSyncErrorCode = code;
 
     if (drive) {
       this._syncedDrives.delete(drive);
+    }
+
+    if (
+      code === ErrorCode.SYNC_REJECTED &&
+      isNotEnrolledMessage(message) &&
+      message.includes('This server does not host new Drives')
+    ) {
+      this.parkOwnerModeDrive(drive, message);
     }
 
     this.emitSyncStatus();
@@ -5848,6 +6385,14 @@ export class Store {
     // the subject as destroyed and drops it from the answer.
     this.markDestroyed(resolved);
 
+    if (isLensSubject(resolved)) {
+      const lens = this.lenses.get(resolved);
+
+      this.lenses.remove(resolved);
+
+      if (lens) this.rematerializeLensed(lens.from, lens.to);
+    }
+
     // Tombstone in ClientDb (OPFS) so the resource doesn't reappear after a
     // page reload. The in-memory `resources` map is wiped on reload, but the
     // WASM DB persists; without this, cascade-deleted children survive
@@ -5859,12 +6404,33 @@ export class Store {
     // nothing will be lost", and a delete that un-deletes itself is exactly
     // the kind of loss that claim is about. It was fire-and-forget, so the
     // status read as settled during the one window where it was not.
-    if (this.clientDb) {
+    const clientDb = this.clientDb;
+    const agent = this.agent;
+
+    if (
+      clientDb &&
+      typeof clientDb.removeResource === 'function' &&
+      !clientDb.unsupportedEnvironment
+    ) {
       this.startScheduledSave();
-      void this.clientDb
-        .removeResource(resolved)
+
+      const persistTombstone = async () => {
+        let opened = clientDb.isOpen === true;
+
+        if (!opened) {
+          opened = await clientDb.whenOpen();
+        }
+
+        if (!opened || this.clientDb !== clientDb || this.agent !== agent) {
+          return;
+        }
+
+        await clientDb.removeResource(resolved);
+      };
+
+      void persistTombstone()
         .catch(() => undefined)
-        .then(() => this.finishScheduledSave());
+        .finally(() => this.finishScheduledSave());
     }
 
     this.evictResource(subjectRaw, shouldNotify);
@@ -5917,6 +6483,11 @@ export class Store {
    * might have security implications for your application.
    */
   public setAgent(agent: Agent | undefined): void {
+    if (this.agent?.subject !== agent?.subject) {
+      this.pendingClientDbWrites.clear();
+      this.pendingClientDbWritesIdentity = agent?.subject;
+    }
+
     // The current drive is an account context, not a server preference. Clear
     // it before reauthenticating, so the next identity never subscribes or
     // reconciles the previous identity's private workspace.
@@ -5927,6 +6498,7 @@ export class Store {
     // identity never drains a previous agent's commits (whose `did:ad:<sig>`
     // subjects can't be re-signed by anyone else — they'd 401 forever).
     this.outbox.rebind(agent?.subject);
+    this.releaseHeldFor(agent);
     // Drain the now-loaded queue for this agent (no-ops if empty/offline).
     this.scheduleOutboxDrain();
 
@@ -6362,7 +6934,19 @@ export class Store {
         this.webSockets.delete(previous);
       }
 
+      if (
+        this._lastDriveSyncError &&
+        this._lastDriveSyncErrorCode === ErrorCode.SYNC_REJECTED &&
+        this._lastDriveSyncError.message.includes(
+          'This server does not host new Drives',
+        )
+      ) {
+        this._lastDriveSyncError = undefined;
+        this._lastDriveSyncErrorCode = undefined;
+      }
+
       this.setServerConnected(false);
+      this.outbox.rearmOwnerModeBlocked();
     }
 
     // The cookie is host-only, so whether it is worth refreshing follows the
@@ -7850,6 +8434,86 @@ export class Store {
     }
   }
 
+  /**
+   * The lenses this store knows, by the properties they touch. Resources
+   * derive values through them when their Loro doc is materialized (see
+   * `lens.ts`). Filled as Lens resources load; `loadLenses` brings in a
+   * drive's lenses.
+   */
+  public readonly lenses = new LensIndex();
+
+  /**
+   * Make a loaded Lens active and re-materialize the loaded resources that
+   * hold one of its properties.
+   *
+   * It applies only when its ID matches its content and its `parent` is the
+   * parent of the property it writes (`lensTo`): a lens never applies across an
+   * ontology it does not own. Anything wrong just means the lens is not
+   * applied; it never fails a load.
+   */
+  public async activateLens(resource: Resource): Promise<void> {
+    try {
+      const from = resource.get(core.properties.lensFrom);
+      const to = resource.get(core.properties.lensTo);
+      const parent = resource.get(core.properties.parent);
+      const transform = readTransformValue(
+        resource.get(core.properties.lensTransform),
+      );
+
+      if (
+        typeof from !== 'string' ||
+        typeof to !== 'string' ||
+        typeof parent !== 'string' ||
+        !verifyLensId(resource.subject, from, to, transform)
+      ) {
+        return;
+      }
+
+      const canonical = canonicalizeScheme(resource.subject);
+      const existing = this.lenses.get(canonical);
+
+      if (existing) return;
+
+      // `lensTo` must be known to read its parent. Only content-addressed
+      // properties are fetched: a lens must not make the store fetch any URL.
+      const target = isPropertySubject(to)
+        ? await this.getResource(to)
+        : this.resources.get(canonicalizeScheme(to));
+      const targetParent = target?.get(core.properties.parent);
+
+      if (
+        typeof targetParent !== 'string' ||
+        canonicalizeScheme(targetParent) !== canonicalizeScheme(parent)
+      ) {
+        return;
+      }
+
+      this.lenses.insert({
+        id: canonical,
+        from: canonicalizeScheme(from),
+        to: canonicalizeScheme(to),
+        transform: parseTransform(transform),
+        parent: canonicalizeScheme(parent),
+      });
+
+      this.rematerializeLensed(
+        canonicalizeScheme(from),
+        canonicalizeScheme(to),
+      );
+    } catch {
+      // An inactive lens derives nothing; reading is unaffected.
+    }
+  }
+
+  /** Re-derive the loaded resources that hold one of these properties. */
+  private rematerializeLensed(...props: string[]): void {
+    for (const resource of this.resources.values()) {
+      if (resource.refreshDerivedValues(props)) {
+        void this.notify(resource);
+      }
+    }
+  }
+
   /** Lets subscribers know that a resource has been changed. */
   private async notify(resource: Resource): Promise<void> {
     // A React snapshot read may initialize a missing resource. Other mounted
@@ -7866,6 +8530,10 @@ export class Store {
     // all `Object.is` needs.
     const key = this.normalizeSubject(resource.subject);
     this.snapshots.set(key, captureResourceSnapshot(resource));
+
+    if (isLensSubject(key)) {
+      void this.activateLens(resource);
+    }
 
     this.eventManager.emit(StoreEvents.ResourceUpdated, resource);
 

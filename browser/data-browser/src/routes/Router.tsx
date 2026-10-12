@@ -1,4 +1,9 @@
-import { createRoute, createRouter, Link } from '@tanstack/react-router';
+import {
+  createLazyRoute,
+  createRoute,
+  createRouter,
+  Link,
+} from '@tanstack/react-router';
 import { ShowRoute } from './ShowRoute';
 import { SearchRoute } from './Search/SearchRoute';
 import { NewRoute } from './NewResource/NewRoute';
@@ -17,7 +22,7 @@ import { pathNames } from './paths';
 import { ShareRoute } from './Share/ShareRoute';
 import { TokenRoute } from './TokenRoute';
 import { devRoutesEnabled } from '../config';
-import { rootRoute, topRoute, appRoute } from './RootRoutes';
+import { rootRoute, topRoute, appRoute, RequireAgent } from './RootRoutes';
 import { unavailableLazyRoute } from './UnavailableLazyRoute';
 import { ImportRoute } from './ImportRoute';
 import { HistoryRoute } from './History/HistoryRoute';
@@ -30,6 +35,14 @@ import { WelcomeRoute } from './WelcomeRoute';
 import { NewDriveRoute } from './NewDriveRoute';
 import { SignOutRoute } from './SignOutRoute';
 
+const UnavailableRouteComponent = unavailableLazyRoute.options.component;
+const devDriveUnavailableLazyRoute = createLazyRoute('/$')({
+  component: () => (
+    <RequireAgent>
+      {UnavailableRouteComponent && <UnavailableRouteComponent />}
+    </RequireAgent>
+  ),
+});
 const DevDriveRoute = createRoute({
   getParentRoute: () => appRoute,
   path: pathNames.devDrive,
@@ -38,7 +51,7 @@ const DevDriveRoute = createRoute({
   if (devRoutesEnabled()) {
     return import('./DevDriveRoute').then(mod => mod.devDriveRouteLazy);
   } else {
-    return Promise.resolve(unavailableLazyRoute);
+    return Promise.resolve(devDriveUnavailableLazyRoute);
   }
 });
 

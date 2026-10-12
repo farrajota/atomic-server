@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Store } from './store.js';
+import { testStore } from './test-store.js';
 import {
   attributionForVersion,
   mergeHistoryAttributions,
@@ -132,4 +134,80 @@ describe('mergeHistoryAttributions', () => {
     expect(mergeHistoryAttributions(null, local)).toBe(local);
     expect(mergeHistoryAttributions(null, null)).toBeNull();
   });
+});
+
+describe('Store history storage admission', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const subject = 'atomic:history-owner';
+  const local: HistoryAttribution = {
+    subject,
+    retention: 'all',
+    complete: true,
+    attributions: [attribution({ signature: 'local' })],
+  };
+
+  it('uses server attribution without a terminal-denied local lookup', async () => {
+    const store = new Store({ serverUrl: 'https://example.com' });
+    const remote = {
+      ...local,
+      attributions: [attribution({ signature: 'remote' })],
+    };
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify(remote)));
+    const historyAttribution = vi.fn().mockResolvedValue(local);
+    store.setClientDb({
+      isOpen: false,
+      whenOpen: async () => false,
+      initError: new Error('storage denied'),
+      historyAttribution,
+    } as never);
+
+    const result = await store.getHistoryAttribution(subject);
+
+    expect(result?.attributions.map(a => a.signature)).toEqual(['remote']);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(historyAttribution).not.toHaveBeenCalled();
+  });
+
+  it('retains a local attribution lookup while its database opens', async () => {
+    const store = new Store();
+    const opening = Promise.withResolvers<boolean>();
+    const db = {
+      isOpen: false,
+      whenOpen: () => opening.promise,
+      historyAttribution: vi.fn().mockResolvedValue(local),
+    };
+    store.setClientDb(db as never);
+    const result = store.getHistoryAttribution(subject);
+    await Promise.resolve();
+    expect(db.historyAttribution).not.toHaveBeenCalled();
+    db.isOpen = true;
+    opening.resolve(true);
+    await expect(result).resolves.toEqual(local);
+    expect(db.historyAttribution).toHaveBeenCalledWith(subject);
+  });
+
+  it.each(['worker', 'agent'] as const)(
+    'discards retained attribution after %s changes during its read',
+    async replacement => {
+      const { store } = await testStore();
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(null, { status: 404 }),
+      );
+      const reading = Promise.withResolvers<HistoryAttribution | null>();
+      const historyAttribution = vi.fn(() => reading.promise);
+      store.setClientDb({ isOpen: true, historyAttribution } as never);
+      const result = store.getHistoryAttribution(subject);
+      await vi.waitFor(() => expect(historyAttribution).toHaveBeenCalledOnce());
+
+      if (replacement === 'worker')
+        store.setClientDb({ isOpen: true } as never);
+      else store.setAgent(undefined);
+
+      reading.resolve(local);
+      await expect(result).resolves.toBeNull();
+    },
+  );
 });

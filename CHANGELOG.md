@@ -15,6 +15,18 @@ See [STATUS.md](server/STATUS.md) to learn more about which features will remain
 - Downloads served to a signed-in reader carry `Cache-Control: private, no-store`.
 - A new resource's `drive` comes from its parent lineage (explicit `drive`, else the nearest Drive ancestor, at most 32 steps). On creation or a parent change, a claimed `drive` the lineage cannot confirm is kept only when the signer may append to it; otherwise it is replaced by what the lineage backs. Managed-node admission keys an undriven lineage on its root.
 - `did:ad:` and `atomic:` spellings of a property are one property: reads accept either stored spelling, writes and removals act on the spelling already stored, and a resource holding both spellings with different values fails the read with an explicit error instead of picking one.
+- Loro documents: strings that start with `[`, `{`, `atomic:`, `did:ad:` or `http(s)://` are tagged as `string` in the `datatypes` map so they are no longer read back as nested resources or URLs, and JSON `null` is kept inside nested maps and lists.
+- `atomic-lib`: dropping the final native `Db` clone stops and joins its durable-flush workers before releasing the store, so an immediate same-process redb reopen cannot race an in-flight flush. Other clones keep the worker running; the periodic flush cadence is unchanged.
+
+## [v0.41.0-beta.8] - 2026-10-10
+
+- Discovery (#2198): a drive's pkarr record also lists the public https origins of the servers hosting it (`_atomic_http`), published at boot and every hour, so the app can find a drive's server from the secret alone. New anonymous `GET /genesis?subject=<did>` returns only a drive's genesis certificate, which the app verifies against the drive DID before connecting. Drives minted before genesis certificates existed answer 404 and are not found this way.
+- Schemas (#2151): properties get content-addressed subjects, `atomic:prop:{blake3}` of their ontology, shortname and datatype (`docs/src/schema/property-identity.md`). The server verifies the hash on genesis, accepts the same property from two devices, and refuses changes to its `parent`, `shortname` or `datatype`. Existing properties keep their subjects and stay editable.
+- Class constraints (#2151): a Class's `constraints` map holds JSON Schema keywords per property (`enum`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `minLength`, `maxLength`, `minItems`, `maxItems`, `pattern`, `class`), enforced on commit; peer commits and sync skip it. An empty `allowsOnly` on a Property now restricts nothing.
+- Lenses (#2151): `atomic:lens:` resources map one property onto another (`rename`, `wrap`, `head`, `map`, `convert`); the derived values appear in reads and indexes without changing signed data (`docs/src/schema/lenses.md`).
+- `atomic-cli schema push | lock | check`: turn a JSON Schema or ontology file into an ontology and a lockfile that pins its property IDs (#2151). `atomic_lib::schema::json_schema` imports JSON Schema and `ensure_ontology` creates the result.
+- Forms: field options use JSON Schema keyword names (`minItems`, `maxItems`, `minimum`, `maximum`; the old names are still read) and may only tighten the column's class constraints; `describe_form` returns the form's JSON Schema (#2151).
+
 - `--served-domain-suffix` / `ATOMIC_SERVED_DOMAIN_SUFFIX` takes a comma-separated list (`atomicserver.eu,atomic.place`), so a node can answer under two domains while it moves from one to the other.
 
 - MCP endpoint: `POST /mcp` (Streamable HTTP) is the one implementation of the

@@ -5,7 +5,7 @@ import { JSCryptoProvider } from './CryptoProvider.js';
 import { core } from './ontologies/core.js';
 import { server } from './ontologies/server.js';
 import { LocalOutbox, isSettledDestroyErrorMessage } from './local-outbox.js';
-import { testStore } from './test-store.js';
+import { attachSnapshotDb, testStore } from './test-store.js';
 import type { ClientDbWorker } from './client-db.js';
 
 afterEach(() => {
@@ -88,6 +88,7 @@ describe('Resource.destroy() through the outbox', () => {
   it('offline create + destroy: POSTs neither the genesis nor the destroy', async () => {
     const { store, postCommitSpy } = await testStore();
     store.setServerConnected(false);
+    attachSnapshotDb(store);
 
     const doc = await store.newResource({
       isA: server.classes.drive,

@@ -35,6 +35,9 @@ describe('state that arrives while no local database is attached', () => {
       putResourceWithSnapshot,
       worker: {
         isReady: true,
+        isOpen: true,
+        whenOpen: async () => true,
+        waitForInit: async () => true,
         waitForReady: async () => true,
         putResourceWithSnapshot,
       } as unknown as ClientDbWorker,

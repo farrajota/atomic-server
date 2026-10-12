@@ -12,6 +12,9 @@ import {
   decodeEphemeral,
   EphemeralKind,
   Flags,
+  encodeSyncPush,
+  encodeBlobRequest,
+  encodeBlobResponse,
 } from './ws-v2.js';
 import {
   decodeHelloCaps,
@@ -25,6 +28,7 @@ import {
 import { LoroLoader } from './loro-loader.js';
 import type { Commit } from './commit.js';
 import { serializeDeterministically } from './commit.js';
+import { BLOB } from './urls.js';
 
 /**
  * Frame-level tests for the client side of the COMMIT round trip and the
@@ -135,11 +139,16 @@ describe('WSClient handshake', () => {
     'https://example.com/drive',
   ])('attributes a rejected sync to the complete subject %s', async drive => {
     const { client, socket, store } = await connectedClient();
-    vi.spyOn(console, 'error').mockImplementation(() => {});
     const failed = vi.spyOn(store, 'failDriveSync');
     const message = `SYNC_PUSH rejected for drive ${drive}: not enrolled`;
     socket.receive(encodeError(0, ErrorCode.SYNC_REJECTED, message));
-    await vi.waitFor(() => assert(failed).toHaveBeenCalledWith(drive, message));
+    await vi.waitFor(() =>
+      assert(failed).toHaveBeenCalledWith(
+        drive,
+        message,
+        ErrorCode.SYNC_REJECTED,
+      ),
+    );
     client.close();
   });
 
@@ -409,6 +418,199 @@ describe('WSClient drive sync probe', () => {
     globalThis.WebSocket = original;
     vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+  it('does not probe with version vectors read from a replaced database', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    const reading =
+      Promise.withResolvers<Record<string, Record<string, number>>>();
+    const getVersionVectorsForDrive = vi.fn(() => reading.promise);
+
+    store.setClientDb({
+      isOpen: true,
+      isReady: true,
+      getVersionVectorsForDrive,
+    } as never);
+
+    // These sync entrypoints are private; the fixture exercises their wire output.
+    const internal = client as unknown as {
+      startVVSync: (drive: string) => Promise<void>;
+    };
+    const syncing = internal.startVVSync('did:ad:drive');
+
+    await vi.waitFor(() =>
+      expect(getVersionVectorsForDrive).toHaveBeenCalled(),
+    );
+    store.setClientDb({ isOpen: true, isReady: true } as never);
+    reading.resolve({ 'atomic:old-resource': { peer: 1 } });
+    await syncing;
+
+    expect(framesWithTag(socket, Tag.SYNC)).toHaveLength(0);
+    client.close();
+  });
+  it('does not send version vectors when the current database cannot open', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    const getVersionVectorsForDrive = vi.fn();
+    const warning = vi.spyOn(console, 'warn');
+    store.setClientDb({
+      isOpen: false,
+      isReady: false,
+      initError: new Error('Local storage denied'),
+      openIsSlow: false,
+      unsupportedEnvironment: false,
+      whenOpen: async () => false,
+      waitForReady: async () => false,
+      getVersionVectorsForDrive,
+    } as never);
+    const internal = client as unknown as {
+      startVVSync: (drive: string) => Promise<void>;
+    };
+
+    try {
+      await internal.startVVSync('did:ad:drive');
+
+      expect(getVersionVectorsForDrive).not.toHaveBeenCalled();
+      expect(framesWithTag(socket, Tag.SYNC)).toHaveLength(0);
+      expect(warning).not.toHaveBeenCalledWith(
+        '[WS] VV sync failed:',
+        expect.anything(),
+      );
+    } finally {
+      client.close();
+    }
+  });
+
+  it('keeps version-vector sync useful while the current database opens slowly', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    const opening = Promise.withResolvers<boolean>();
+    const getVersionVectorsForDrive = vi.fn().mockResolvedValue({
+      'atomic:resource': { peer: 3 },
+    });
+    const database = {
+      isOpen: false,
+      isReady: false,
+      initError: undefined as Error | undefined,
+      openIsSlow: false,
+      unsupportedEnvironment: false,
+      whenOpen: () => opening.promise,
+      waitForReady: async () => true,
+      getVersionVectorsForDrive,
+    };
+    database.initError = new Error('Local database is still opening');
+    database.openIsSlow = true;
+    store.setClientDb(database as never);
+    const internal = client as unknown as {
+      startVVSync: (drive: string) => Promise<void>;
+    };
+
+    try {
+      const syncing = internal.startVVSync('did:ad:drive');
+      await Promise.resolve();
+      expect(getVersionVectorsForDrive).not.toHaveBeenCalled();
+      expect(framesWithTag(socket, Tag.SYNC)).toHaveLength(0);
+
+      database.isOpen = true;
+      database.isReady = true;
+      database.initError = undefined;
+      database.openIsSlow = false;
+      opening.resolve(true);
+      await syncing;
+
+      expect(getVersionVectorsForDrive).toHaveBeenCalledWith('did:ad:drive');
+      const syncs = framesWithTag(socket, Tag.SYNC);
+      expect(syncs).toHaveLength(1);
+      socket.receive(encodeSyncResend('did:ad:drive'));
+
+      const frame = framesWithTag(socket, Tag.SYNC)[1];
+      const driveLength = (frame[1] << 8) | frame[2];
+      const hashOffset = 3 + driveLength;
+      const hashLength = (frame[hashOffset] << 8) | frame[hashOffset + 1];
+      const jsonOffset = hashOffset + 2 + hashLength;
+      const syncState = JSON.parse(
+        new TextDecoder().decode(frame.subarray(jsonOffset)),
+      );
+      expect(syncState).toEqual({
+        peers: ['peer'],
+        resources: { 'did:ad:resource': [3] },
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  it('does not read version vectors from a database replaced while opening', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    const opening = Promise.withResolvers<boolean>();
+    const waitingForOpen = Promise.withResolvers<void>();
+    const getVersionVectorsForDrive = vi.fn();
+    const warning = vi.spyOn(console, 'warn');
+    const database = {
+      isOpen: false,
+      isReady: false,
+      unsupportedEnvironment: false,
+      whenOpen: () => {
+        waitingForOpen.resolve();
+
+        return opening.promise;
+      },
+      waitForReady: async () => true,
+      getVersionVectorsForDrive,
+    };
+    store.setClientDb(database as never);
+    const internal = client as unknown as {
+      startVVSync: (drive: string) => Promise<void>;
+    };
+
+    try {
+      const syncing = internal.startVVSync('did:ad:drive');
+      await waitingForOpen.promise;
+      store.setClientDb({ isOpen: true, isReady: true } as never);
+      database.isOpen = true;
+      database.isReady = true;
+      opening.resolve(true);
+      await syncing;
+
+      expect(getVersionVectorsForDrive).not.toHaveBeenCalled();
+      expect(framesWithTag(socket, Tag.SYNC)).toHaveLength(0);
+      expect(warning).not.toHaveBeenCalledWith(
+        '[WS] VV sync failed:',
+        expect.anything(),
+      );
+    } finally {
+      client.close();
+    }
+  });
+  it('does not resend retained full state after its database is replaced', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    store.setClientDb({
+      isOpen: true,
+      isReady: true,
+      getVersionVectorsForDrive: async () => ({
+        'atomic:held-resource': { peer: 1 },
+      }),
+    } as never);
+    const internal = client as unknown as {
+      startVVSync: (drive: string) => Promise<void>;
+      sendFullSyncState: (drive: string) => void;
+    };
+
+    await internal.startVVSync('did:ad:drive');
+    expect(framesWithTag(socket, Tag.SYNC)).toHaveLength(1);
+
+    store.setClientDb({ isOpen: true, isReady: true } as never);
+    internal.sendFullSyncState('did:ad:drive');
+    expect(framesWithTag(socket, Tag.SYNC)).toHaveLength(1);
+    client.close();
   });
 
   it('does not send a sync probe computed for a previous identity', async ({
@@ -1069,6 +1271,558 @@ describe('WSClient SYNC_DIFF and the outbox', () => {
 
     expect(exported).toEqual(['atomic:clean']);
     expect(framesWithTag(socket, Tag.SYNC_PUSH)).toHaveLength(1);
+    client.close();
+  });
+});
+describe('WSClient background storage admission', () => {
+  const original = globalThis.WebSocket;
+
+  afterEach(() => {
+    globalThis.WebSocket = original;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const invokePrivate = (
+    client: WSClient,
+    name: string,
+    ...args: unknown[]
+  ) => {
+    const method = Reflect.get(client, name);
+
+    if (typeof method !== 'function') {
+      throw new TypeError(`WSClient has no ${name} method`);
+    }
+
+    return Reflect.apply(method, client, args);
+  };
+
+  const blobHash = new Uint8Array(32).fill(7);
+  const blobBytes = new Uint8Array([9, 8, 7]);
+
+  async function receiveBlobWork(
+    socket: FakeWebSocket,
+    operation: 'missing' | 'request' | 'response',
+  ) {
+    if (operation === 'request') {
+      socket.receive(encodeBlobRequest(blobHash));
+    } else if (operation === 'response') {
+      socket.receive(encodeBlobResponse(blobHash, blobBytes));
+    } else {
+      await LoroLoader.initializeLoro();
+      const doc = new LoroLoader.Loro.LoroDoc();
+      doc.getMap('properties').set(BLOB, `atomic:blob:${'07'.repeat(32)}`);
+      doc.commit();
+      socket.receive(
+        encodeSyncPush(
+          'atomic:blob-drive',
+          [
+            {
+              subject: 'atomic:blob-resource',
+              loroBytes: doc.export({ mode: 'snapshot' }),
+            },
+          ],
+          false,
+        ),
+      );
+    }
+  }
+
+  it.each(['missing', 'request', 'response'] as const)(
+    'skips terminal-denied optional blob %s RPCs',
+    async operation => {
+      const { client, socket, store } = await connectedClient();
+      vi.useFakeTimers();
+      const getBlob = vi.fn().mockResolvedValue(null);
+      const putBlob = vi.fn().mockResolvedValue(undefined);
+      vi.spyOn(store, 'getClientDb').mockReturnValue({
+        isOpen: false,
+        unsupportedEnvironment: false,
+        initError: new Error('Local storage denied'),
+        whenOpen: async () => false,
+        getBlob,
+        putBlob,
+      } as never);
+
+      try {
+        await receiveBlobWork(socket, operation);
+        await vi.advanceTimersByTimeAsync(0);
+        assert(getBlob).not.toHaveBeenCalled();
+        assert(putBlob).not.toHaveBeenCalled();
+        assert(framesWithTag(socket, Tag.BLOB_REQUEST)).toHaveLength(0);
+        assert(framesWithTag(socket, Tag.BLOB_RESPONSE)).toHaveLength(0);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  it.each(['missing', 'request', 'response'] as const)(
+    'retains optional blob %s work until the captured database opens',
+    async operation => {
+      const { client, socket, store } = await connectedClient();
+      const opening = Promise.withResolvers<boolean>();
+      const db = {
+        isOpen: false,
+        whenOpen: vi.fn(() => opening.promise),
+        getBlob: vi
+          .fn()
+          .mockResolvedValue(operation === 'missing' ? null : blobBytes),
+        putBlob: vi.fn().mockResolvedValue(undefined),
+      };
+      vi.spyOn(store, 'getClientDb').mockReturnValue(db as never);
+
+      try {
+        await receiveBlobWork(socket, operation);
+        await Promise.resolve();
+        assert(db.getBlob).not.toHaveBeenCalled();
+        assert(db.putBlob).not.toHaveBeenCalled();
+        db.isOpen = true;
+        opening.resolve(true);
+        await vi.waitFor(() => {
+          if (operation === 'response') {
+            assert(db.putBlob).toHaveBeenCalledWith(blobHash, blobBytes);
+          } else {
+            assert(
+              framesWithTag(
+                socket,
+                operation === 'missing' ? Tag.BLOB_REQUEST : Tag.BLOB_RESPONSE,
+              ),
+            ).toHaveLength(1);
+          }
+        });
+      } finally {
+        opening.resolve(false);
+        client.close();
+      }
+    },
+  );
+
+  it.each([
+    ['worker', 'missing'],
+    ['worker', 'found'],
+    ['agent', 'missing'],
+    ['agent', 'found'],
+  ] as const)(
+    'does not publish blob reads after %s replacement (%s bytes)',
+    async (replacement, result) => {
+      const { client, socket, store } = await connectedClient();
+      vi.useFakeTimers();
+      const reading = Promise.withResolvers<Uint8Array | null>();
+      const db = {
+        isOpen: true,
+        getBlob: vi.fn(() => reading.promise),
+      };
+      const attached = vi
+        .spyOn(store, 'getClientDb')
+        .mockReturnValue(db as never);
+
+      try {
+        await receiveBlobWork(socket, 'missing');
+        socket.receive(encodeBlobRequest(blobHash));
+        await vi.waitFor(() => assert(db.getBlob).toHaveBeenCalledTimes(2));
+
+        if (replacement === 'worker')
+          attached.mockReturnValue({ isOpen: true } as never);
+        else store.setAgent(undefined);
+
+        reading.resolve(result === 'found' ? blobBytes : null);
+        await vi.advanceTimersByTimeAsync(0);
+        assert(framesWithTag(socket, Tag.BLOB_RESPONSE)).toHaveLength(0);
+        assert(framesWithTag(socket, Tag.BLOB_REQUEST)).toHaveLength(0);
+      } finally {
+        reading.resolve(null);
+        client.close();
+      }
+    },
+  );
+
+  it.each(['missing', 'request', 'response'] as const)(
+    'abandons unopened blob %s work after worker replacement',
+    async operation => {
+      const { client, socket, store } = await connectedClient();
+      vi.useFakeTimers();
+      const opening = Promise.withResolvers<boolean>();
+      const db = {
+        isOpen: false,
+        whenOpen: () => opening.promise,
+        getBlob: vi.fn().mockResolvedValue(null),
+        putBlob: vi.fn().mockResolvedValue(undefined),
+      };
+      const next = { ...db, isOpen: true };
+      const attached = vi
+        .spyOn(store, 'getClientDb')
+        .mockReturnValue(db as never);
+
+      try {
+        await receiveBlobWork(socket, operation);
+        attached.mockReturnValue(next as never);
+        db.isOpen = true;
+        opening.resolve(true);
+        await vi.advanceTimersByTimeAsync(0);
+        assert(db.getBlob).not.toHaveBeenCalled();
+        assert(db.putBlob).not.toHaveBeenCalled();
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  it('keeps received blob bytes for the same database when the socket closes before open', async () => {
+    const { client, socket, store } = await connectedClient();
+    const opening = Promise.withResolvers<boolean>();
+    const db = {
+      isOpen: false,
+      whenOpen: () => opening.promise,
+      putBlob: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.spyOn(store, 'getClientDb').mockReturnValue(db as never);
+    socket.receive(encodeBlobResponse(blobHash, blobBytes));
+    client.close();
+    db.isOpen = true;
+    opening.resolve(true);
+    await vi.waitFor(() =>
+      assert(db.putBlob).toHaveBeenCalledWith(blobHash, blobBytes),
+    );
+  });
+
+  it.each(['missing', 'request', 'response'] as const)(
+    'reports an admitted blob %s RPC failure without an unhandled rejection',
+    async operation => {
+      const { client, socket, store } = await connectedClient();
+      const error = new Error('blob storage read/write failed');
+      const warn = vi
+        .spyOn(console, 'warn')
+        .mockImplementation(() => undefined);
+      const db = {
+        isOpen: true,
+        getBlob: vi.fn().mockRejectedValue(error),
+        putBlob: vi.fn().mockRejectedValue(error),
+      };
+      vi.spyOn(store, 'getClientDb').mockReturnValue(db as never);
+
+      try {
+        await receiveBlobWork(socket, operation);
+        await vi.waitFor(() =>
+          assert(warn).toHaveBeenCalledWith(
+            '[WS] blob cache operation failed:',
+            error,
+          ),
+        );
+        assert(
+          operation === 'response' ? db.putBlob : db.getBlob,
+        ).toHaveBeenCalledOnce();
+        assert(framesWithTag(socket, Tag.BLOB_REQUEST)).toHaveLength(0);
+        assert(framesWithTag(socket, Tag.BLOB_RESPONSE)).toHaveLength(0);
+      } finally {
+        client.close();
+      }
+    },
+  );
+
+  it('does not index or import envelopes after terminal storage refusal', async ({
+    expect,
+  }) => {
+    const { client, store } = await connectedClient();
+    const indexPendingSearch = vi.fn().mockResolvedValue(0);
+    const importEnvelopes = vi.fn().mockResolvedValue(1);
+    vi.spyOn(store, 'getClientDb').mockReturnValue({
+      initError: new Error('Local storage denied'),
+      unsupportedEnvironment: true,
+      isOpen: false,
+      whenOpen: vi.fn().mockResolvedValue(false),
+      indexPendingSearch,
+      importEnvelopes,
+    } as never);
+    const background = client as unknown as {
+      pendingEnvelopes: Array<{ subject: string; json: string }>;
+      drainBackground(): Promise<void>;
+    };
+    background.pendingEnvelopes.push({ subject: 'did:ad:denied', json: '{}' });
+
+    await background.drainBackground();
+
+    expect(indexPendingSearch).not.toHaveBeenCalled();
+    expect(importEnvelopes).not.toHaveBeenCalled();
+    client.close();
+  });
+
+  it('retains indexing and envelope work until the captured database opens', async ({
+    expect,
+  }) => {
+    const { client, store } = await connectedClient();
+    let isOpen = false;
+    const opening = Promise.withResolvers<boolean>();
+
+    const opened = (value: boolean) => {
+      isOpen = value;
+      opening.resolve(value);
+    };
+
+    const indexPendingSearch = vi.fn().mockResolvedValue(0);
+    const importEnvelopes = vi.fn().mockResolvedValue(1);
+    vi.spyOn(store, 'getClientDb').mockReturnValue({
+      initError: undefined,
+      unsupportedEnvironment: false,
+      get isOpen() {
+        return isOpen;
+      },
+      whenOpen: vi.fn(() => opening.promise),
+      indexPendingSearch,
+      importEnvelopes,
+    } as never);
+    const background = client as unknown as {
+      pendingEnvelopes: Array<{ subject: string; json: string }>;
+      drainBackground(): Promise<void>;
+    };
+    background.pendingEnvelopes.push({ subject: 'did:ad:slow', json: '{}' });
+    const draining = background.drainBackground();
+
+    await Promise.resolve();
+    expect(indexPendingSearch).not.toHaveBeenCalled();
+    expect(importEnvelopes).not.toHaveBeenCalled();
+
+    opened(true);
+    await draining;
+
+    expect(indexPendingSearch).toHaveBeenCalledOnce();
+    expect(importEnvelopes).toHaveBeenCalledWith([
+      { subject: 'did:ad:slow', json: '{}' },
+    ]);
+    client.close();
+  });
+
+  it('cancels pending background work when its database is replaced', async ({
+    expect,
+  }) => {
+    const { client, store } = await connectedClient();
+    let isOpen = false;
+    const opening = Promise.withResolvers<boolean>();
+
+    const opened = (value: boolean) => {
+      isOpen = value;
+      opening.resolve(value);
+    };
+
+    const oldIndex = vi.fn().mockResolvedValue(0);
+    const oldImport = vi.fn().mockResolvedValue(1);
+    const getDb = vi.spyOn(store, 'getClientDb').mockReturnValue({
+      initError: undefined,
+      unsupportedEnvironment: false,
+      get isOpen() {
+        return isOpen;
+      },
+      whenOpen: vi.fn(() => opening.promise),
+      indexPendingSearch: oldIndex,
+      importEnvelopes: oldImport,
+    } as never);
+    const background = client as unknown as {
+      pendingEnvelopes: Array<{ subject: string; json: string }>;
+      drainBackground(): Promise<void>;
+    };
+    background.pendingEnvelopes.push({ subject: 'did:ad:old', json: '{}' });
+    const draining = background.drainBackground();
+    const replacementIndex = vi.fn().mockResolvedValue(0);
+    const replacementImport = vi.fn().mockResolvedValue(1);
+    getDb.mockReturnValue({
+      initError: undefined,
+      unsupportedEnvironment: false,
+      isOpen: true,
+      indexPendingSearch: replacementIndex,
+      importEnvelopes: replacementImport,
+    } as never);
+
+    opened(true);
+    await draining;
+
+    expect(oldIndex).not.toHaveBeenCalled();
+    expect(oldImport).not.toHaveBeenCalled();
+    expect(replacementIndex).not.toHaveBeenCalled();
+    expect(replacementImport).not.toHaveBeenCalled();
+    client.close();
+  });
+  it('cancels a SYNC_DIFF tombstone when its captured database is replaced', async ({
+    expect,
+  }) => {
+    const { client, store } = await connectedClient();
+    const applying = Promise.withResolvers<void>();
+    const applyCommit = vi.fn(() => applying.promise);
+    const getDb = vi.spyOn(store, 'getClientDb').mockReturnValue({
+      unsupportedEnvironment: false,
+      isOpen: true,
+      applyCommit,
+    } as never);
+    const removeResource = vi.spyOn(store, 'removeResource');
+    const finishDriveSync = vi.spyOn(store, 'finishDriveSync');
+
+    const handling = invokePrivate(client, 'handleSyncDiff', {
+      drive: 'did:ad:drive',
+      pull: [],
+      push: [],
+      remove: ['did:ad:removed'],
+      removeCommits: { 'did:ad:removed': 'signed-envelope' },
+    });
+    await Promise.resolve();
+    expect(applyCommit).toHaveBeenCalledOnce();
+
+    getDb.mockReturnValue({
+      unsupportedEnvironment: false,
+      isOpen: true,
+    } as never);
+    applying.resolve();
+    await handling;
+
+    expect(removeResource).not.toHaveBeenCalled();
+    expect(finishDriveSync).not.toHaveBeenCalled();
+    client.close();
+  });
+
+  it('keeps in-memory SYNC_DIFF pushes online after terminal cache refusal', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    const whenOpen = vi.fn().mockResolvedValue(false);
+    const getLoroSnapshot = vi.fn().mockResolvedValue(new Uint8Array([2]));
+    const envelopesFor = vi.fn().mockResolvedValue({});
+    const applyCommit = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(store, 'getClientDb').mockReturnValue({
+      unsupportedEnvironment: false,
+      isOpen: false,
+      whenOpen,
+      getLoroSnapshot,
+      envelopesFor,
+      applyCommit,
+    } as never);
+    vi.spyOn(store.resources, 'get').mockImplementation(subject =>
+      subject === 'atomic:memory'
+        ? ({ getLoroDoc: () => ({ subject }) } as never)
+        : undefined,
+    );
+    vi.spyOn(Resource, 'exportLoroBytesForSync').mockReturnValue(
+      new Uint8Array([1]),
+    );
+    const removeResource = vi.spyOn(store, 'removeResource');
+
+    await invokePrivate(client, 'handleSyncDiff', {
+      drive: 'did:ad:drive',
+      pull: ['did:ad:memory', 'did:ad:stored'],
+      push: [],
+      remove: ['did:ad:removed'],
+      removeCommits: { 'did:ad:removed': 'signed-envelope' },
+    });
+
+    expect(whenOpen).toHaveBeenCalled();
+    expect(getLoroSnapshot).not.toHaveBeenCalled();
+    expect(envelopesFor).not.toHaveBeenCalled();
+    expect(applyCommit).not.toHaveBeenCalled();
+    expect(removeResource).toHaveBeenCalledWith('did:ad:removed');
+    expect(framesWithTag(socket, Tag.SYNC_PUSH)).toHaveLength(1);
+    client.close();
+  });
+
+  it('retains SYNC_DIFF snapshot and envelope work until the captured database opens', async ({
+    expect,
+  }) => {
+    const { client, socket, store } = await connectedClient();
+    let isOpen = false;
+    const opening = Promise.withResolvers<boolean>();
+
+    const opened = (value: boolean) => {
+      isOpen = value;
+      opening.resolve(value);
+    };
+
+    const getLoroSnapshot = vi.fn().mockResolvedValue(new Uint8Array([3]));
+    const envelopesFor = vi.fn().mockResolvedValue({});
+    vi.spyOn(store, 'getClientDb').mockReturnValue({
+      unsupportedEnvironment: false,
+      get isOpen() {
+        return isOpen;
+      },
+      whenOpen: vi.fn(() => opening.promise),
+      getLoroSnapshot,
+      envelopesFor,
+    } as never);
+
+    const handling = invokePrivate(client, 'handleSyncDiff', {
+      drive: 'did:ad:drive',
+      pull: ['did:ad:stored'],
+      push: [],
+    });
+
+    expect(getLoroSnapshot).not.toHaveBeenCalled();
+    expect(envelopesFor).not.toHaveBeenCalled();
+    expect(framesWithTag(socket, Tag.SYNC_PUSH)).toHaveLength(0);
+
+    opened(true);
+    await handling;
+
+    expect(getLoroSnapshot).toHaveBeenCalledWith('atomic:stored');
+    expect(envelopesFor).toHaveBeenCalledWith(['atomic:stored']);
+    expect(framesWithTag(socket, Tag.SYNC_PUSH)).toHaveLength(1);
+    client.close();
+  });
+
+  it('does not flush a final SYNC_PUSH while storage remains denied', async ({
+    expect,
+  }) => {
+    const { client, store } = await connectedClient();
+    const whenOpen = vi.fn().mockResolvedValue(false);
+    const flush = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(store, 'getClientDb').mockReturnValue({
+      unsupportedEnvironment: false,
+      isOpen: false,
+      whenOpen,
+      flush,
+    } as never);
+    const finish = vi.spyOn(store, 'finishDriveSync');
+
+    invokePrivate(
+      client,
+      'handleBinary',
+      encodeSyncPush('did:ad:drive', [], true),
+    );
+
+    await vi.waitFor(() => expect(finish).toHaveBeenCalledOnce());
+    expect(whenOpen).toHaveBeenCalledOnce();
+    expect(flush).not.toHaveBeenCalled();
+    client.close();
+  });
+
+  it('flushes the final SYNC_PUSH only after the captured database opens', async ({
+    expect,
+  }) => {
+    const { client, store } = await connectedClient();
+    let isOpen = false;
+    const opening = Promise.withResolvers<boolean>();
+
+    const opened = (value: boolean) => {
+      isOpen = value;
+      opening.resolve(value);
+    };
+
+    const flush = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(store, 'getClientDb').mockReturnValue({
+      unsupportedEnvironment: false,
+      get isOpen() {
+        return isOpen;
+      },
+      whenOpen: vi.fn(() => opening.promise),
+      flush,
+    } as never);
+    const finish = vi.spyOn(store, 'finishDriveSync');
+
+    invokePrivate(
+      client,
+      'handleBinary',
+      encodeSyncPush('did:ad:drive', [], true),
+    );
+
+    expect(flush).not.toHaveBeenCalled();
+    expect(finish).not.toHaveBeenCalled();
+    opened(true);
+    await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(finish).toHaveBeenCalledOnce());
     client.close();
   });
 });

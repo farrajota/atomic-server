@@ -1,13 +1,11 @@
 import {
   core,
-  dataBrowser,
   JSONValue,
   Resource,
-  useArray,
-  useResource,
   useResources,
+  useStore,
 } from '@tomic/react';
-import { useRef, useState, type JSX } from 'react';
+import { useMemo, useRef, useState, type JSX } from 'react';
 import { styled } from 'styled-components';
 import { IconButton } from '@components/IconButton/IconButton';
 import { TagButton, Tag } from '@components/Tag';
@@ -20,6 +18,7 @@ import { KeyboardInteraction, useCellOptions } from '@chunks/TableEditor';
 import { AbsoluteCell } from './CellComponents';
 import { FaXmark, FaPlus } from 'react-icons/fa6';
 import { CustomPopover, usePopover } from '@components/CustomPopover';
+import { optionSubjects, useRowConstraint } from '../useColumnConstraint';
 
 const TAG_SPACING = '0.5rem';
 
@@ -48,22 +47,25 @@ function SelectCellEdit({
   value,
   property,
   onChange,
+  resource: row,
 }: EditCellProps<JSONValue>): JSX.Element {
   const inputRef = useRef<HTMLInputElement>(null);
   const val = (value as string[]) ?? emptyArray;
-  const propertyResource = useResource(property);
-  const [allowsOnly] = useArray(propertyResource, core.properties.allowsOnly);
-  // Subscribed, so a tag's title is matched as soon as the tag loads; a tag
-  // still loading has no name to match yet.
-  const tagResources = useResources(allowsOnly);
+  const store = useStore();
+  // Options and the pick limit come from the row's class `constraints`,
+  // falling back to the Property's legacy `allowsOnly` and `max`.
+  const constraint = useRowConstraint(row.getClasses(), property);
+  const allowsOnly = optionSubjects(constraint);
+  // Keep a stable list for the resource subscription while options change.
+  const optionKey = allowsOnly.join('\n');
+  const optionList = useMemo(() => allowsOnly, [optionKey]);
+  const tagResources = useResources(optionList);
   const [query, setQuery] = useState('');
 
-  // `max` on a SelectProperty caps how many tags may be picked at once — it is
-  // how single-select is expressed, since a SelectProperty is always a
-  // resourceArray. Form questions of a single-pick type set `max: 1`.
-  const max = propertyResource.get(dataBrowser.properties.max) as
-    | number
-    | undefined;
+  // `maxItems` caps how many tags may be picked at once. It is how
+  // single-select is expressed, since a select column is always a
+  // resourceArray. Form questions of a single-pick type set `maxItems: 1`.
+  const max = constraint.maxItems;
 
   const filteredTags = buildListWithTitles(tagResources, allowsOnly, val)
     .filter(v => v.title.toLowerCase().includes(query.toLowerCase()))
@@ -95,22 +97,39 @@ function SelectCellEdit({
     const next = Array.from(new Set([...val, subject]));
 
     // At the cap, the new pick displaces the oldest rather than being
-    // dropped — so a `max: 1` column behaves as a single-select swap.
+    // dropped — so a `maxItems: 1` column behaves as a single-select swap.
     onChange(max !== undefined && next.length > max ? next.slice(-max) : next);
+  };
+
+  const pickSelected = async () => {
+    const availableSubject = filteredTags[selectedIndex];
+
+    if (availableSubject) {
+      handleAddTag(availableSubject);
+
+      return;
+    }
+
+    // Enter right after the column was created can find its Tags still loading,
+    // with no title to match the typed text against. Wait for them, then pick,
+    // instead of picking from a list that is empty only for now.
+    if (allowsOnly.some(o => store.getResourceLoading(o).loading)) {
+      await Promise.all(
+        allowsOnly.map(o => store.getResource(o).catch(() => undefined)),
+      );
+    }
+
+    const subject = buildListWithTitles(tagResources, allowsOnly, val)
+      .filter(v => v.title.toLowerCase().includes(query.toLowerCase()))
+      .map(ft => ft.subject)[selectedIndex];
+
+    if (subject) {
+      handleAddTag(subject);
+    }
   };
 
   const handleRemoveTag = (subject: string) => {
     onChange(val.filter(tagSubject => tagSubject !== subject));
-  };
-
-  const addSelectedTag = () => {
-    const subject = filteredTags[selectedIndex];
-
-    // Nothing matches: there is no tag to add, and the cell keeps its value
-    // rather than being saved with an empty pick.
-    if (subject !== undefined) {
-      handleAddTag(subject);
-    }
   };
 
   const changeSelection = (mod: number) => {
@@ -129,7 +148,7 @@ function SelectCellEdit({
         break;
       case 'Enter':
         e.preventDefault();
-        addSelectedTag();
+        void pickSelected();
         break;
     }
   };

@@ -3,6 +3,7 @@ import { Store, type StoreOpts } from './store.js';
 import { Agent } from './agent.js';
 import { JSCryptoProvider } from './CryptoProvider.js';
 import type { Commit } from './commit.js';
+import type { ClientDbWorker } from './client-db.js';
 
 export interface TestStore {
   store: Store;
@@ -66,4 +67,39 @@ export async function testStore(opts: StoreOpts = {}): Promise<TestStore> {
   });
 
   return { store, agentDID, posted, postCommitSpy };
+}
+
+/** An open, initialized I/O boundary that stores the actual snapshot bytes. */
+export function attachSnapshotDb(store: Store) {
+  const rows = new Map<string, { jsonAd: string; snapshot?: Uint8Array }>();
+  const db = {
+    isOpen: true,
+    isReady: true,
+    isInitialized: true,
+    unsupportedEnvironment: false,
+    whenOpen: async () => true,
+    waitForInit: async () => true,
+    waitForReady: async () => true,
+    putResourceWithSnapshot: vi.fn(
+      async (subject: string, jsonAd: string, snapshot?: Uint8Array) => {
+        rows.set(subject, { jsonAd, snapshot: snapshot?.slice() });
+      },
+    ),
+    getResource: async (subject: string) => rows.get(subject)?.jsonAd ?? null,
+    getResourceWithSnapshot: async (subject: string) =>
+      rows.get(subject) ?? { jsonAd: null, snapshot: undefined },
+    getResourcesWithSnapshots: async (subjects: string[]) =>
+      subjects.map(
+        subject => rows.get(subject) ?? { jsonAd: null, snapshot: undefined },
+      ),
+    getLoroSnapshot: async (subject: string) => rows.get(subject)?.snapshot,
+    removeResource: async (subject: string) => {
+      rows.delete(subject);
+    },
+    flush: async () => undefined,
+  };
+
+  store.setClientDb(db as unknown as ClientDbWorker);
+
+  return { db, rows };
 }

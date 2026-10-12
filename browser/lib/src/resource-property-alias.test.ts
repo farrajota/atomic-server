@@ -1,4 +1,11 @@
-import { afterEach, beforeAll, describe, it, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  describe,
+  expect as expectValue,
+  it,
+  vi,
+} from 'vitest';
 import { enableLoro } from './loro-loader.js';
 import { Resource, ResourceEvents } from './resource.js';
 import { testStore } from './test-store.js';
@@ -270,4 +277,30 @@ describe('Resource custom property access across identifier spellings', () => {
     expect(String(warn.mock.calls[0][0])).not.toContain('canonical value');
     warn.mockRestore();
   });
+  it.each(['set', 'remove', 'set-undefined'] as const)(
+    'refreshes a legacy content-addressed reader after %s',
+    async operation => {
+      const canonical = `atomic:prop:${'a'.repeat(64)}`;
+      const legacy = `did:ad:prop:${'a'.repeat(64)}`;
+      const resource = new Resource(resourceSubject);
+      await resource.set(canonical, 'before', false);
+      let rendered = resource.get(legacy);
+      resource.on(ResourceEvents.LocalChange, property => {
+        if (property === legacy) rendered = resource.get(legacy);
+      });
+
+      if (operation === 'set') {
+        await resource.set(legacy, 'after', false);
+      } else if (operation === 'remove') {
+        resource.remove(legacy);
+      } else {
+        await resource.set(legacy, undefined, false);
+      }
+
+      const expected = operation === 'set' ? 'after' : undefined;
+      expectValue(resource.get(canonical)).toBe(expected);
+      expectValue(rendered).toBe(expected);
+      expectValue(Object.keys(resource.getPropVals())).not.toContain(legacy);
+    },
+  );
 });

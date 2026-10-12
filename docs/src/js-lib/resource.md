@@ -170,13 +170,15 @@ await resource.save();
 
 ## Saving
 
-When using methods like `.set()` and `.push()`, the changes will be collected into a single commit.
-This commit is only reflected locally and has to be sent to the server to make the changes permanent.
-To do this, call the `.save()` method.
+When using methods like `.set()` and `.push()`, the changes are collected into a single commit. Call `.save()` to persist it through the applicable save path: an online save is durable when the server acknowledges it, while local-only and offline saves can be durable through the client database.
 
 ```typescript
 await resource.save();
 ```
+
+For an online save, success means the server acknowledged the commit; mirroring that acknowledged state to the local database is optional and bounded. A failed or slow optional mirror does not undo the server acknowledgement.
+
+For a local-only resource, `save()` waits for an actually opened database and a durable resource snapshot; it does not enroll that edit in the server-drain outbox. For a save made while offline, the snapshot and applicable outbox write must both complete durably before success. If the database is absent, opening is refused or times out, its worker or identity is replaced during the write, or a required write fails, the promise rejects before saved notification (and before offline outbox publication). The edit remains in the in-memory Resource as unsaved, but is not guaranteed to survive reload. Attach and verify a usable database before relying on local-only or offline saves; see the [local-first guide](../local-first-guide/3-store-and-drive.md).
 
 You can check if a resource has unsaved changes with the `.hasUnsavedChanges()` method.
 

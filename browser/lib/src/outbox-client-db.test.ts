@@ -6,6 +6,7 @@ import { JSCryptoProvider } from './CryptoProvider.js';
 import { core } from './ontologies/core.js';
 import { server } from './ontologies/server.js';
 import { Store } from './store.js';
+import { RequestCancelledError } from './error.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -37,7 +38,7 @@ class FakeClientDb {
     return true;
   }
 
-  whenOpen(_timeoutMs: number): Promise<boolean> {
+  whenOpen(_timeoutMs?: number): Promise<boolean> {
     if (this.isOpen) return Promise.resolve(true);
 
     return new Promise(resolve => this.openWaiters.push(resolve));
@@ -143,6 +144,57 @@ async function newAgent(): Promise<Agent> {
 }
 
 describe('the outbox in the client database', () => {
+  it.each(['worker', 'agent'] as const)(
+    'cancels an offline-baseline drain after %s changes during its snapshot read',
+    async replacement => {
+      const agent = await newAgent();
+      const db = new FakeClientDb();
+      const { store, posted } = await tab(agent, db, true);
+      const doc = await store.newResource({
+        isA: server.classes.drive,
+        noParent: true,
+        propVals: { [core.properties.name]: 'Before' },
+      });
+      await doc.save();
+      store.setServerConnected(false);
+      await doc.set(core.properties.name, 'Offline edit');
+      await doc.save();
+      const oldRow = db.rows.get(doc.subject)!;
+      const oldEntry = store.outbox.getEntry(doc.subject)!;
+      const failures = oldEntry.failures;
+      const baseline = oldEntry.baseVersion;
+      const cursor = doc.getEncodedSaveCursor();
+      const reading = Promise.withResolvers<typeof oldRow>();
+      const reached = Promise.withResolvers<void>();
+      vi.spyOn(db, 'getResourceWithSnapshot').mockImplementation(() => {
+        reached.resolve();
+
+        return reading.promise;
+      });
+      const saved = vi.spyOn(store, 'notifyResourceSaved');
+      const restore = vi.spyOn(doc, 'restoreSaveCursor');
+      const next = new FakeClientDb();
+      store.setServerConnected(true);
+      const draining = store.syncDirtyResources();
+      await reached.promise;
+
+      if (replacement === 'worker')
+        store.setClientDb(next as unknown as ClientDbWorker);
+      else store.setAgent(await newAgent());
+
+      reading.resolve(oldRow);
+      await draining;
+      expect(posted).toHaveLength(1);
+      expect(saved).not.toHaveBeenCalled();
+      expect(restore).not.toHaveBeenCalled();
+      expect(doc.getEncodedSaveCursor()).toEqual(cursor);
+      expect(oldEntry.baseVersion).toBe(baseline);
+      expect(oldEntry.failures).toBe(failures);
+      expect(next.putCalls).toEqual([]);
+      expect(doc.get(core.properties.name)).toBe('Offline edit');
+      store.setServerConnected(false);
+    },
+  );
   it('an offline edit survives a reload and drains on reconnect', async () => {
     const agent = await newAgent();
     const db = new FakeClientDb();
@@ -231,6 +283,47 @@ describe('the outbox in the client database', () => {
       doc.subject,
     ]);
   });
+
+  it.each(['offline', 'local-only'] as const)(
+    'rejects a %s save replaced after its snapshot write completed',
+    async mode => {
+      const agent = await newAgent();
+      const db = new FakeClientDb();
+      const replacement = new FakeClientDb();
+      const { store, posted } = await tab(agent, db, false);
+      const doc = await store.newResource({
+        isA: server.classes.drive,
+        noParent: true,
+        propVals: { [core.properties.name]: 'Retained outgoing edit' },
+      });
+
+      if (mode === 'local-only') store.registerLocalOnlyDrive(doc.subject);
+
+      const saved = vi.spyOn(store, 'notifyResourceSaved');
+      const persistState = store.persistState.bind(store);
+
+      vi.spyOn(store, 'persistState').mockImplementation((...args) => {
+        const writing = persistState(...args);
+
+        void writing.then(() => {
+          // The durable helper resumes first; supersede its owner before the
+          // caller or outbox continuation can publish that completion.
+          queueMicrotask(() =>
+            store.setClientDb(replacement as unknown as ClientDbWorker),
+          );
+        });
+
+        return writing;
+      });
+
+      await expect(doc.save()).rejects.toBeInstanceOf(RequestCancelledError);
+      expect(db.rows.get(doc.subject)?.snapshot).toBeInstanceOf(Uint8Array);
+      expect(replacement.rows.has(doc.subject)).toBe(false);
+      expect(store.outbox.hasPending(doc.subject)).toBe(false);
+      expect(saved).not.toHaveBeenCalled();
+      expect(posted).toHaveLength(0);
+    },
+  );
 
   it('an offline create keeps its signed genesis across a reload', async () => {
     const agent = await newAgent();

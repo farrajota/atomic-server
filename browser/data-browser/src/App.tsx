@@ -25,6 +25,7 @@ import { ProxyConnectReturn } from './chunks/AppPage/ProxyConnectReturn';
 import { router } from './routes/Router';
 
 import { errorHandler } from './handlers/errorHandler';
+import { registerRefusedDriveHealing } from './helpers/managed/refusedDrive';
 import { PerformanceProfiler, attachStoreToProfiler } from './helpers/profiler';
 
 /**
@@ -218,9 +219,7 @@ if (isClientDbEnabled()) {
     // The demo makes a guest identity straight away, and that identity gets
     // its own database: opening the anonymous one first only to close it
     // again cost a second worker and WebAssembly start on every first visit.
-    deferAnonymous:
-      window.location.pathname === '/app/dev-drive' ||
-      window.location.pathname === '/app/demo',
+    deferAnonymous: window.location.pathname === '/app/demo',
   });
 }
 
@@ -249,6 +248,7 @@ window.store = store;
 attachStoreToProfiler(store);
 reportRepeatedCommitFailures(store);
 identifyAgentInSentry(store);
+registerRefusedDriveHealing(store);
 
 if (isDev()) {
   const { attachDevtools } = await import('./helpers/devtools');

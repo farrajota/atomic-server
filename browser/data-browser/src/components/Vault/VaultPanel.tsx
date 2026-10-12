@@ -1,5 +1,11 @@
-import { useState } from 'react';
-import { FaRotateLeft, FaCloudArrowUp } from 'react-icons/fa6';
+import { useRef, useState } from 'react';
+import { styled } from 'styled-components';
+import {
+  FaRotateLeft,
+  FaCloudArrowUp,
+  FaDownload,
+  FaFileImport,
+} from 'react-icons/fa6';
 import { Button } from '../Button';
 import { ServiceRow, type ServiceStanding } from '../Cloud/ServiceRow';
 import { UsageMeter } from '../Cloud/UsageMeter';
@@ -32,6 +38,8 @@ export function VaultPanel({
 }) {
   const { status, busy, error, restoreProgress } = vault;
   const [storageOpen, setStorageOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
   // What Cloud Vault is: the same sentence in every state. Declared in here,
   // not at module level, so the translation extractor sees it.
   const tagline = 'Encrypted backup of your data. Only you can read it.';
@@ -44,6 +52,24 @@ export function VaultPanel({
 
   async function handleRestore() {
     const outcome = await vault.restore();
+
+    if (outcome) onRestored?.();
+  }
+
+  async function handleDownload() {
+    setNotice(null);
+    const outcome = await vault.downloadBackup();
+
+    if (outcome === 'saved') setNotice('Backup saved to this device.');
+
+    if (outcome === 'empty') setNotice('Nothing is backed up yet.');
+  }
+
+  async function handleFile(file: File | undefined) {
+    if (!file) return;
+
+    setNotice(null);
+    const outcome = await vault.restoreFromFile(file);
 
     if (outcome) onRestored?.();
   }
@@ -118,6 +144,13 @@ export function VaultPanel({
     details.confirmed_objects === 1 ? '' : 's'
   }`;
 
+  // Included in Cloud Server, the vault's allowance is part of that plan, whose
+  // own meter carries the limit. Quoting it here reads as the vault's limit.
+  // Close to full it comes back, so a near-full vault is never hidden.
+  const quota = enrollment.quota_bytes > 0 ? enrollment.quota_bytes : null;
+  const nearlyFull = quota !== null && enrollment.used_bytes >= quota * 0.9;
+  const showQuota = !included || nearlyFull;
+
   return (
     <>
       <ServiceRow
@@ -170,16 +203,26 @@ export function VaultPanel({
             <UsageMeter
               data-testid='vault-usage'
               usedBytes={enrollment.used_bytes}
-              quotaBytes={
-                enrollment.quota_bytes > 0 ? enrollment.quota_bytes : null
-              }
+              quotaBytes={showQuota ? quota : null}
+              backedUp
               facts={[objects]}
             />
+            {!showQuota && (
+              <IncludedNote data-testid='vault-included-note'>
+                This backup is part of your Cloud Server plan.
+              </IncludedNote>
+            )}
+            {notice && (
+              <IncludedNote data-testid='vault-notice'>{notice}</IncludedNote>
+            )}
             {storageOpen && (
               <VaultStorage
                 drivePseudonym={enrollment.drive_pseudonym}
                 onChanged={() => void vault.refresh()}
                 onClose={() => setStorageOpen(false)}
+                busy={busy}
+                suspended={suspended}
+                onCompact={vault.compact}
               />
             )}
           </>
@@ -203,6 +246,37 @@ export function VaultPanel({
               <FaRotateLeft /> <span>Restore</span>
             </Button>
             <Button
+              data-testid='vault-download'
+              subtle
+              onClick={handleDownload}
+              disabled={busy || details.confirmed_objects === 0}
+            >
+              <FaDownload /> <span>Download backup</span>
+            </Button>
+            <Button
+              data-testid='vault-restore-file'
+              subtle
+              onClick={() => fileInput.current?.click()}
+              disabled={busy}
+            >
+              <FaFileImport /> <span>Restore from file</span>
+            </Button>
+            <HiddenInput
+              ref={fileInput}
+              data-testid='vault-file-input'
+              type='file'
+              accept='.atomic-vault'
+              aria-label='Backup file'
+              tabIndex={-1}
+              onChange={e => {
+                const file = e.target.files?.[0];
+
+                // Cleared so picking the same file again still fires.
+                e.target.value = '';
+                void handleFile(file);
+              }}
+            />
+            <Button
               data-testid='vault-manage-storage'
               subtle
               onClick={() => setStorageOpen(open => !open)}
@@ -224,6 +298,15 @@ export function VaultPanel({
     </>
   );
 }
+
+const HiddenInput = styled.input`
+  display: none;
+`;
+
+const IncludedNote = styled.span`
+  color: ${p => p.theme.colors.textLight};
+  font-size: 0.85em;
+`;
 
 function ErrorText({ children }: { children: string }) {
   return <span data-testid='vault-error'>{children}</span>;

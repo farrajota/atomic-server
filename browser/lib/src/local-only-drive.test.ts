@@ -1,12 +1,44 @@
 import { describe, it, vi } from 'vitest';
 import {
-  core,
+  Resource,
   commits,
+  core,
   server,
   isAtomicIdentifier,
   isCommitSubject,
 } from './index.js';
 import { testStore } from './test-store.js';
+import type { Store } from './store.js';
+
+function attachDurableSnapshotDb(store: Store) {
+  const snapshots = new Map<string, { jsonAd: string; snapshot: Uint8Array }>();
+  store.setClientDb({
+    isOpen: true,
+    isReady: true,
+    isInitialized: true,
+    whenOpen: async () => true,
+    waitForInit: async () => true,
+    waitForReady: async () => true,
+    getResourceWithSnapshot: async (subject: string) =>
+      snapshots.get(subject) ?? { jsonAd: null, snapshot: undefined },
+    getResourcesWithSnapshots: async (subjects: string[]) =>
+      subjects.map(
+        subject =>
+          snapshots.get(subject) ?? { jsonAd: null, snapshot: undefined },
+      ),
+    unsupportedEnvironment: false,
+    putResourceWithSnapshot: async (
+      subject: string,
+      jsonAd: string,
+      snapshot?: Uint8Array,
+    ) => {
+      if (!snapshot) throw new Error('Expected a durable resource snapshot');
+      snapshots.set(subject, { jsonAd, snapshot: snapshot.slice() });
+    },
+  } as never);
+
+  return snapshots;
+}
 
 /**
  * Local-only drives (e.g. the demo workspace): resources save and
@@ -52,6 +84,7 @@ describe('Local-only drives', () => {
     expect,
   }) => {
     const { store, posted } = await testStore();
+    const snapshots = attachDurableSnapshotDb(store);
 
     const drive = await store.newResource({
       isA: server.classes.drive,
@@ -65,17 +98,88 @@ describe('Local-only drives', () => {
     expect(result).toBe('persisted');
     expect(posted).toHaveLength(0);
     expect(store.outbox.size).toBe(0);
+    const persisted = snapshots.get(drive.subject)!;
+    expect(JSON.parse(persisted.jsonAd)[core.properties.name]).toBe(
+      'Demo team',
+    );
+    expect(persisted.snapshot).toBeInstanceOf(Uint8Array);
+    const reloaded = new Resource(drive.subject);
+    reloaded.importLoroUpdate(persisted.snapshot);
+    expect(reloaded.get(core.properties.name)).toBe('Demo team');
     expect(isAtomicIdentifier(drive.subject)).toBe(true);
 
     const lastCommit = String(drive.get(commits.properties.lastCommit));
     expect(isCommitSubject(lastCommit)).toBe(true);
     expect(store.resources.has(lastCommit)).toBe(false);
   });
+  it('creates and saves a parentless local-only drive without a server URL', async ({
+    expect,
+  }) => {
+    const { store, posted } = await testStore({ serverUrl: undefined });
+    const snapshots = attachDurableSnapshotDb(store);
+
+    const drive = await store.createDrive('Offline workspace', {
+      localOnly: true,
+    });
+    const child = await store.newResource({
+      parent: drive.subject,
+      propVals: { [core.properties.name]: 'Welcome' },
+    });
+
+    expect(isAtomicIdentifier(drive.subject)).toBe(true);
+    expect(drive.get(core.properties.parent)).toBeUndefined();
+    expect(drive.get('https://atomicdata.dev/properties/genesis')).toBeTruthy();
+    expect(child.get(core.properties.parent)).toBe(drive.subject);
+    expect(child.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+    expect(store.isLocalOnlySubject(child.subject)).toBe(true);
+
+    await child.save();
+
+    for (const resource of [drive, child]) {
+      const persisted = snapshots.get(resource.subject);
+      expect(persisted).toBeDefined();
+      expect(persisted!.snapshot).toBeInstanceOf(Uint8Array);
+      const reloaded = new Resource(resource.subject);
+      reloaded.importLoroUpdate(persisted!.snapshot);
+      expect(reloaded.get(core.properties.name)).toBe(
+        resource.get(core.properties.name),
+      );
+    }
+
+    expect(posted).toHaveLength(0);
+    expect(store.outbox.size).toBe(0);
+  });
+
+  it('retains a local-only save after its required snapshot is unavailable', async ({
+    expect,
+  }) => {
+    const { store } = await testStore();
+    const drive = await store.newResource({
+      isA: server.classes.drive,
+      noParent: true,
+      propVals: { [core.properties.name]: 'Local-only drive' },
+    });
+    store.registerLocalOnlyDrive(drive.subject);
+    const saved = vi.spyOn(store, 'notifyResourceSaved');
+
+    await expect(drive.save()).rejects.toThrow(/local database|storage/i);
+    expect(saved).not.toHaveBeenCalled();
+    expect(store.outbox.size).toBe(0);
+
+    const snapshots = attachDurableSnapshotDb(store);
+    await expect(drive.save()).resolves.toBe('persisted');
+    expect(saved).toHaveBeenCalledOnce();
+    expect(snapshots.get(drive.subject)?.snapshot).toBeInstanceOf(Uint8Array);
+    expect(store.outbox.size).toBe(0);
+  });
 
   it('resolves children as local-only and stamps lastCommit locally', async ({
     expect,
   }) => {
     const { store, posted } = await testStore();
+    attachDurableSnapshotDb(store);
 
     const drive = await store.newResource({
       isA: server.classes.drive,
@@ -108,6 +212,7 @@ describe('Local-only drives', () => {
 
   it('leaves other drives untouched', async ({ expect }) => {
     const { store, posted } = await testStore();
+    attachDurableSnapshotDb(store);
 
     const localDrive = await store.newResource({
       isA: server.classes.drive,

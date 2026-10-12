@@ -31,6 +31,7 @@ import { ChatRoomPage } from './ChatRoomPage';
 import { ConversationPage } from './Conversation/ConversationPage';
 import { InboxPage } from './InboxPage';
 import { MessagePage } from './MessagePage';
+import { ChatLogPage } from './ChatLogPage';
 import { BookmarkPage } from './BookmarkPage/BookmarkPage';
 import { ImporterPage } from './ImporterPage.jsx';
 import { FolderPage } from './FolderPage';
@@ -166,9 +167,7 @@ const ResourcePage: React.FC<Props> = ({ subject, websiteVersion }) => {
   if (resource.loading && !loadingExceeded && !hasLoadedThisSubject) {
     return (
       <Main subject={subject}>
-        <ContainerNarrow>
-          <Spinner centered />
-        </ContainerNarrow>
+        <Spinner centered />
       </Main>
     );
   }
@@ -312,6 +311,8 @@ function selectComponent(klass: string | undefined) {
       return ConversationPage;
     case dataBrowser.classes.message:
       return MessagePage;
+    case dataBrowser.classes.chatLog:
+      return ChatLogPage;
     case dataBrowser.classes.bookmark:
       return BookmarkPage;
     case dataBrowser.classes.importer:

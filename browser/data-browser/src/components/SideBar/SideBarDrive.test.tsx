@@ -85,10 +85,7 @@ vi.mock('@dnd-kit/core', () => ({
 function show() {
   render(
     <ThemeProvider theme={buildTheme(false, '#336699', false)}>
-      <SideBarDrive
-        onItemClick={() => undefined}
-        onIsRearangingChange={() => undefined}
-      />
+      <SideBarDrive onItemClick={() => undefined} />
     </ThemeProvider>,
   );
 }

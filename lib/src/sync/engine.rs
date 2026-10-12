@@ -756,6 +756,9 @@ pub struct CommitIngestOpts {
     /// for peer replicas — hosting subjects the node does not own is what
     /// replication is.
     pub enforce_subject_ownership: bool,
+    /// Hub semantics: check values against class `constraints`. Off for peer
+    /// replicas, which must keep what another node already accepted.
+    pub validate_constraints: bool,
     /// Origin used to resolve `internal:/` subjects in the response JSON-AD.
     /// `None` falls back to the store's base domain.
     pub response_origin: Option<String>,
@@ -769,6 +772,7 @@ impl CommitIngestOpts {
             source_id,
             validate_loro_causality: true,
             enforce_subject_ownership: true,
+            validate_constraints: true,
             response_origin,
         }
     }
@@ -787,6 +791,7 @@ impl CommitIngestOpts {
             source_id: None,
             validate_loro_causality: false,
             enforce_subject_ownership: false,
+            validate_constraints: false,
             response_origin: None,
         }
     }
@@ -933,6 +938,7 @@ pub async fn ingest_commit(
 
     let commit_opts = crate::commit::CommitOpts {
         validate_schema: true,
+        validate_constraints: opts.validate_constraints,
         validate_signature: true,
         // Rejects commits stamped in the future. This is NOT an age bound —
         // a bulk reconcile legitimately re-sends old destroy envelopes to a

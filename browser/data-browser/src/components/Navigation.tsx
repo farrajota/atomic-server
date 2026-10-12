@@ -85,11 +85,13 @@ export function NavWrapper({ children }: NavWrapperProps): JSX.Element {
   const contextualSubject = useMemo(
     () =>
       subject ||
-      search.get('parentSubject') ||
-      search.get('parent') ||
-      search.get('newSubject') ||
-      undefined,
-    [subject, search],
+      (agent
+        ? search.get('parentSubject') ||
+          search.get('parent') ||
+          search.get('newSubject') ||
+          undefined
+        : undefined),
+    [subject, search, agent],
   );
 
   const contentRef = useRef<HTMLDivElement>(null);

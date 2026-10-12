@@ -36,25 +36,47 @@ for (const destination of restrictedDestinations) {
       });
     }
 
-    await page.goto(new URL(destination, FRONTEND_URL).toString());
+    const expectedDestination = new URL(destination, FRONTEND_URL).toString();
 
-    await expect(page).toHaveURL(url => {
-      const next = new URL(url).searchParams.get('next');
+    await page.goto(expectedDestination);
 
-      return (
-        new URL(url).pathname === '/app/welcome' &&
-        new URL(url).searchParams.get('step') === 'signin' &&
-        next === destination
-      );
-    });
-    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible();
-    await expect(page.getByLabel('Agent secret')).toBeVisible();
     await expect(page).toHaveURL(url => {
       const current = new URL(url);
+      const next = current.searchParams.get('next');
+      let resolvedNext: URL;
+
+      try {
+        if (next === null) return false;
+        resolvedNext = new URL(next, current.origin);
+      } catch {
+        return false;
+      }
 
       return (
         current.pathname === '/app/welcome' &&
-        current.searchParams.get('next') === destination
+        current.searchParams.get('step') === 'signin' &&
+        resolvedNext.origin === current.origin &&
+        resolvedNext.toString() === expectedDestination
+      );
+    });
+    await expect(page.getByLabel('Agent secret')).toBeEnabled();
+    await expect(page.getByLabel('Agent secret')).toBeVisible();
+    await expect(page).toHaveURL(url => {
+      const current = new URL(url);
+      const next = current.searchParams.get('next');
+      let resolvedNext: URL;
+
+      try {
+        if (next === null) return false;
+        resolvedNext = new URL(next, current.origin);
+      } catch {
+        return false;
+      }
+
+      return (
+        current.pathname === '/app/welcome' &&
+        resolvedNext.origin === current.origin &&
+        resolvedNext.toString() === expectedDestination
       );
     });
     expect(pageErrors).toEqual([]);
@@ -84,9 +106,12 @@ test('an open stored mobile sidebar does not block the anonymous sign-in flow', 
     new URL('/app/agent?return_to=agent', FRONTEND_URL).toString(),
   );
 
-  await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible();
-  await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByLabel('Agent secret')).toBeVisible();
+  const secretField = page.getByLabel('Agent secret');
+
+  await expect(secretField).toBeVisible();
+  await expect(secretField).toBeEnabled();
+  await secretField.click();
+  await expect(secretField).toBeFocused();
   await expect(
     page.getByText(/Resource not found|not found locally/i),
   ).toHaveCount(0);

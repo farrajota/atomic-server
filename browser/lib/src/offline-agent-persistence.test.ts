@@ -28,10 +28,11 @@ describe('Offline Agent Persistence', () => {
       { jsonAd: string; snapshot: Uint8Array | null }
     >();
     const mockClientDb = {
+      isOpen: true,
+      unsupportedEnvironment: false,
       isReady: true,
       isInitialized: true,
       initError: undefined,
-      waitForReady: async () => true,
       waitForInit: async () => undefined,
       flush: async () => undefined,
       putResourceWithSnapshot: async (

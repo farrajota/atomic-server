@@ -30,17 +30,20 @@ const store = new Store({
 
 ### A store without a server
 
-A store with an Agent and no `serverUrl` is a complete [local-first](../local-first.md) client: it mints `atomic:` identifiers, creates Drives, signs edits and keeps them in an outbox.
+A Store with a signing Agent and no `serverUrl` can create locally identified, signed resources without making a server request **when the SDK supports explicitly parentless creation without a server URL**. That SDK capability and an actually opened client database are separate prerequisites: opening the database alone does not make this flow supported. Local-only saves need an attached client database that has actually opened; see the [local-first guide](../local-first-guide/3-store-and-drive.md) for setup. The example assumes that SDK support and that `store` is the initialized instance:
 
 ```typescript
-const store = new Store({ agent });
-
+// Requires parentless no-server creation support in the SDK, a signing Agent,
+// and an attached ClientDbWorker that passed whenOpen().
 const drive = await store.createDrive('Notes', { localOnly: true });
 store.setDrive(drive.subject);
 ```
 
 `localOnly` keeps the sync engine from offering the Drive to a server you connect later; lift it with `store.promoteLocalDrive(drive.subject)` once you want it replicated.
-To keep data across reloads attach the WASM client database with `store.setClientDb()`; the [local-first guide](../local-first-guide/4-persist.md) shows the setup.
+Local-only saves require a durable resource snapshot in the client database and do not enroll edits in the server-drain outbox. Offline saves require that snapshot and the applicable outbox write to complete durably. If storage is absent, refused, times out while opening, is replaced during the write, or the write fails, the save rejects before saved notification; an offline edit is not published to the outbox. The edit remains in memory as unsaved and is not guaranteed to survive reload.
+An online save instead succeeds when the server acknowledges it. Mirroring that acknowledged state to an attached local database is optional and bounded; mirror failure does not undo the server acknowledgement.
+If local storage is unsupported or denied, the Store can still read from the server, but has no local cache or offline durability. A supported database that opens later can resume optional cache/index work only for its current worker and agent; work belonging to a replaced worker or identity is not reused.
+To keep data across reloads attach the WASM client database with `store.setClientDb()`; the [local-first guide](../local-first-guide/3-store-and-drive.md) initializes and checks it before the first required save.
 Sync status (connected, pending edits, last drive sync) is on `store.getSyncStatus()` and the `StoreEvents.SyncStatusChanged` event.
 
 ### One vs Many Stores

@@ -735,6 +735,7 @@ impl HostCore {
         // (its installer's drive, or public ones), and nothing else.
         let opts = CommitOpts {
             validate_schema: true,
+            validate_constraints: true,
             validate_signature: true,
             validate_timestamp: false,
             validate_rights: true,

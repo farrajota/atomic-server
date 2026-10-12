@@ -58,6 +58,7 @@ vi.mock('../../helpers/AppSettings', () => ({
     setAgent: state.setAgent,
     setDrive: state.setDrive,
     setServer: state.setServer,
+    setBaseURL: vi.fn(),
   }),
 }));
 vi.mock('../../hooks/useNavigateWithTransition', () => ({
@@ -121,6 +122,9 @@ vi.mock('../../helpers/managed/vaultAutoBackup', () => ({
 vi.mock('../../helpers/managed/reconcile', () => ({
   connectHostedDrive: async () => true,
   shortDid: (subject: string) => subject,
+}));
+vi.mock('../../helpers/discoverHomeServer', () => ({
+  discoverHomeServerForApp: async () => false,
 }));
 vi.mock('../../helpers/agentStorage', () => ({ saveAgentToIDB: vi.fn() }));
 vi.mock('../../helpers/deviceLock', () => ({ beat: vi.fn() }));
@@ -352,6 +356,23 @@ it('returns to an internal guarded route with its query after sign-in', async ()
   });
 
   expect(state.navigate).toHaveBeenCalledWith(destination);
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+});
+it('returns a fully qualified same-origin app link after secret sign-in', async () => {
+  const destination = new URL(
+    '/app/new?parentSubject=did%3Aad%3Ashared#details',
+    window.location.origin,
+  ).toString();
+  await show(`?step=signin&next=${encodeURIComponent(destination)}`);
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.navigate).toHaveBeenCalledWith(
+    '/app/new?parentSubject=did%3Aad%3Ashared#details',
+  );
   expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
 });
 

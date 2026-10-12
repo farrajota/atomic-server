@@ -298,6 +298,43 @@ describe('LocalOutbox in the client database', () => {
     expect(outbox.hydrated).toBe(false);
   });
 
+  it('does not return attachment rows superseded during the durable import', async () => {
+    const db = new FakeDatabase();
+    const first = await reload(db);
+
+    first.markDirty('did:ad:outgoing');
+    await first.flush();
+
+    const outbox = new LocalOutbox();
+    outbox.expectDatabase();
+    localStorage.setItem(
+      `atomic.outbox.${AGENT}`,
+      JSON.stringify([{ subject: 'did:ad:legacy', enqueuedAt: 1 }]),
+    );
+    outbox.rebind(AGENT);
+
+    const writing = Promise.withResolvers<void>();
+    const importing = Promise.withResolvers<void>();
+    const outboxWrite = db.outboxWrite.bind(db);
+
+    vi.spyOn(db, 'outboxWrite').mockImplementationOnce(async (...args) => {
+      await outboxWrite(...args);
+      importing.resolve();
+      await writing.promise;
+    });
+
+    const attached = outbox.attachDatabase(AGENT, db);
+
+    await importing.promise;
+    outbox.rebind(OTHER);
+    writing.resolve();
+
+    await expect(attached).resolves.toEqual([]);
+    expect(outbox.size).toBe(0);
+    expect(outbox.hydrated).toBe(false);
+    expect(localStorage.getItem(`atomic.outbox.${AGENT}`)).not.toBeNull();
+  });
+
   it('writes an offline save with its snapshot, then updates memory', async () => {
     const db = new FakeDatabase();
     const onChange = vi.fn();

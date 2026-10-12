@@ -68,6 +68,13 @@ function isStorageBlockedDbError(error: unknown): boolean {
   return message.includes(STORAGE_BLOCKED_MARKER);
 }
 
+function isStorageBlockedError(error: unknown): boolean {
+  return (
+    isStorageBlockedDbError(error) ||
+    (error instanceof Error && error.name === STORAGE_BLOCKED_ERROR_NAME)
+  );
+}
+
 /**
  * Normalizes a leader-init failure into the error we keep on `_initError`.
  *
@@ -82,8 +89,38 @@ function isStorageBlockedDbError(error: unknown): boolean {
  *  caller that cannot work without it (the demo) can say so in its own words. */
 export const STORAGE_BLOCKED_ERROR_NAME = 'StorageBlockedError';
 
+/**
+ * Drives that exist only in this browser, as `Store.registerLocalOnlyDrive`
+ * stored them. A worker has no `localStorage`, so the page reads them for it.
+ * Anything unreadable counts as none: the chat migration then writes no pages
+ * and only drops cached messages that already have their entry, which is the
+ * safe side.
+ */
+function readLocalOnlyDrives(): string[] {
+  try {
+    const raw = localStorage.getItem('atomic.localOnlyDrives');
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+
+    return Array.isArray(parsed)
+      ? parsed.filter((d): d is string => typeof d === 'string')
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function asInitError(e: unknown): Error {
-  const message = e instanceof Error ? e.message : String(e);
+  const securityError =
+    (typeof DOMException !== 'undefined' && e instanceof DOMException) ||
+    (e instanceof Error && e.name === 'SecurityError')
+      ? e
+      : undefined;
+  const message =
+    securityError?.name === 'SecurityError'
+      ? `OPFS unavailable [${STORAGE_BLOCKED_MARKER}]: ${securityError.message}`
+      : e instanceof Error
+        ? e.message
+        : String(e);
 
   // Firefox's word for "another sync access handle has this file open":
   // another tab of this site, or its worker, still holds the database. Left
@@ -97,7 +134,7 @@ function asInitError(e: unknown): Error {
     );
   }
 
-  if (isStorageBlockedDbError(e)) {
+  if (message.includes(STORAGE_BLOCKED_MARKER)) {
     return Object.assign(
       new Error(
         'Local caching and offline support are disabled: this browser is not ' +
@@ -436,6 +473,8 @@ export class ClientDbWorker {
       );
       console.info('[ClientDb]', this._initError.message);
 
+      this.settleOpenWaiters(false);
+
       return;
     }
 
@@ -473,6 +512,15 @@ export class ClientDbWorker {
       // itself in 'failed' or surface an error the replacement already
       // resolved.
       if (this.destroyed) return;
+
+      if (isStorageBlockedError(this._initError)) {
+        this.role = 'failed';
+        this.openIsSlow = false;
+        this.ready = false;
+        this.settleOpenWaiters(false);
+
+        return;
+      }
 
       // A worker exists only after we acquire the lock. Cold WASM startup
       // can exceed the election window; wait for our worker instead of
@@ -654,6 +702,13 @@ export class ClientDbWorker {
         // instance — a destroyed one has been superseded.
         if (!this.worker && !this.destroyed) {
           this._initError = asInitError(e);
+
+          if (isStorageBlockedError(this._initError)) {
+            this.role = 'failed';
+            this.openIsSlow = false;
+            this.ready = false;
+            this.settleOpenWaiters(false);
+          }
         }
       });
   }
@@ -707,9 +762,9 @@ export class ClientDbWorker {
 
     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       if ((event.data as { type: string }).type === 'migration-progress') {
-        const { done, total, finished } =
+        const { done, total, finished, phase } =
           event.data as unknown as IndexMigrationProgress;
-        publishIndexMigration({ done, total, finished });
+        publishIndexMigration({ done, total, finished, phase });
 
         return;
       }
@@ -741,6 +796,7 @@ export class ClientDbWorker {
       dbKey: this.opts.dbKey,
       migrateLegacy: this.opts.migrateLegacy,
       discardUndecryptable: this.opts.discardUndecryptable,
+      localOnlyDrives: readLocalOnlyDrives(),
     })) as ClientDbInitTimings | undefined;
     endWorkerInit(timings);
 
@@ -1256,6 +1312,7 @@ export class ClientDbWorker {
     checkpointN: number,
     driveHasCheckpoint: boolean,
     observedLanes: Record<string, number>,
+    currentStateOnly = false,
   ): Promise<{
     objectKey: string;
     sealed: Uint8Array;
@@ -1276,6 +1333,7 @@ export class ClientDbWorker {
       checkpointN,
       driveHasCheckpoint,
       observedLanes,
+      currentStateOnly,
     });
 
     return (r ?? null) as {
@@ -1372,7 +1430,7 @@ export class ClientDbWorker {
    * delays the open past its 17s cap would otherwise lose the write. See the
    * note at `OWN_BOOT_SETTLE_WAIT_MS` on why that cap itself must stay short.
    */
-  whenOpen(timeoutMs: number): Promise<boolean> {
+  whenOpen(timeoutMs?: number): Promise<boolean> {
     if (this.ready) return Promise.resolve(true);
 
     if (this.destroyed || this._unsupportedEnvironment) {
@@ -1384,17 +1442,22 @@ export class ClientDbWorker {
       return Promise.resolve(false);
     }
 
-    return new Promise<boolean>(resolve => {
-      const done = (open: boolean) => {
-        clearTimeout(timer);
-        this.openWaiters.delete(done);
-        resolve(open);
-      };
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
-      const timer = setTimeout(() => done(false), timeoutMs);
+    const done = (open: boolean) => {
+      clearTimeout(timer);
+      this.openWaiters.delete(done);
+      resolve(open);
+    };
 
-      this.openWaiters.add(done);
-    });
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => done(false), timeoutMs);
+    }
+
+    this.openWaiters.add(done);
+
+    return promise;
   }
 
   private settleOpenWaiters(open: boolean): void {
@@ -1415,6 +1478,10 @@ export class ClientDbWorker {
     this.seedPromise = promise.then(() => {
       this.seeded = true;
     });
+
+    // The App owns reporting the original rejection. Observe this derived
+    // readiness promise too, so an SDK-owned rejection is never unhandled.
+    void this.seedPromise.catch(() => undefined);
   }
 
   /** Resolves when the WASM worker is initialized (lookups can run).

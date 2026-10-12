@@ -17,6 +17,7 @@ import {
   emitSubjectForCaps,
 } from './subject.js';
 import { Resource } from './resource.js';
+import type { ClientDbWorker } from './client-db.js';
 import { recordServerVersionFromWsProtocol } from './serverCapabilities.js';
 import { StoreEvents, type Store } from './store.js';
 import type { DriveItem } from './local-drive-copy.js';
@@ -475,14 +476,70 @@ export class WSClient {
       ws.addEventListener('message', event => {
         if (!signal.aborted) this.handleMessage(event);
       });
+      let ended = false;
+      let rejectOpen: (error: AtomicError) => void = () => undefined;
+
+      // Tears this socket down and schedules the next attempt. Runs at most
+      // once per socket: normally from `close`, but also from `error` when the
+      // socket never opened, because Node's WebSocket (undici) fires only
+      // `error` on a refused connection, never `close`. Waiting for `close`
+      // there left the client without a retry and `openPromise` pending, so a
+      // client whose first attempt hit a server that was not up yet stayed
+      // offline for good.
+      const end = (error: string | undefined) => {
+        if (ended) return;
+        ended = true;
+        // Explicit close already tears down this client synchronously. Its
+        // later event must not overwrite a replacement socket's live state.
+        if (this._closed || ws !== this.ws) return;
+        this.connection.abort(new RequestCancelledError('WebSocket closed'));
+
+        if (!opened) {
+          // A socket that dies before opening must REJECT `openPromise`, not
+          // leave it pending forever. `authenticate()` awaits it while
+          // holding `isAuthenticating`, and its `finally` (the only thing
+          // that clears that flag) is downstream of this await. A
+          // never-settling promise therefore pins the flag for the lifetime
+          // of the client: the retry loop reconnects, the new socket opens,
+          // and its `authenticate()` takes the `if (this.isAuthenticating)
+          // await this.authPromise` branch onto the dead promise and waits
+          // forever. Auth never completes, so `reportConnected(true)` never
+          // fires and the app sits on "Offline" next to a server answering
+          // in milliseconds. Reproduced on a cold start where the webview is
+          // ready before the embedded server binds.
+          rejectOpen(
+            new AtomicError(
+              `WebSocket to ${wsURL.origin} closed before it opened`,
+              ErrorType.Server,
+            ),
+          );
+        }
+
+        this.reportConnected(false, error);
+        this.rejectAllPending('WebSocket closed before response arrived');
+        this.stopLiveness();
+        this._serverCaps = [];
+        this._challengeNonce = undefined;
+        this._subscribedDrive = undefined;
+
+        this._retryTimer = setTimeout(() => {
+          this.authenticatedWith = undefined;
+          createSocket();
+        }, this._retryDelay);
+        this._retryDelay = Math.min(this._retryDelay * 2, 30000);
+      };
+
       ws.addEventListener('error', () => {
         if (this._closed || ws !== this.ws) return;
-        this.connection.abort(new RequestCancelledError('WebSocket error'));
 
         if (!opened) {
           console.warn('[WS] Connection failed');
+          end(connectionFailedMessage(wsURL));
+
+          return;
         }
 
+        this.connection.abort(new RequestCancelledError('WebSocket error'));
         this.reportConnected(false, connectionFailedMessage(wsURL));
         // Some environments fire error without an immediately-following
         // close. Reject anyway — if close does fire later, the second
@@ -490,10 +547,7 @@ export class WSClient {
         this.rejectAllPending('WebSocket error before response arrived');
       });
       ws.addEventListener('close', (ev: CloseEvent) => {
-        // Explicit close already tears down this client synchronously. Its
-        // later event must not overwrite a replacement socket's live state.
         if (this._closed || ws !== this.ws) return;
-        this.connection.abort(new RequestCancelledError('WebSocket closed'));
 
         // Surface CloseEvent metadata so an unexplained reconnect loop
         // names its own cause: code 1000=normal, 1001=going away,
@@ -503,59 +557,20 @@ export class WSClient {
         // tells us if the closing handshake completed. Without this the
         // user-visible "Connection ... closed" line gives no signal of
         // what actually killed the connection.
-        if (!this._closed) {
+        if (!ended) {
           console.warn(
             `[WS] close code=${ev.code} reason=${JSON.stringify(ev.reason)} wasClean=${ev.wasClean} opened=${opened}`,
           );
         }
 
-        const error = this._closed
-          ? undefined
-          : opened
+        end(
+          opened
             ? `Connection to ${wsURL.origin} closed (code=${ev.code}${ev.reason ? `, reason=${ev.reason}` : ''}).`
-            : connectionFailedMessage(wsURL);
-
-        this.reportConnected(false, error);
-        this.rejectAllPending('WebSocket closed before response arrived');
-        this.stopLiveness();
-        this._serverCaps = [];
-        this._challengeNonce = undefined;
-        this._subscribedDrive = undefined;
-
-        if (!this._closed) {
-          this._retryTimer = setTimeout(() => {
-            this.authenticatedWith = undefined;
-            createSocket();
-          }, this._retryDelay);
-          this._retryDelay = Math.min(this._retryDelay * 2, 30000);
-        }
+            : connectionFailedMessage(wsURL),
+        );
       });
       this.openPromise = new Promise((resolve, reject) => {
-        // A socket that dies before opening must REJECT this, not leave it
-        // pending forever. `authenticate()` awaits it while holding
-        // `isAuthenticating`, and its `finally` — the only thing that clears
-        // that flag — is downstream of this await. A never-settling promise
-        // therefore pins the flag for the lifetime of the client: the retry
-        // loop reconnects, the new socket opens, and its `authenticate()`
-        // takes the `if (this.isAuthenticating) await this.authPromise` branch
-        // onto the dead promise and waits forever. Auth never completes, so
-        // `reportConnected(true)` never fires and the app sits on "Offline"
-        // next to a server answering in milliseconds, with every `ws.fetch`
-        // hung because `REQUEST_TIMEOUT` only starts after auth.
-        //
-        // Reproduced on a cold start where the webview is ready before the
-        // embedded server binds: one `close code=1006 opened=false`, and no
-        // recovery until a reload builds a fresh client.
-        ws.addEventListener('close', () => {
-          if (!opened) {
-            reject(
-              new AtomicError(
-                `WebSocket to ${wsURL.origin} closed before it opened`,
-                ErrorType.Server,
-              ),
-            );
-          }
-        });
+        rejectOpen = reject;
         ws.addEventListener('open', () => {
           opened = true;
           this._retryDelay = 1000;
@@ -1265,6 +1280,7 @@ export class WSClient {
           this.store.failDriveSync(
             this.driveFromRejection(msg.message),
             msg.message,
+            msg.code,
           );
         } else if (
           msg.code === ErrorCode.AUTH_REQUIRED ||
@@ -1532,8 +1548,10 @@ export class WSClient {
           // that announces each one.
           if (
             entries.length >= BULK_PULL_MIN_ENTRIES &&
-            typeof workerDb?.applyStateUpdates === 'function' &&
-            !workerDb.initError
+            workerDb?.isOpen === true &&
+            typeof workerDb.applyStateUpdates === 'function' &&
+            !workerDb.initError &&
+            !workerDb.unsupportedEnvironment
           ) {
             const direct = entries.filter(
               e => !this.store.resources.has(e.subject),
@@ -1585,8 +1603,19 @@ export class WSClient {
           if (msg.last) {
             const drive = canonicalizeScheme(msg.drive);
             const count = msg.entries.length;
+            const clientDb = this.store.getClientDb();
+            const agent = this.store.getAgent();
+            const current = this.connectionGuard();
 
             const finish = () => {
+              if (
+                !current() ||
+                this.store.getClientDb() !== clientDb ||
+                this.store.getAgent() !== agent
+              ) {
+                return;
+              }
+
               this.store.finishDriveSync(drive, count, Date.now());
 
               if (this.pulledInBulk) {
@@ -1595,17 +1624,49 @@ export class WSClient {
               }
             };
 
-            const clientDb = this.store.getClientDb();
+            const finishAfterOpen = async () => {
+              if (
+                typeof clientDb?.flush !== 'function' ||
+                clientDb.unsupportedEnvironment
+              ) {
+                finish();
 
-            // "Synced" is what lets a collection believe its local answer,
-            // an empty one included. Until the pulled resources are in the
-            // local database that answer is a partial one (a large drive
-            // takes minutes to land), so wait for the queued writes first.
-            if (typeof clientDb?.flush === 'function') {
-              clientDb.flush().then(finish, finish);
-            } else {
+                return;
+              }
+
+              let opened = clientDb.isOpen === true;
+
+              if (!opened) {
+                opened = await clientDb.whenOpen();
+
+                if (
+                  !current() ||
+                  this.store.getClientDb() !== clientDb ||
+                  this.store.getAgent() !== agent
+                ) {
+                  return;
+                }
+              }
+
+              if (!opened) {
+                finish();
+
+                return;
+              }
+
+              if (
+                !current() ||
+                this.store.getClientDb() !== clientDb ||
+                this.store.getAgent() !== agent
+              ) {
+                return;
+              }
+
+              await clientDb.flush().catch(() => undefined);
               finish();
-            }
+            };
+
+            void finishAfterOpen().catch(() => finish());
           }
         }
 
@@ -1616,16 +1677,15 @@ export class WSClient {
         const hash = decodeBlobRequest(payload);
 
         if (hash) {
-          const clientDb = this.store.getClientDb();
+          const connected = this.connectionGuard();
 
-          if (clientDb) {
-            const current = this.connectionGuard();
-            clientDb.getBlob(hash).then(bytes => {
-              if (current() && bytes) {
-                this.sendBinary(encodeBlobResponse(hash, bytes));
-              }
-            });
-          }
+          void this.withBlobCache(async (clientDb, current) => {
+            const bytes = await clientDb.getBlob(hash);
+
+            if (current() && connected() && bytes) {
+              this.sendBinary(encodeBlobResponse(hash, bytes));
+            }
+          });
         }
 
         break;
@@ -1635,7 +1695,9 @@ export class WSClient {
         const resp = decodeBlobResponse(payload);
 
         if (resp) {
-          this.store.getClientDb()?.putBlob(resp.hash, resp.bytes);
+          void this.withBlobCache(async clientDb => {
+            await clientDb.putBlob(resp.hash, resp.bytes);
+          });
         }
 
         break;
@@ -1999,14 +2061,15 @@ export class WSClient {
       if (this._vvSyncRuns.get(drive) === run) this._vvSyncRuns.delete(drive);
     });
 
-    this._vvSyncRuns.set(drive, run);
-
     return run;
   }
 
   private pulledInBulk = false;
   private pendingEnvelopes: Array<{ subject: string; json: string }> = [];
   private envelopeDrain: ReturnType<typeof setTimeout> | undefined;
+  private backgroundOwner:
+    | { clientDb: ClientDbWorker; agent: ReturnType<Store['getAgent']> }
+    | undefined;
 
   /** Keep the signed envelopes of pulled resources, a slice at a time. Each is
    *  verified (a signature check in WASM, about 2 ms), which for a 10k drive
@@ -2017,29 +2080,107 @@ export class WSClient {
   private queueEnvelopeImport(
     envelopes: Array<{ subject: string; json: string }>,
   ): void {
+    const owner = this.captureBackgroundOwner();
+    if (!owner?.clientDb.importEnvelopes) return;
+
     this.pendingEnvelopes.push(...envelopes);
     this.scheduleBackgroundImport();
   }
 
+  private captureBackgroundOwner():
+    | { clientDb: ClientDbWorker; agent: ReturnType<Store['getAgent']> }
+    | undefined {
+    const clientDb = this.store.getClientDb();
+    const agent = this.store.getAgent();
+    const previous = this.backgroundOwner;
+
+    if (
+      previous &&
+      (previous.clientDb !== clientDb || previous.agent !== agent)
+    ) {
+      this.pendingEnvelopes = [];
+    }
+
+    this.backgroundOwner = clientDb ? { clientDb, agent } : undefined;
+
+    return this.backgroundOwner;
+  }
+
+  private ownsBackgroundWork(owner: {
+    clientDb: ClientDbWorker;
+    agent: ReturnType<Store['getAgent']>;
+  }): boolean {
+    return (
+      this.store.getClientDb() === owner.clientDb &&
+      this.store.getAgent() === owner.agent
+    );
+  }
+
+  private discardPendingEnvelopes(owner: {
+    clientDb: ClientDbWorker;
+    agent: ReturnType<Store['getAgent']>;
+  }): void {
+    if (
+      this.backgroundOwner?.clientDb === owner.clientDb &&
+      this.backgroundOwner.agent === owner.agent
+    ) {
+      this.pendingEnvelopes = [];
+    }
+  }
+
   /** Run the envelope and search indexing once pulls go quiet. */
   private scheduleBackgroundImport(): void {
+    this.captureBackgroundOwner();
     clearTimeout(this.envelopeDrain);
     this.envelopeDrain = setTimeout(() => void this.drainBackground(), 2000);
   }
 
+  private async waitForBackgroundOpen(owner: {
+    clientDb: ClientDbWorker;
+    agent: ReturnType<Store['getAgent']>;
+  }): Promise<boolean> {
+    if (
+      !this.ownsBackgroundWork(owner) ||
+      owner.clientDb.unsupportedEnvironment
+    )
+      return false;
+
+    if (owner.clientDb.isOpen) return true;
+
+    const opened = await owner.clientDb.whenOpen();
+
+    return opened && this.ownsBackgroundWork(owner);
+  }
+
   private async drainBackground(): Promise<void> {
-    await this.drainEnvelopes();
-    await this.drainSearchIndex();
+    const owner = this.backgroundOwner ?? this.captureBackgroundOwner();
+
+    if (!owner || !this.ownsBackgroundWork(owner)) {
+      if (owner) this.discardPendingEnvelopes(owner);
+
+      return;
+    }
+
+    await this.drainEnvelopes(owner);
+    await this.drainSearchIndex(owner);
   }
 
   /** Index pulled resources for search, a slice at a time. Runs after the
    *  envelopes so neither holds the database worker for long. */
-  private async drainSearchIndex(): Promise<void> {
-    const clientDb = this.store.getClientDb();
+  private async drainSearchIndex(owner: {
+    clientDb: ClientDbWorker;
+    agent: ReturnType<Store['getAgent']>;
+  }): Promise<void> {
+    const clientDb = owner.clientDb;
 
-    while (clientDb?.indexPendingSearch) {
-      if (this.store.getClientDb() !== clientDb) return;
+    if (
+      !clientDb.indexPendingSearch ||
+      !(await this.waitForBackgroundOpen(owner))
+    ) {
+      return;
+    }
 
+    while (this.ownsBackgroundWork(owner)) {
       let done = 0;
 
       try {
@@ -2050,20 +2191,30 @@ export class WSClient {
         return;
       }
 
-      if (done === 0) return;
+      if (!this.ownsBackgroundWork(owner) || done === 0) return;
 
-      await new Promise(resolve => setTimeout(resolve, ENVELOPE_SLICE_GAP_MS));
+      const gap = Promise.withResolvers<void>();
+      setTimeout(gap.resolve, ENVELOPE_SLICE_GAP_MS);
+      await gap.promise;
     }
   }
 
-  private async drainEnvelopes(): Promise<void> {
-    const clientDb = this.store.getClientDb();
+  private async drainEnvelopes(owner: {
+    clientDb: ClientDbWorker;
+    agent: ReturnType<Store['getAgent']>;
+  }): Promise<void> {
+    const clientDb = owner.clientDb;
+    if (this.pendingEnvelopes.length === 0 || !clientDb.importEnvelopes) return;
 
-    while (this.pendingEnvelopes.length > 0 && clientDb?.importEnvelopes) {
-      // A different database is a different identity: what is left belongs to
-      // the one that was open, and the server can be asked for it later.
-      if (this.store.getClientDb() !== clientDb) {
-        this.pendingEnvelopes = [];
+    if (!(await this.waitForBackgroundOpen(owner))) {
+      this.discardPendingEnvelopes(owner);
+
+      return;
+    }
+
+    while (this.pendingEnvelopes.length > 0) {
+      if (!this.ownsBackgroundWork(owner)) {
+        this.discardPendingEnvelopes(owner);
 
         return;
       }
@@ -2076,7 +2227,15 @@ export class WSClient {
         console.warn('[WS] envelope import failed:', e);
       }
 
-      await new Promise(resolve => setTimeout(resolve, ENVELOPE_SLICE_GAP_MS));
+      if (!this.ownsBackgroundWork(owner)) {
+        this.discardPendingEnvelopes(owner);
+
+        return;
+      }
+
+      const gap = Promise.withResolvers<void>();
+      setTimeout(gap.resolve, ENVELOPE_SLICE_GAP_MS);
+      await gap.promise;
     }
   }
 
@@ -2084,9 +2243,10 @@ export class WSClient {
     if (!explicit && !this.canAutomaticallySyncDrive(drive)) return;
     if (this.awaitingDriveGenesis(drive)) return;
     if (this.readyState !== WebSocket.OPEN) return;
+    const clientDb = this.store.getClientDb();
     // Server-only mode (no OPFS / Web Locks): there is no local state to
     // reconcile, and computing it would only fail, once per call.
-    if (this.store.getClientDb()?.initError) return;
+    if (clientDb?.unsupportedEnvironment) return;
 
     const current = this.connectionGuard();
 
@@ -2105,6 +2265,18 @@ export class WSClient {
 
     if (!current() || this.readyState !== WebSocket.OPEN) return;
 
+    if (clientDb && !clientDb.isOpen) {
+      try {
+        const opened = await clientDb.whenOpen();
+
+        if (!opened || !current() || !clientDb.isOpen) return;
+      } catch (e) {
+        if (current()) console.warn('[WS] VV sync failed:', e);
+
+        return;
+      }
+    }
+
     const close = perfSpan('ws.computeDriveSyncState');
 
     try {
@@ -2120,6 +2292,9 @@ export class WSClient {
       const localState = await this.store.computeDriveSyncState(drive, {
         sparse,
       });
+
+      if (!current()) return;
+
       rememberDriveSize(
         drive,
         Object.keys(localState.vvs ?? localState.resources).length,
@@ -2143,6 +2318,8 @@ export class WSClient {
           ? await canonicalDriveHashV2(syncState.vvs)
           : await canonicalDriveHash(syncState.resources);
       }
+
+      if (!current()) return;
 
       close({
         resourceCount: Object.keys(syncState.vvs ?? syncState.resources).length,
@@ -2274,20 +2451,30 @@ export class WSClient {
   }) {
     const current = this.connectionGuard();
     if (!current()) return;
-    const clientDb = this.store.getClientDb();
+
+    const owner = this.captureBackgroundOwner();
 
     for (const subject of diff.remove ?? []) {
+      if (!current()) return;
+
       const envelope = diff.removeCommits?.[subject];
 
-      // The clientDb applies this as a local-cache write (no signature or
-      // rights check happens in the browser), so a failure here is a local
-      // error, not a refusal. The server already decided the subject is
-      // gone: fall through to the in-memory removal either way, otherwise
-      // the resource stays rendered and is re-listed on every reconcile.
-      if (envelope && clientDb) {
+      // The local cache is optional here: the server already decided this
+      // subject is gone, so an unavailable or refused cache must not preserve
+      // a stale in-memory resource.
+      if (
+        envelope &&
+        owner &&
+        typeof owner.clientDb.applyCommit === 'function' &&
+        (await this.waitForBackgroundOpen(owner))
+      ) {
+        if (!current() || !this.ownsBackgroundWork(owner)) return;
+
         try {
-          await clientDb.applyCommit(envelope);
+          await owner.clientDb.applyCommit(envelope);
         } catch (e) {
+          if (!current() || !this.ownsBackgroundWork(owner)) return;
+
           console.warn(
             '[WS] SYNC_DIFF remove envelope not applied:',
             subject,
@@ -2296,26 +2483,25 @@ export class WSClient {
         }
       }
 
-      if (!current()) return;
+      if (!current() || (owner && !this.ownsBackgroundWork(owner))) return;
       this.store.removeResource(subject);
     }
 
     const entries: Array<{ subject: string; loroBytes: Uint8Array }> = [];
 
     for (const remoteSubject of diff.pull) {
+      if (!current()) return;
+
       const subject = this.store.normalizeSubject(remoteSubject);
-      // F1 interim (planning/unified-sync.md): a subject with a pending
-      // outbox entry is the drain's to deliver, as a signed commit. Pushing
-      // its raw bytes here — from memory or, worse, the clientDb fallback
-      // below — would race the drain with an unsigned write. The
-      // `computeDriveSyncState` side already hides these subjects from the
-      // version vector we send; this closes the other half, where the
-      // server names them in `pull`.
+
+      // The outbox drain owns these subjects and sends signed commits; never
+      // race it with a raw Loro update from memory or the local cache.
       if (
         this.store.outbox.hasPending(subject) ||
         this.store.outbox.hasPending(remoteSubject)
-      )
+      ) {
         continue;
+      }
 
       let loroBytes: Uint8Array | undefined;
       const serverVv = diff.pullFrom?.[remoteSubject];
@@ -2325,16 +2511,23 @@ export class WSClient {
         loroBytes = Resource.exportLoroBytesForSync(memDoc, serverVv);
       }
 
-      if ((!loroBytes || loroBytes.length === 0) && clientDb) {
-        try {
-          const stored = await clientDb.getLoroSnapshot(subject);
-          if (!current()) return;
+      if (
+        (!loroBytes || loroBytes.length === 0) &&
+        owner &&
+        typeof owner.clientDb.getLoroSnapshot === 'function' &&
+        (await this.waitForBackgroundOpen(owner))
+      ) {
+        if (!current() || !this.ownsBackgroundWork(owner)) return;
 
-          if (stored && stored.length > 0) {
-            loroBytes = stored;
-          }
-        } catch {
-          // skip
+        try {
+          const stored = await owner.clientDb.getLoroSnapshot(subject);
+
+          if (!current() || !this.ownsBackgroundWork(owner)) return;
+          if (stored && stored.length > 0) loroBytes = stored;
+        } catch (e) {
+          if (!current() || !this.ownsBackgroundWork(owner)) return;
+
+          console.warn('[WS] SYNC_DIFF snapshot lookup failed:', subject, e);
         }
       }
 
@@ -2346,16 +2539,32 @@ export class WSClient {
     if (!current()) return;
 
     if (entries.length > 0) {
-      // Our retained envelopes ride with the snapshots, so the server can
-      // attribute history it never saw applied live.
-      const envelopes = clientDb
-        ? await clientDb.envelopesFor(entries.map(e => e.subject))
-        : {};
-      if (!current()) return;
+      // Retained signed envelopes let the server attribute history that it
+      // never saw applied live. This is an optional mirror lookup; if local
+      // storage is refused, the online SYNC_PUSH still proceeds without it.
+      let envelopes: Record<string, string[]> = {};
 
-      if (this.readyState !== WebSocket.OPEN) {
-        return;
+      if (
+        owner &&
+        typeof owner.clientDb.envelopesFor === 'function' &&
+        (await this.waitForBackgroundOpen(owner))
+      ) {
+        if (!current() || !this.ownsBackgroundWork(owner)) return;
+
+        try {
+          envelopes = await owner.clientDb.envelopesFor(
+            entries.map(entry => entry.subject),
+          );
+
+          if (!current() || !this.ownsBackgroundWork(owner)) return;
+        } catch (e) {
+          if (!current() || !this.ownsBackgroundWork(owner)) return;
+
+          console.warn('[WS] SYNC_DIFF envelope lookup failed:', e);
+        }
       }
+
+      if (!current() || this.readyState !== WebSocket.OPEN) return;
 
       try {
         for (const frame of encodeSyncPushChunks(
@@ -2375,8 +2584,11 @@ export class WSClient {
       }
     }
 
-    // If server has nothing to push, sync is done
-    if (diff.push.length === 0) {
+    if (
+      current() &&
+      (!owner || this.ownsBackgroundWork(owner)) &&
+      diff.push.length === 0
+    ) {
       this.store.finishDriveSync(
         this.store.normalizeSubject(diff.drive),
         entries.length,
@@ -2394,6 +2606,7 @@ export class WSClient {
     const { signal } = this.connection;
     const agent = this.store.getAgent()?.subject;
     const drive = this.store.getDrive();
+    const clientDb = this.store.getClientDb();
     const authenticatedWith = this.authenticatedWith;
 
     return () =>
@@ -2401,6 +2614,7 @@ export class WSClient {
       this.readyState === WebSocket.OPEN &&
       this.store.getAgent()?.subject === agent &&
       this.store.getDrive() === drive &&
+      this.store.getClientDb() === clientDb &&
       this.authenticatedWith === authenticatedWith;
   }
 
@@ -2413,7 +2627,35 @@ export class WSClient {
     return match?.[1] ?? this.store.getDrive() ?? '';
   }
 
-  private async checkForMissingBlobs(resource: Resource) {
+  /** Blob work is optional, but a slow open must not discard a useful pull. */
+  private async withBlobCache(
+    work: (clientDb: ClientDbWorker, current: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    const clientDb = this.store.getClientDb();
+    const agent = this.store.getAgent();
+    const current = () =>
+      this.store.getClientDb() === clientDb && this.store.getAgent() === agent;
+
+    if (!clientDb || clientDb.unsupportedEnvironment || !current()) return;
+
+    try {
+      if (!clientDb.isOpen) {
+        const opened = await clientDb.whenOpen();
+
+        if (!opened || !current()) return;
+      }
+
+      if (!clientDb.isOpen || !current()) return;
+
+      await work(clientDb, current);
+    } catch (error) {
+      if (!(error instanceof RequestCancelledError)) {
+        console.warn('[WS] blob cache operation failed:', error);
+      }
+    }
+  }
+
+  private checkForMissingBlobs(resource: Resource): void {
     const blobDid = resource.get(BLOB) as string | undefined;
 
     if (!blobDid) return;
@@ -2422,17 +2664,16 @@ export class WSClient {
     const hashStr = isBlobSubject(blobDid)
       ? blobDid.replace(/^(atomic:blob:|did:ad:blob:)/, '')
       : blobDid;
+    const connected = this.connectionGuard();
 
-    const clientDb = this.store.getClientDb();
-
-    if (clientDb) {
+    void this.withBlobCache(async (clientDb, current) => {
       const hash = hexToBytes(hashStr);
       const exists = await clientDb.getBlob(hash);
 
-      if (!exists) {
+      if (current() && connected() && !exists) {
         this.sendBinary(encodeBlobRequest(hash));
       }
-    }
+    });
   }
 
   private tagListeners = new Map<number, () => void>();

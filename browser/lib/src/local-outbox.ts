@@ -99,9 +99,11 @@ export interface OutboxEntry {
    *  never fix (e.g. `401 Unauthorized` — the agent lacks write rights on the
    *  target parent). A blocked entry stays in the outbox so it stays visible to
    *  the user ("could not sync"), but the drain stops retrying it and the
-   *  scheduler stops waking for it. Cleared by `markDirty` — a fresh local edit
-   *  is a new signal worth re-attempting (rights may have since been granted). */
+   *  scheduler stops waking for it. `markDirty` re-arms ordinary refusals; an
+   *  owner-mode refusal remains parked until an explicit server change. */
   blocked?: boolean;
+  /** Narrow durable discriminator for owner-policy parking; never stores response text. */
+  ownerPolicyBlocked?: true;
   /** Set once a finished drive resync has re-armed this entry after the server
    *  refused it for a missing parent. One automatic re-arm per entry: if the
    *  resync did not deliver the parent, a second block is final until the next
@@ -489,6 +491,7 @@ interface PersistedEntry {
   signedGenesis?: unknown;
   signedDestroy?: unknown;
   baseVersion?: string;
+  ownerPolicyBlocked?: true;
 }
 
 export class LocalOutbox {
@@ -655,6 +658,11 @@ export class LocalOutbox {
         live.signedGenesis ??= stored.signedGenesis;
         live.signedDestroy ??= stored.signedDestroy;
         live.baseVersion ??= stored.baseVersion;
+
+        if (stored.ownerPolicyBlocked) {
+          live.blocked = true;
+          live.ownerPolicyBlocked = true;
+        }
       } else {
         this.entries.set(stored.subject, stored);
         added.push(stored);
@@ -680,10 +688,10 @@ export class LocalOutbox {
       console.warn('[Outbox] importing the queue into the database failed:', e);
     }
 
-    if (generation === this.bindGeneration) {
-      this.setHydrated(true);
-      this.onChange();
-    }
+    if (generation !== this.bindGeneration || this.database !== db) return [];
+
+    this.setHydrated(true);
+    this.onChange();
 
     return added;
   }
@@ -741,17 +749,27 @@ export class LocalOutbox {
    */
   async recordOfflineSave(
     subject: string,
-    opts: { baseVersion?: string; dirty: boolean },
+    opts: {
+      baseVersion?: string;
+      dirty: boolean;
+      signedGenesis?: Commit;
+    },
     persist: (outbox: ClientDbOutboxWrite | undefined) => Promise<boolean>,
+    stillCurrent?: () => boolean,
   ): Promise<void> {
     const existing = this.entries.get(subject);
+    const signedGenesis = existing?.signedGenesis ?? opts.signedGenesis;
     const willExist =
       !isCommitSubject(subject) &&
-      (!!existing || opts.dirty || opts.baseVersion !== undefined);
+      (!!existing ||
+        opts.dirty ||
+        opts.baseVersion !== undefined ||
+        signedGenesis !== undefined);
     const staged: OutboxEntry | undefined = willExist
       ? {
           ...(existing ?? { subject, enqueuedAt: Date.now() }),
           baseVersion: existing?.baseVersion ?? opts.baseVersion,
+          signedGenesis,
         }
       : undefined;
     const db = this.database;
@@ -763,21 +781,69 @@ export class LocalOutbox {
 
     const wrote = await persist(write);
 
+    if (stillCurrent && !stillCurrent()) {
+      throw new RequestCancelledError(
+        'Identity changed during offline snapshot persistence',
+      );
+    }
+
     // Apply through the public mutators, so a wrapped `markDirty` (the AI
     // review hold) still decides whether the subject is queued.
     if (
       staged &&
       !this.entries.has(subject) &&
-      opts.baseVersion !== undefined
+      (opts.baseVersion !== undefined || signedGenesis !== undefined)
     ) {
       this.entries.set(subject, { subject, enqueuedAt: staged.enqueuedAt });
     }
 
-    if (opts.baseVersion !== undefined) {
-      this.setBaseVersion(subject, opts.baseVersion);
+    if (signedGenesis && !existing?.signedGenesis) {
+      if (stillCurrent && !stillCurrent()) {
+        throw new RequestCancelledError(
+          'Identity changed during offline snapshot persistence',
+        );
+      }
+
+      this.setGenesisCommit(subject, signedGenesis);
+
+      if (stillCurrent && !stillCurrent()) {
+        throw new RequestCancelledError(
+          'Identity changed during offline snapshot persistence',
+        );
+      }
     }
 
-    if (opts.dirty) this.markDirty(subject);
+    if (opts.baseVersion !== undefined) {
+      if (stillCurrent && !stillCurrent()) {
+        throw new RequestCancelledError(
+          'Identity changed during offline snapshot persistence',
+        );
+      }
+
+      this.setBaseVersion(subject, opts.baseVersion);
+
+      if (stillCurrent && !stillCurrent()) {
+        throw new RequestCancelledError(
+          'Identity changed during offline snapshot persistence',
+        );
+      }
+    }
+
+    if (opts.dirty) {
+      if (stillCurrent && !stillCurrent()) {
+        throw new RequestCancelledError(
+          'Identity changed during offline snapshot persistence',
+        );
+      }
+
+      this.markDirty(subject);
+
+      if (stillCurrent && !stillCurrent()) {
+        throw new RequestCancelledError(
+          'Identity changed during offline snapshot persistence',
+        );
+      }
+    }
 
     if (wrote && value !== undefined && this.database === db) {
       this.written.set(subject, value);
@@ -793,12 +859,19 @@ export class LocalOutbox {
 
     if (existing) {
       // Already dirty; bump enqueuedAt only if it was never set (recovery).
-      // A fresh edit re-arms a blocked entry: clear the block and the failure
-      // streak so the next drain re-attempts (rights may now be granted).
+      // A fresh edit re-arms ordinary blocked entries, but cannot change an
+      // owner-mode server's policy about hosting new Drives.
       if (existing.blocked) {
-        existing.blocked = false;
-        existing.failures = 0;
-        existing.rearmedAfterResync = false;
+        if (
+          existing.ownerPolicyBlocked ||
+          isOwnerModeWorkspaceRefusal(existing.lastAttemptError)
+        ) {
+          existing.ownerPolicyBlocked = true;
+        } else {
+          existing.blocked = false;
+          existing.failures = 0;
+          existing.rearmedAfterResync = false;
+        }
       }
 
       this.changed(subject);
@@ -837,6 +910,30 @@ export class LocalOutbox {
       entry.blocked = false;
       entry.failures = 0;
       entry.rearmedAfterResync = true;
+      rearmed++;
+      this.changed(entry.subject);
+    }
+
+    return rearmed;
+  }
+
+  /** Re-arm owner-mode refusals only after an explicit server change. */
+  rearmOwnerModeBlocked(): number {
+    let rearmed = 0;
+
+    for (const entry of this.entries.values()) {
+      if (
+        !entry.blocked ||
+        (!entry.ownerPolicyBlocked &&
+          !isOwnerModeWorkspaceRefusal(entry.lastAttemptError))
+      ) {
+        continue;
+      }
+
+      entry.blocked = false;
+      entry.failures = 0;
+      entry.rearmedAfterResync = false;
+      entry.ownerPolicyBlocked = undefined;
       rearmed++;
       this.changed(entry.subject);
     }
@@ -910,6 +1007,7 @@ export class LocalOutbox {
     if (entry.blocked) {
       entry.blocked = false;
       entry.failures = 0;
+      entry.ownerPolicyBlocked = undefined;
     }
 
     this.entries.set(subject, entry);
@@ -1157,6 +1255,7 @@ export class LocalOutbox {
           // This refusal cannot change through a retry: the node's owner chose
           // not to host new workspaces. Keep the edit but wait for user action.
           live.blocked = true;
+          live.ownerPolicyBlocked = true;
           ctx.onBlocked?.(live, e);
         } else {
           // Back off and retry. This includes BLOCKING-classified errors
@@ -1418,6 +1517,7 @@ function toPersisted(e: OutboxEntry): PersistedEntry {
       ? commitToJsonADObject(e.signedDestroy)
       : undefined,
     baseVersion: e.baseVersion,
+    ownerPolicyBlocked: e.ownerPolicyBlocked,
   };
 }
 
@@ -1473,6 +1573,8 @@ function parseEntry(p: unknown): OutboxEntry | undefined {
     signedDestroy,
     baseVersion:
       typeof obj.baseVersion === 'string' ? obj.baseVersion : undefined,
+    blocked: obj.ownerPolicyBlocked === true ? true : undefined,
+    ownerPolicyBlocked: obj.ownerPolicyBlocked === true ? true : undefined,
   };
 }
 

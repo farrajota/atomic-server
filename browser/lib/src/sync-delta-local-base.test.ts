@@ -1,7 +1,15 @@
-import { beforeAll, describe, it, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  describe,
+  expect as vitestExpect,
+  it,
+  vi,
+} from 'vitest';
 import { Store } from './store.js';
 import { LoroLoader } from './loro-loader.js';
 import { commits, core } from './index.js';
+import { testStore } from './test-store.js';
 
 /**
  * #1905. A local query hands back JSON-AD, not snapshots, so the resources it
@@ -69,6 +77,8 @@ function storeWith(json: string, local: Uint8Array) {
 
   store.setClientDb({
     isReady: true,
+    isOpen: true,
+    whenOpen: async () => true,
     waitForReady: async () => true,
     waitForInit: async () => true,
     flush: async () => undefined,
@@ -95,6 +105,130 @@ function storeWith(json: string, local: Uint8Array) {
 const settle = () => new Promise(resolve => setTimeout(resolve, 20));
 
 describe('a sync delta for a resource with no local Loro history', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ['worker', 'readiness'],
+    ['worker', 'snapshot'],
+    ['agent', 'readiness'],
+    ['agent', 'snapshot'],
+  ] as const)(
+    'abandons local-base repair after %s changes during %s',
+    async (replacement, phase) => {
+      const { json, local, delta } = history();
+      const { store, writes, asked } = storeWith(json, local);
+      const { store: signedIn } = await testStore();
+      store.setAgent(signedIn.getAgent());
+      const ready = Promise.withResolvers<boolean>();
+      const reading = Promise.withResolvers<{
+        jsonAd: string;
+        snapshot: Uint8Array;
+      }>();
+      const reached = Promise.withResolvers<void>();
+      const db = store.getClientDb()!;
+      Object.assign(db, {
+        isReady: phase !== 'readiness',
+        waitForReady: vi.fn(() => {
+          reached.resolve();
+
+          return ready.promise;
+        }),
+        getResourceWithSnapshot: vi.fn(() => {
+          reached.resolve();
+
+          return reading.promise;
+        }),
+      });
+      store.hydrateResourceFromJsonAd(SUBJECT, json);
+      vi.useFakeTimers();
+      store.applyIncoming({
+        subject: SUBJECT,
+        loroBytes: delta,
+        source: 'ws-sync-push',
+      });
+      await reached.promise;
+      const nextWrite = vi.fn().mockResolvedValue(undefined);
+
+      if (replacement === 'worker') {
+        store.setClientDb({
+          isOpen: true,
+          isReady: true,
+          waitForInit: async () => true,
+          putResourceWithSnapshot: nextWrite,
+        } as never);
+      } else {
+        store.setAgent(undefined);
+      }
+
+      ready.resolve(true);
+      reading.resolve({ jsonAd: json, snapshot: local });
+      await vi.advanceTimersByTimeAsync(0);
+      vitestExpect(store.resources.get(SUBJECT)?.get(RENDERS)).not.toEqual([
+        OWN,
+        TXN,
+      ]);
+      vitestExpect(writes).toEqual([]);
+      vitestExpect(nextWrite).not.toHaveBeenCalled();
+      vitestExpect(asked).toEqual([]);
+
+      if (phase === 'readiness')
+        vitestExpect(db.getResourceWithSnapshot).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps the replacement session repair when the outgoing read settles first', async () => {
+    const { json, local, delta } = history();
+    const { store, writes, asked } = storeWith(json, local);
+    const outgoing = Promise.withResolvers<{
+      jsonAd: string;
+      snapshot: Uint8Array;
+    }>();
+    const incoming = Promise.withResolvers<{
+      jsonAd: string;
+      snapshot: Uint8Array;
+    }>();
+    const oldRead = vi
+      .spyOn(store.getClientDb()!, 'getResourceWithSnapshot')
+      .mockReturnValue(outgoing.promise);
+    const nextRead = vi.fn(() => incoming.promise);
+    const nextWrite = vi.fn().mockResolvedValue(undefined);
+    store.hydrateResourceFromJsonAd(SUBJECT, json);
+    vi.useFakeTimers();
+    store.applyIncoming({
+      subject: SUBJECT,
+      loroBytes: delta,
+      source: 'ws-sync-push',
+    });
+    vitestExpect(oldRead).toHaveBeenCalledOnce();
+    store.setClientDb({
+      isOpen: true,
+      isReady: true,
+      waitForInit: async () => true,
+      getResourceWithSnapshot: nextRead,
+      putResourceWithSnapshot: nextWrite,
+    } as never);
+    store.applyIncoming({
+      subject: SUBJECT,
+      loroBytes: delta,
+      source: 'ws-sync-push',
+    });
+    vitestExpect(nextRead).toHaveBeenCalledOnce();
+    outgoing.resolve({ jsonAd: json, snapshot: local });
+    await vi.advanceTimersByTimeAsync(0);
+    vitestExpect(nextWrite).not.toHaveBeenCalled();
+    incoming.resolve({ jsonAd: json, snapshot: local });
+    await vi.advanceTimersByTimeAsync(0);
+    vitestExpect(store.resources.get(SUBJECT)?.get(RENDERS)).toEqual([
+      OWN,
+      TXN,
+    ]);
+    vitestExpect(nextWrite).toHaveBeenCalledOnce();
+    vitestExpect(writes).toEqual([]);
+    vitestExpect(asked).toEqual([]);
+  });
   it('does not write a doc rebuilt from JSON-AD back to the local database', async ({
     expect,
   }) => {

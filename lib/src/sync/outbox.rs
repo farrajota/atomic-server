@@ -765,6 +765,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_store_closes_after_its_last_db_clone() {
+        let dir = std::env::temp_dir().join(format!(
+            "atomic-outbox-clone-close-{}-{}",
+            std::process::id(),
+            crate::utils::random_string(6)
+        ));
+        let uploads = dir.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let device = Db::init_redb_file(&dir, Some("https://localhost".into()), &uploads)
+            .await
+            .unwrap();
+        let agent = device.create_agent(None).await.unwrap();
+        device.set_default_agent(agent.clone());
+        let drive = device.create_drive("Clone close").await.unwrap();
+        let subject = device
+            .create_resource(urls::FOLDER, &drive, "persisted", None)
+            .await
+            .unwrap();
+        let last_clone = device.clone();
+
+        drop(device);
+        assert!(last_clone
+            .get_resource(&subject.as_str().into())
+            .await
+            .is_ok());
+        drop(last_clone);
+
+        let reopened = Db::init_redb_file(&dir, Some("https://localhost".into()), &uploads)
+            .await
+            .unwrap();
+        let persisted = reopened
+            .get_resource(&subject.as_str().into())
+            .await
+            .unwrap();
+        assert_eq!(persisted.get_subject().pure_id(), subject);
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn outboxes_are_scoped_to_the_signing_agent() {
         let device = Db::init_temp("outbox_scope").await.unwrap();
         let (alice, drive) = device.setup("Alice").await.unwrap();

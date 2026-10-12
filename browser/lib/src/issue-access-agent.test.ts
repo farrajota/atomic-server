@@ -11,7 +11,7 @@ import {
 import { core } from './ontologies/core.js';
 import { dataBrowser } from './ontologies/dataBrowser.js';
 import { server } from './ontologies/server.js';
-import { testStore } from './test-store.js';
+import { attachSnapshotDb, testStore } from './test-store.js';
 
 async function createWorkspace(
   store: Awaited<ReturnType<typeof testStore>>['store'],
@@ -311,6 +311,7 @@ describe('an issued agent queued while offline', () => {
     const drive = await createWorkspace(store, agentDID, 'Apps');
 
     store.setServerConnected(false);
+    const { rows } = attachSnapshotDb(store);
 
     const folder = await store.newResource({
       parent: drive.subject,
@@ -325,6 +326,9 @@ describe('an issued agent queued while offline', () => {
       targets: [drive.subject],
       parent: folder.subject,
     });
+
+    expect(rows.get(folder.subject)?.snapshot?.length).toBeGreaterThan(0);
+    expect(rows.get(issued.subject)?.snapshot?.length).toBeGreaterThan(0);
 
     // A server that knows only what it has been sent.
     const created = new Set<string>([drive.subject]);

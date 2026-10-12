@@ -5,7 +5,11 @@
  * The WASM module URL is passed as the first message after creation.
  */
 
-import { openClientDb, isStorageBlockedDbError } from './client-db-open.js';
+import {
+  openClientDb,
+  isStorageBlockedDbError,
+  STORAGE_BLOCKED_MARKER,
+} from './client-db-open.js';
 import { wasmBinaryUrl } from './wasm-url.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -42,6 +46,12 @@ export type WorkerRequest =
       migrateLegacy?: boolean;
       /** Allow discarding an undecryptable `dbName`; see `client-db-open.ts`. */
       discardUndecryptable?: boolean;
+      /**
+       * Drives that exist only in this browser (`Store.registerLocalOnlyDrive`).
+       * Chat messages are moved into chat log pages for these alone; a drive a
+       * server hosts gets its pages from the server.
+       */
+      localOnlyDrives?: string[];
     }
   | { id: number; type: 'getResource'; subject: string }
   | { id: number; type: 'getResourceWithSnapshot'; subject: string }
@@ -138,6 +148,7 @@ export type WorkerRequest =
       checkpointN: number;
       driveHasCheckpoint: boolean;
       observedLanes: Record<string, number>;
+      currentStateOnly?: boolean;
     }
   | {
       id: number;
@@ -211,6 +222,7 @@ async function handleMessage(msg: WorkerRequest): Promise<unknown> {
         msg.dbKey,
         msg.migrateLegacy,
         msg.discardUndecryptable,
+        msg.localOnlyDrives,
       );
 
       return await initPromise;
@@ -506,6 +518,7 @@ async function handleMessage(msg: WorkerRequest): Promise<unknown> {
         BigInt(msg.checkpointN),
         msg.driveHasCheckpoint,
         msg.observedLanes,
+        msg.currentStateOnly ?? false,
       );
     }
 
@@ -619,6 +632,31 @@ export interface ClientDbInitTimings {
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+function storageCapabilityRefusal(error: unknown): Error | undefined {
+  if (isStorageBlockedDbError(error)) {
+    if (
+      error instanceof Error &&
+      error.message.includes(STORAGE_BLOCKED_MARKER)
+    ) {
+      return error;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+
+    return new Error(
+      `OPFS unavailable [${STORAGE_BLOCKED_MARKER}]: ${message}`,
+    );
+  }
+
+  if (error instanceof Error && error.name === 'SecurityError') {
+    return new Error(
+      `OPFS unavailable [${STORAGE_BLOCKED_MARKER}]: ${error.message}`,
+    );
+  }
+
+  return undefined;
+}
+
 async function doInit(
   wasmUrl: string,
   wasmModule: WebAssembly.Module | undefined,
@@ -627,6 +665,7 @@ async function doInit(
   dbKey?: Uint8Array,
   migrateLegacy?: boolean,
   discardUndecryptable?: boolean,
+  localOnlyDrives?: string[],
 ): Promise<ClientDbInitTimings> {
   // Dynamic import of the WASM glue code.
   // The URL should point to the directory containing atomic_wasm.js and atomic_wasm_bg.wasm
@@ -641,20 +680,19 @@ async function doInit(
   const t2 = performance.now();
 
   // One-time migration of the legacy shared DB file into the per-agent
-  // `dbName`. Must run BEFORE `ClientDb.open` takes the OPFS handle. A failed
-  // migration must not block opening the new DB — the legacy file is left in
-  // place for a later attempt.
+  // `dbName`. Must run BEFORE `ClientDb.open` takes the OPFS handle. Ordinary
+  // migration failures leave the legacy file for a later attempt, but a
+  // storage-capability refusal means opening another file cannot succeed.
   if (migrateLegacy && dbName && dbName !== 'atomic_data.redb') {
     try {
       await wasm.migrateLegacyClientDb(dbName, dbKey ?? undefined);
     } catch (e) {
-      // When the browser is withholding storage there is no legacy file to
-      // migrate and never will be, so this failure is expected and says
-      // nothing the open below won't say better. Staying quiet here avoids
-      // reporting the same condition twice, with a stack trace, per load.
-      if (!isStorageBlockedDbError(e)) {
-        console.warn('[ClientDb] legacy DB migration failed:', e);
-      }
+      const refusal = storageCapabilityRefusal(e);
+      if (refusal) throw refusal;
+
+      // An ordinary legacy migration failure does not block opening the new
+      // per-agent database; the shared file remains intact.
+      console.warn('[ClientDb] legacy DB migration failed:', e);
     }
   }
 
@@ -672,6 +710,7 @@ async function doInit(
   });
   db = opened.db;
   await migrateIndexKeys(db);
+  await migrateMessages(db, localOnlyDrives ?? []);
   const t3 = performance.now();
 
   return {
@@ -707,6 +746,59 @@ async function migrateIndexKeys(opened: WasmModule): Promise<void> {
     if (step.finished) return;
 
     // Let the worker answer other messages (they queue behind `init`).
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+}
+
+/** Messages the chat migration handles per slice (whole chats at a time). */
+const MESSAGE_MIGRATION_SLICE = 500;
+
+/**
+ * Moves old chat messages into chat log pages (`planning/chat-log.md`): the
+ * `Message` resources of group chats and comments, then the `ai-message`
+ * resources of AI chats. Pages are written for the drives that exist only in
+ * this browser; for a drive a server hosts the server makes them and this only
+ * drops cached messages that already have their entry. Progress goes to the page
+ * as `migration-progress` messages, like the index rebuild. Runs inside
+ * `init`.
+ */
+async function migrateMessages(
+  opened: WasmModule,
+  localOnlyDrives: string[],
+): Promise<void> {
+  const drives = JSON.stringify(localOnlyDrives);
+
+  await runChatMigration(opened.messageMigrationPending?.(), () =>
+    opened.migrateMessagesStep(MESSAGE_MIGRATION_SLICE, drives),
+  );
+  await runChatMigration(opened.aiChatMigrationPending?.(), () =>
+    opened.migrateAiChatsStep(MESSAGE_MIGRATION_SLICE, drives),
+  );
+}
+
+async function runChatMigration(
+  pending: boolean | undefined,
+  step: () => Promise<string>,
+): Promise<void> {
+  if (!pending) return;
+
+  const report = (done: number, total: number, finished: boolean) =>
+    self.postMessage({
+      type: 'migration-progress',
+      phase: 'messages',
+      done,
+      total,
+      finished,
+    });
+
+  report(0, 0, false);
+
+  for (;;) {
+    const result = JSON.parse(await step());
+    report(result.done, result.total, result.finished);
+
+    if (result.finished) return;
+
     await new Promise(resolve => setTimeout(resolve, 0));
   }
 }

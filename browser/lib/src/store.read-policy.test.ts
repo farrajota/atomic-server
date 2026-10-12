@@ -1,4 +1,4 @@
-import { describe, it, vi, afterEach } from 'vitest';
+import { describe, expect as vitestExpect, it, vi, afterEach } from 'vitest';
 import { enableLoro } from './loro-loader.js';
 import { Resource } from './resource.js';
 import {
@@ -8,6 +8,7 @@ import {
 } from './error.js';
 import { testStore } from './test-store.js';
 import type { Store } from './store.js';
+import { RequestCancelledError } from './error.js';
 
 /**
  * One read policy for every caller: memory, then the embedded database, then
@@ -19,7 +20,10 @@ import type { Store } from './store.js';
 const NAME = 'https://atomicdata.dev/properties/name';
 const IS_A = 'https://atomicdata.dev/properties/isA';
 
-function row(subject: string, name: string) {
+function row(
+  subject: string,
+  name: string,
+): { jsonAd: string; snapshot: Uint8Array | null } {
   return {
     jsonAd: JSON.stringify({
       '@id': subject,
@@ -42,8 +46,10 @@ function fakeDb(
   const calls: string[][] = [];
   const db = {
     isReady: true,
+    isOpen: true,
+    whenOpen: async () => true,
     isInitialized: true,
-    waitForInit: async () => undefined,
+    waitForInit: async () => true,
     waitForReady: async () => true,
     getResourceWithSnapshot: async (subject: string) => {
       calls.push([subject]);
@@ -57,7 +63,13 @@ function fakeDb(
 
       return subjects.map(s => rows[s] ?? { jsonAd: null, snapshot: null });
     },
-    putResourceWithSnapshot: async () => undefined,
+    putResourceWithSnapshot: async (
+      subject: string,
+      jsonAd: string,
+      snapshot?: Uint8Array,
+    ) => {
+      rows[subject] = { jsonAd, snapshot: snapshot ?? null };
+    },
     putResource: async () => undefined,
     removeResource: async () => undefined,
     flush: async () => undefined,
@@ -217,6 +229,74 @@ describe('store read policy', () => {
     // One bulk read for the misses in memory, then only the true miss on the wire.
     expect(calls).toEqual([['atomic:a', 'atomic:b', 'atomic:c']]);
     expect(socket.fetchMany).toHaveBeenCalledWith(['atomic:c']);
+  });
+  it.each([
+    ['worker', 'readiness'],
+    ['worker', 'snapshot'],
+    ['agent', 'readiness'],
+    ['agent', 'snapshot'],
+  ] as const)(
+    'cancels local-only refresh after %s changes during %s',
+    async (replacement, phase) => {
+      await enableLoro();
+      const { store } = await testStore();
+      const subject = 'atomic:local-refresh-owner';
+      store.registerLocalOnlyDrive(subject);
+      const ready = Promise.withResolvers<boolean>();
+      const reading = Promise.withResolvers<{
+        jsonAd: string;
+        snapshot: Uint8Array | null;
+      }>();
+      const { db } = fakeDb({});
+      Object.assign(db!, {
+        isReady: phase !== 'readiness',
+        waitForReady: vi.fn(() => ready.promise),
+        getResourceWithSnapshot: vi.fn(() => reading.promise),
+      });
+      store.setClientDb(db);
+      const refresh = store.fetchResourceFromServer(subject);
+      const cancelled = vitestExpect(refresh).rejects.toBeInstanceOf(
+        RequestCancelledError,
+      );
+
+      await vi.waitFor(() =>
+        vitestExpect(
+          phase === 'readiness'
+            ? db!.waitForReady
+            : db!.getResourceWithSnapshot,
+        ).toHaveBeenCalled(),
+      );
+      const { db: next } = fakeDb({});
+      const writes = vi.spyOn(next!, 'putResourceWithSnapshot');
+
+      if (replacement === 'worker') store.setClientDb(next);
+      else store.setAgent(undefined);
+
+      ready.resolve(true);
+      reading.resolve(row(subject, 'Outgoing private state'));
+      await cancelled;
+      vitestExpect(store.resources.get(subject)?.get(NAME)).toBeUndefined();
+      vitestExpect(writes).not.toHaveBeenCalled();
+
+      if (phase === 'readiness')
+        vitestExpect(db!.getResourceWithSnapshot).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refreshes a cold local-only resource from its current database', async ({
+    expect,
+  }) => {
+    await enableLoro();
+    const { store } = await testStore();
+    const subject = 'atomic:local-refresh-current';
+    store.registerLocalOnlyDrive(subject);
+    const { db } = fakeDb({ [subject]: row(subject, 'Current local state') });
+    store.setClientDb(db);
+
+    const resource = await store.fetchResourceFromServer(subject);
+
+    expect(resource.get(NAME)).toBe('Current local state');
+    expect(store.resources.get(subject)).toBe(resource);
   });
 });
 

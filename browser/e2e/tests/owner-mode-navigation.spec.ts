@@ -24,8 +24,10 @@ import {
   expect,
   type BrowserContext,
   type Page,
+  type Request,
   type TestInfo,
 } from '@playwright/test';
+import { driveToPkarrKey, PKARR_RELAY_URL } from '@tomic/lib';
 import {
   installAbsentLocalOllama,
   installEmptyDiscoveryRoom,
@@ -49,13 +51,59 @@ type ScenarioDiagnostic = {
   message: string;
   url?: string;
   status?: number;
+  method?: string;
   expected?: boolean;
+  classification?:
+    | 'initial-public-drive-relay-404'
+    | 'same-subject-owner-mode-outbox-refusal'
+    | 'same-subject-owner-mode-refusal-notification';
   operation?: 'SUB' | 'SYNC';
   resource?: string;
   principal?: string | null;
   socket?: number;
   document?: number;
 };
+
+type ScenarioDiagnosticExpectations = {
+  publicHomeDrive?: string;
+  ownerModeRefusal?: {
+    subject: string;
+    result: string;
+    guidanceText: string;
+    document?: number;
+  };
+};
+
+type OwnerNavWorkerPhase = 'started' | 'getDirectory-denied';
+type OwnerNavWorkerOutcome = {
+  documentId: string;
+  workerId: number;
+  phase: OwnerNavWorkerPhase;
+};
+type OwnerNavWorkerState = {
+  documentId: string;
+  latestWorkerId: number;
+  outcomes: OwnerNavWorkerOutcome[];
+};
+type OwnerNavWorkerEvidence = {
+  documentId: string;
+  workerId: number;
+  phases: OwnerNavWorkerPhase[];
+};
+type OwnerNavWorkerBoundary =
+  | 'initial-root'
+  | 'sign-in-root'
+  | 'owner-identity'
+  | 'public-resource'
+  | 'reload';
+type OwnerNavWorkerProvenance = OwnerNavWorkerEvidence & {
+  boundary: OwnerNavWorkerBoundary;
+};
+
+// Named wire oracle matches lib/src/ws-v2.ts Tag without importing SDK source
+// outside the e2e project. AUTH_OK acknowledges this socket's preceding AUTH;
+// its optional payload is capabilities, not an identity or success object.
+const ownerNavAuthWireTag = { AUTH: 0x01, AUTH_OK: 0x02 } as const;
 
 const manifestPath = process.env.ATOMIC_NAV_FIXTURE;
 const identitiesPath = process.env.ATOMIC_NAV_IDENTITIES;
@@ -253,9 +301,12 @@ async function expectIdentityUnlocked(page: Page, role: Role) {
   const identity = identities?.identities[role];
   if (!identity) throw new Error(`Missing runtime identity for ${role}.`);
   await expect
-    .poll(() => page.evaluate(() => window.store.getAgent()?.subject ?? null), {
-      timeout: 30_000,
-    })
+    .poll(
+      () => page.evaluate(() => window.store?.getAgent()?.subject ?? null),
+      {
+        timeout: 30_000,
+      },
+    )
     .toBe(identity.subject);
 }
 
@@ -268,14 +319,60 @@ function routeUrl(key: string, host?: string) {
   return url.toString();
 }
 
-async function signIn(page: Page, role: Role) {
+async function signIn(page: Page, role: Role, afterRoot?: () => Promise<void>) {
   const secret = identities?.identities[role].secret;
   if (!secret) throw new Error(`Missing runtime identity for ${role}.`);
   await safeNavigation(() => page.goto(routeUrl('root')));
   await expectStoreReady(page);
+  await afterRoot?.();
   await openSignIn(page);
   await fillSecret(page, secret);
   await expectIdentityUnlocked(page, role);
+}
+
+async function expectCurrentOpfsWorkerDenial(
+  page: Page,
+  boundary: OwnerNavWorkerBoundary,
+  provenance: OwnerNavWorkerProvenance[],
+) {
+  const observation: { latest: OwnerNavWorkerEvidence | null } = {
+    latest: null,
+  };
+  await expect
+    .poll(
+      async () => {
+        observation.latest = await page.evaluate(() => {
+          const state = (
+            window as Window & { ownerNavOpfs?: OwnerNavWorkerState }
+          ).ownerNavOpfs;
+          if (!state || state.latestWorkerId <= 0) return null;
+          const outcomes = state.outcomes.filter(
+            outcome =>
+              outcome.documentId === state.documentId &&
+              outcome.workerId === state.latestWorkerId,
+          );
+
+          const phases: OwnerNavWorkerPhase[] = [];
+          if (outcomes.some(outcome => outcome.phase === 'started'))
+            phases.push('started');
+          if (outcomes.some(outcome => outcome.phase === 'getDirectory-denied'))
+            phases.push('getDirectory-denied');
+
+          return {
+            documentId: state.documentId,
+            workerId: state.latestWorkerId,
+            phases,
+          };
+        });
+
+        return observation.latest?.phases ?? [];
+      },
+      { timeout: 30_000 },
+    )
+    .toEqual(expect.arrayContaining(['started', 'getDirectory-denied']));
+  const latest = observation.latest;
+  if (!latest) throw new Error('Current OPFS worker evidence disappeared.');
+  provenance.push({ boundary, ...latest });
 }
 
 async function visitAs(
@@ -420,6 +517,7 @@ function watchDiagnostics(page: Page, expectedErrors: RegExp[] = []) {
   const entries: ScenarioDiagnostic[] = [];
   const seenErrors = new Set<string>();
   let document = 0;
+  const requestDocuments = new WeakMap<Request, number>();
 
   const isExpected = (message: string) => {
     for (const pattern of expectedErrors) {
@@ -459,14 +557,17 @@ function watchDiagnostics(page: Page, expectedErrors: RegExp[] = []) {
   page.on('request', request => {
     // SPA route changes do not restart the worker. Count only real main-frame
     // document requests so initialization credits survive in-app navigation.
-    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
-      document += 1;
-    }
+    const mainFrameNavigation =
+      request.isNavigationRequest() && request.frame() === page.mainFrame();
 
+    if (mainFrameNavigation) document += 1;
+
+    requestDocuments.set(request, document);
     entries.push({
       kind: 'request',
       message: request.method(),
       url: redact(request.url()),
+      document,
     });
   });
 
@@ -483,7 +584,9 @@ function watchDiagnostics(page: Page, expectedErrors: RegExp[] = []) {
       kind: 'http',
       message: redact(response.statusText()),
       status: response.status(),
+      method: response.request().method(),
       url: redact(response.url()),
+      document: requestDocuments.get(response.request()),
     });
   });
 
@@ -638,7 +741,13 @@ async function recordScenario(
     expectedOpfsFailure?: boolean;
   },
   diagnostics: ScenarioDiagnostic[],
+  diagnosticExpectations: ScenarioDiagnosticExpectations = {},
 ) {
+  const driveKey = diagnosticExpectations.publicHomeDrive
+    ? driveToPkarrKey(diagnosticExpectations.publicHomeDrive)
+    : undefined;
+  const relayUrl = driveKey ? `${PKARR_RELAY_URL}/${driveKey.z32}` : undefined;
+
   const protectedReads = () =>
     diagnostics.filter(
       entry =>
@@ -682,6 +791,185 @@ async function recordScenario(
       entry.socket = warningCredits[index].socket;
       warningCredits.splice(index, 1);
     }
+  }
+
+  const relayRequests = relayUrl
+    ? diagnostics.filter(
+        entry =>
+          entry.kind === 'request' &&
+          entry.message === 'GET' &&
+          entry.url === relayUrl,
+      )
+    : [];
+  const relayResponses = relayUrl
+    ? diagnostics.filter(
+        entry =>
+          entry.kind === 'http' &&
+          entry.method === 'GET' &&
+          entry.status === 404 &&
+          entry.url === relayUrl,
+      )
+    : [];
+
+  expect(
+    relayRequests.length,
+    'Public-home pkarr discovery must not make repeated matching requests',
+  ).toBeLessThanOrEqual(1);
+  let relay404CreditUsed = false;
+
+  for (const entry of diagnostics) {
+    if (
+      !relay404CreditUsed &&
+      relayUrl &&
+      entry.kind === 'console.error' &&
+      entry.message ===
+        'Failed to load resource: the server responded with a status of 404 (Not Found)' &&
+      entry.url === relayUrl
+    ) {
+      const matchingRequests = relayRequests.filter(
+        request => request.document === entry.document,
+      );
+      const matchingResponses = relayResponses.filter(
+        response => response.document === entry.document,
+      );
+
+      if (matchingRequests.length === 1 && matchingResponses.length === 1) {
+        entry.expected = true;
+        entry.classification = 'initial-public-drive-relay-404';
+        relay404CreditUsed = true;
+      }
+    }
+  }
+
+  const refusal = diagnosticExpectations.ownerModeRefusal;
+  let refusalEvidence:
+    | {
+        subject: string;
+        document: number | null;
+        backendOwnerModePredicate: boolean;
+        matchingWarningCount: number;
+        classified: boolean;
+        sourceGuidance: string;
+        assertedGuidanceMatches: boolean;
+        matchingNotificationCount: number;
+        notificationStackMatches: boolean;
+        notificationSerialization: string | null;
+        notificationClassified: boolean;
+      }
+    | undefined;
+
+  if (refusal) {
+    const refusalMessage = `[Outbox] drain failed for subject: ${refusal.subject} error: ${redact(refusal.result)}`;
+    const matchingWarnings = diagnostics.filter(
+      entry =>
+        entry.kind === 'console.warning' && entry.message === refusalMessage,
+    );
+    const backendOwnerModePredicate = refusal.result.startsWith(
+      'This server does not host new Drives.',
+    );
+    const classified =
+      backendOwnerModePredicate &&
+      matchingWarnings.length === 1 &&
+      matchingWarnings[0].document === refusal.document;
+
+    if (classified) {
+      matchingWarnings[0].expected = true;
+      matchingWarnings[0].classification =
+        'same-subject-owner-mode-outbox-refusal';
+    }
+
+    // notifyBlockedSync constructs this Error from the same blocked subject's
+    // refusal; errorHandler logs that Error and renders its message in the toast.
+    const sourceGuidance = redact(
+      `This server does not host this workspace (${refusal.result.trim()}) ` +
+        `Your changes are kept on this device and are not being sent. ` +
+        `Sign in with an existing identity to use a workspace hosted here.`,
+    );
+    const assertedGuidanceMatches =
+      refusal.guidanceText.replace(/\s+/g, ' ').trim() ===
+      sourceGuidance.replace(/\s+/g, ' ').trim();
+    // Preserve the canonical Error and the observed console serialization only:
+    // lowercase header, source CR/LF removed without spaces, flattened frames.
+    const notificationFormats = [
+      {
+        name: 'canonical-error',
+        header: `Error: ${sourceGuidance}`,
+        separator: '\n    at ',
+      },
+      {
+        name: 'flattened-error',
+        header: `error: ${sourceGuidance.replace(/[\r\n]/g, '')}`,
+        separator: '    at ',
+      },
+    ];
+    const matchingNotifications = diagnostics.filter(
+      entry =>
+        entry.kind === 'console.error' &&
+        notificationFormats.some(
+          format =>
+            entry.message === format.header ||
+            entry.message.startsWith(`${format.header}${format.separator}`),
+        ),
+    );
+    const notification = matchingNotifications[0];
+    const notificationFormat = notificationFormats.find(
+      format =>
+        notification?.message === format.header ||
+        notification?.message.startsWith(`${format.header}${format.separator}`),
+    );
+    const stackLines =
+      notification && notificationFormat
+        ? notification.message
+            .slice(
+              notificationFormat.header.length +
+                notificationFormat.separator.length,
+            )
+            .split(notificationFormat.separator)
+        : [];
+    const notificationChain = ['notifyBlockedSync', 'onBlocked', 'drainOne'];
+    const notificationStackMatches =
+      stackLines.length >= notificationChain.length &&
+      notificationChain.every((name, index) => {
+        const frame = stackLines[index].match(
+          /^[\w$]+\.(notifyBlockedSync|onBlocked|drainOne) \((https?:\/\/[^\s()]+):\d+:\d+\)$/,
+        );
+
+        return frame?.[1] === name && frame[2] === matchingWarnings[0]?.url;
+      }) &&
+      stackLines.every(
+        line =>
+          !/[\r\n]/.test(line) &&
+          /^(?:async )?(?:[\w$.[\]<>]+ \(https?:\/\/[^\s()]+:\d+:\d+\)|https?:\/\/[^\s()]+:\d+:\d+|Promise\.all \(index \d+\))$/.test(
+            line,
+          ),
+      );
+    const notificationClassified =
+      classified &&
+      refusal.document !== undefined &&
+      assertedGuidanceMatches &&
+      matchingNotifications.length === 1 &&
+      notification?.document === refusal.document &&
+      notificationStackMatches;
+
+    if (notificationClassified) {
+      notification.expected = true;
+      notification.classification =
+        'same-subject-owner-mode-refusal-notification';
+    }
+
+    refusalEvidence = {
+      subject: refusal.subject,
+      document: refusal.document ?? null,
+      backendOwnerModePredicate,
+      matchingWarningCount: matchingWarnings.length,
+      classified,
+      sourceGuidance,
+      assertedGuidanceMatches,
+      matchingNotificationCount: matchingNotifications.length,
+      notificationStackMatches,
+      notificationSerialization: notificationFormat?.name ?? null,
+      notificationClassified,
+    };
   }
 
   if (scenario.expectedOpfsFailure) {
@@ -751,6 +1039,23 @@ async function recordScenario(
       (await page.locator('body').innerText()).slice(0, 5000),
     ),
     diagnostics,
+    diagnosticBindingEvidence: {
+      publicHomeDrive: diagnosticExpectations.publicHomeDrive ?? null,
+      pkarrZ32: driveKey?.z32 ?? null,
+      relayUrl: relayUrl ?? null,
+      relayGetRequestCount: relayRequests.length,
+      relayGet404ResponseCount: relayResponses.length,
+      sourceSupportedTargetBinding:
+        driveKey !== undefined &&
+        relayRequests.length === 1 &&
+        relayResponses.length === 1 &&
+        relayRequests[0]?.document === relayResponses[0]?.document,
+      bindingBasis: driveKey
+        ? 'source-supported public drive-to-pkarr key derivation'
+        : null,
+      resolverArgumentDirectlyObserved: false,
+      ownerModeRefusal: refusalEvidence ?? null,
+    },
     settledReadDenials,
     finalReadDenials: protectedReads().length,
     settledWorkerStarts,
@@ -813,15 +1118,25 @@ async function assertRouteContent(
     role === 'anonymous' &&
     ['app', 'newResource', 'privateResource', 'invite', 'table'].includes(route)
   ) {
-    const destination = routeUrl(route);
-    const expectedNext = `${new URL(destination).pathname}${new URL(destination).search}`;
+    const expectedNext = new URL(routeUrl(route)).toString();
+
     await expect
       .poll(() => {
-        const parsed = new URL(page.url());
+        const current = new URL(page.url());
+        const next = current.searchParams.get('next');
+        let resolvedNext: URL;
+
+        try {
+          if (next === null) return false;
+          resolvedNext = new URL(next, current.origin);
+        } catch {
+          return false;
+        }
 
         return (
-          parsed.pathname.includes('welcome') &&
-          parsed.searchParams.get('next') === expectedNext
+          current.pathname.includes('welcome') &&
+          resolvedNext.origin === current.origin &&
+          resolvedNext.toString() === expectedNext
         );
       })
       .toBe(true);
@@ -1103,14 +1418,16 @@ if (manifest && identities) {
         );
         const diagnostics = watchDiagnostics(page);
         const target = routeUrl(route.key);
-        await safeNavigation(() => page.goto(routeUrl('root')));
+        const historyAnchor = route.key === 'root' ? 'settings' : 'root';
+        await safeNavigation(() => page.goto(routeUrl(historyAnchor)));
+        await assertRouteScreen(page, historyAnchor, 'anonymous');
         await safeNavigation(() => page.goto(target));
         await assertRouteScreen(page, route.key, 'anonymous');
         const finalUrl = page.url();
         await safeNavigation(() => page.reload());
         await assertRouteScreen(page, route.key, 'anonymous');
         await safeNavigation(() => page.goBack());
-        await assertRouteScreen(page, 'root', 'anonymous');
+        await assertRouteScreen(page, historyAnchor, 'anonymous');
         await safeNavigation(() => page.goForward());
         await assertRouteScreen(page, route.key, 'anonymous');
         await expect.poll(() => page.url() === finalUrl).toBe(true);
@@ -1165,10 +1482,19 @@ if (manifest && identities) {
       await expect(editContent).toBeVisible();
       await expect(editContent).toBeEnabled();
       await editContent.click({ trial: true });
+      const attachmentUpload = ownerPage.getByRole('button', {
+        name: /Upload file\(s\)\.\.\./i,
+      });
+
+      await expect(attachmentUpload).toBeVisible();
+      await expect(attachmentUpload).toBeEnabled();
       await expect(
-        ownerPage.getByRole('button', { name: /Upload file\(s\)\.\.\./i }),
-      ).toBeVisible();
-      await expect(ownerPage.locator('input[type="file"]')).toHaveCount(1);
+        attachmentUpload.locator('..').locator('input[type="file"]'),
+      ).toHaveCount(1);
+      await Promise.all([
+        ownerPage.waitForEvent('filechooser'),
+        attachmentUpload.click(),
+      ]);
       const folder = await ownerPage.evaluate(async () => {
         const subject = new URL(location.href).searchParams.get('subject');
 
@@ -1206,14 +1532,18 @@ if (manifest && identities) {
       expect(new URL(ownerPage.url()).searchParams.get('parentSubject')).toBe(
         folder.subject,
       );
-      const folderUpload = ownerPage.getByRole('button', {
-        name: 'Drop files or click here to upload.',
-        exact: true,
-      });
+      const folderUpload = ownerPage
+        .getByRole('main')
+        .getByRole('button')
+        .filter({ has: ownerPage.locator('input[type="file"]') });
       await expect(folderUpload).toBeVisible();
       await expect(folderUpload).toBeEnabled();
       await folderUpload.click({ trial: true });
-      await expect(ownerPage.locator('input[type="file"]')).toHaveCount(1);
+      await expect(folderUpload.locator('input[type="file"]')).toHaveCount(1);
+      await Promise.all([
+        ownerPage.waitForEvent('filechooser'),
+        folderUpload.click(),
+      ]);
       await safeNavigation(() => ownerPage.goto(routeUrl('privateResource')));
       await assertRouteScreen(ownerPage, 'privateResource', 'owner');
       await recordScenario(
@@ -1400,15 +1730,21 @@ if (manifest && identities) {
         await openSignIn(page);
         await fillSecret(page, identities.identities.readonly.secret);
         await expectIdentityUnlocked(page, 'readonly');
-        const recoveryDrive = await assertReadonlyHome(page, null);
+        const selectedHomeDrive = await assertReadonlyHome(page, null);
+        const recoveryDrive =
+          selectedHomeDrive ??
+          (await page.evaluate(
+            async () => window.store.getAgent()?.privateDriveSubject() ?? null,
+          ));
         await page.waitForLoadState('networkidle', { timeout: 30_000 });
         await expect
           .poll(() => page.evaluate(() => window.store.getDrive() ?? null), {
             timeout: 30_000,
           })
-          .toBe(recoveryDrive);
+          .toBe(selectedHomeDrive);
         expectNoCommitAttempts(commitAttempts);
         expect(refusedCommitUrls).toEqual([]);
+        expect(recoveryDrive).not.toBeNull();
         await recordScenario(
           page,
           testInfo,
@@ -1420,6 +1756,7 @@ if (manifest && identities) {
               'existing read-only identity reaches the no-data recovery screen without personal-drive genesis',
           },
           diagnostics,
+          { publicHomeDrive: recoveryDrive! },
         );
       });
     }
@@ -1427,39 +1764,90 @@ if (manifest && identities) {
     test('actual worker OPFS SecurityError reports server-only reads and reloads', async ({
       page,
     }, testInfo) => {
-      let workerIntercepted = false;
       await page.addInitScript(() => {
+        const documentId = crypto.randomUUID();
         const channel = new BroadcastChannel('atomic-owner-nav-opfs-denied');
-
-        channel.onmessage = () => {
-          (
-            window as Window & { ownerNavOpfsDenied?: boolean }
-          ).ownerNavOpfsDenied = true;
+        const state = {
+          documentId,
+          latestWorkerId: 0,
+          outcomes: [] as OwnerNavWorkerOutcome[],
         };
+        Object.assign(window, { ownerNavOpfs: state });
+
+        channel.onmessage = event => {
+          const outcome = event.data as {
+            documentId?: unknown;
+            workerId?: unknown;
+            phase?: unknown;
+          };
+          if (
+            outcome.documentId !== state.documentId ||
+            typeof outcome.workerId !== 'number' ||
+            !Number.isSafeInteger(outcome.workerId) ||
+            outcome.workerId < 1 ||
+            outcome.workerId > state.latestWorkerId ||
+            (outcome.phase !== 'started' &&
+              outcome.phase !== 'getDirectory-denied')
+          )
+            return;
+          state.outcomes.push({
+            documentId: outcome.documentId,
+            workerId: outcome.workerId,
+            phase: outcome.phase,
+          });
+        };
+
+        const NativeWorker = window.Worker;
+        window.Worker = new Proxy(NativeWorker, {
+          construct(target, args, newTarget) {
+            const [script, options] = args as [string | URL, WorkerOptions?];
+            const scriptUrl = new URL(script, location.href);
+
+            if (/\/client-db\.worker[^/]*\.js$/.test(scriptUrl.pathname)) {
+              const workerId = ++state.latestWorkerId;
+              scriptUrl.searchParams.set('ownerNavDocument', documentId);
+              scriptUrl.searchParams.set('ownerNavWorker', String(workerId));
+
+              return Reflect.construct(
+                target,
+                [scriptUrl.toString(), options],
+                newTarget,
+              );
+            }
+
+            return Reflect.construct(target, args, newTarget);
+          },
+        });
       });
       await page.route('**/client-db.worker*.js*', async route => {
         const response = await route.fetch();
         const source = await response.text();
-        workerIntercepted = true;
         await route.fulfill({
           response,
-          body: `console.debug('[OwnerNavOPFS] worker started'); Object.defineProperty(navigator.storage, 'getDirectory', { configurable: true, value: async () => { console.debug('[OwnerNavOPFS] getDirectory denied'); new BroadcastChannel('atomic-owner-nav-opfs-denied').postMessage('denied'); throw new DOMException('Storage access denied by test', 'SecurityError'); } });\n${source}`,
+          body: `const ownerNavParams = new URL(self.location.href).searchParams; const ownerNavDocument = ownerNavParams.get('ownerNavDocument'); const ownerNavWorker = Number(ownerNavParams.get('ownerNavWorker')); const ownerNavChannel = new BroadcastChannel('atomic-owner-nav-opfs-denied'); const ownerNavReport = phase => ownerNavChannel.postMessage({ documentId: ownerNavDocument, workerId: ownerNavWorker, phase }); ownerNavReport('started'); console.debug('[OwnerNavOPFS] worker started'); Object.defineProperty(navigator.storage, 'getDirectory', { configurable: true, value: async () => { console.debug('[OwnerNavOPFS] getDirectory denied'); ownerNavReport('getDirectory-denied'); throw new DOMException('Storage access denied by test', 'SecurityError'); } });\n${source}`,
         });
       });
       const diagnostics = watchDiagnostics(page);
+      const workerProvenance: OwnerNavWorkerProvenance[] = [];
       await safeNavigation(() => page.goto(routeUrl('root')));
-      await expect
-        .poll(() =>
-          page.evaluate(() =>
-            Boolean(
-              (window as Window & { ownerNavOpfsDenied?: boolean })
-                .ownerNavOpfsDenied,
-            ),
-          ),
-        )
-        .toBe(true);
-      expect(workerIntercepted).toBe(true);
-      await signIn(page, 'owner');
+      await expectStoreReady(page);
+      await expectCurrentOpfsWorkerDenial(
+        page,
+        'initial-root',
+        workerProvenance,
+      );
+      await signIn(page, 'owner', async () => {
+        await expectCurrentOpfsWorkerDenial(
+          page,
+          'sign-in-root',
+          workerProvenance,
+        );
+      });
+      await expectCurrentOpfsWorkerDenial(
+        page,
+        'owner-identity',
+        workerProvenance,
+      );
       await expect(
         page.getByText(/Local caching and offline support are disabled/i),
       ).toBeVisible();
@@ -1475,11 +1863,25 @@ if (manifest && identities) {
           exact: true,
         }),
       ).toBeVisible();
+      await expectCurrentOpfsWorkerDenial(
+        page,
+        'public-resource',
+        workerProvenance,
+      );
       await safeNavigation(() => page.reload());
       await expect(
         page.getByText('Public fixture content readable without signing in.', {
           exact: true,
         }),
+      ).toBeVisible();
+      await expect(
+        page.getByText(/Local caching and offline support are disabled/i),
+      ).toBeVisible();
+      await expect(
+        page.getByText(/reading directly from the server/i),
+      ).toBeVisible();
+      await expect(
+        page.getByText(/nothing is kept locally between reloads/i),
       ).toBeVisible();
       await recordScenario(
         page,
@@ -1489,26 +1891,84 @@ if (manifest && identities) {
           user: 'owner',
           viewport: 'desktop',
           expected:
-            'real worker OPFS SecurityError yields an honest server-backed read mode that reloads',
+            'latest worker in the final document reports OPFS SecurityError and server-only mode remains ready after reload',
           expectedOpfsFailure: true,
         },
         diagnostics,
       );
+      await expectCurrentOpfsWorkerDenial(page, 'reload', workerProvenance);
+      await expectStoreReady(page);
+      const finalStorage = await page.evaluate(() =>
+        window.store.getSyncStatus(),
+      );
+      expect(finalStorage.clientDbReady).toBe(false);
+      expect(finalStorage.clientDbError).toMatch(
+        /^Local caching and offline support are disabled:/,
+      );
+      expect(finalStorage.clientDbError).toContain(
+        'reading directly from the server; nothing is kept locally between reloads.',
+      );
+      await expect(
+        page.getByText(/Local caching and offline support are disabled/i),
+      ).toBeVisible();
+      await expect(
+        page.getByText(/reading directly from the server/i),
+      ).toBeVisible();
+      await expect(
+        page.getByText(/nothing is kept locally between reloads/i),
+      ).toBeVisible();
+      await testInfo.attach('opfs-worker-provenance.json', {
+        body: JSON.stringify(workerProvenance, null, 2),
+        contentType: 'application/json',
+      });
     });
 
     test('outsider drive genesis gets one 403, retains edits, and offers existing-identity sign-in', async ({
       browser,
       page,
     }, testInfo) => {
-      const diagnostics = watchDiagnostics(page, [
-        /does not host new drives|owner.mode.*(?:refus|reject)/i,
-      ]);
+      const diagnostics = watchDiagnostics(page);
       let webSocketsSeen = 0;
       let webSocketsClosed = 0;
+      let nextSocketId = 0;
+      let authenticatedSocketId = 0;
       page.on('websocket', socket => {
         webSocketsSeen += 1;
+        const socketId = ++nextSocketId;
+        let authenticatingSubject: string | null = null;
         socket.on('close', () => {
           webSocketsClosed += 1;
+        });
+        socket.on('framesent', frame => {
+          const payload = frame.payload;
+
+          if (
+            typeof payload !== 'string' &&
+            payload.byteLength > 0 &&
+            payload[0] === ownerNavAuthWireTag.AUTH
+          ) {
+            try {
+              const auth = JSON.parse(payload.toString('utf8', 1));
+              const subject =
+                auth['https://atomicdata.dev/properties/auth/agent'];
+              authenticatingSubject =
+                typeof subject === 'string' ? subject : null;
+            } catch {
+              authenticatingSubject = null;
+            }
+          }
+        });
+        socket.on('framereceived', frame => {
+          const payload = frame.payload;
+
+          if (
+            typeof payload !== 'string' &&
+            payload.byteLength > 0 &&
+            payload[0] === ownerNavAuthWireTag.AUTH_OK &&
+            authenticatingSubject === identities.identities.outsider.subject
+          ) {
+            authenticatedSocketId = Math.max(authenticatedSocketId, socketId);
+          }
         });
       });
       const commitAttempts = observeCommitAttempts(page);
@@ -1611,6 +2071,15 @@ if (manifest && identities) {
       expectNoCommitAttempts(commitAttempts);
       const commitFramesBeforeRefusal = commitAttempts.websocketCommits;
       const errorFramesBeforeRefusal = commitAttempts.websocketErrors;
+      let refusalDocument: number | undefined;
+
+      for (let index = diagnostics.length - 1; index >= 0; index -= 1) {
+        if (diagnostics[index].kind === 'request') {
+          refusalDocument = diagnostics[index].document;
+          break;
+        }
+      }
+
       const attempt = await page.evaluate(async () => {
         const resource = await window.store.newResource({
           isA: 'https://atomicdata.dev/classes/Drive',
@@ -1668,20 +2137,25 @@ if (manifest && identities) {
       await expect(refusalGuidance).toBeVisible();
       const guidanceText = redact(await refusalGuidance.innerText());
       const socketsBeforeReconnect = webSocketsSeen;
-      const closesBeforeOffline = webSocketsClosed;
-      await page.context().setOffline(true);
+      const closesBeforeDisconnect = webSocketsClosed;
+      await page.evaluate(() => window.store.disconnect());
       await expect
         .poll(() => webSocketsClosed, { timeout: 20_000 })
-        .toBeGreaterThan(closesBeforeOffline);
-      await page.context().setOffline(false);
+        .toBeGreaterThan(closesBeforeDisconnect);
+      await page.evaluate(() => window.store.reconnect());
       await expect
         .poll(() => webSocketsSeen, { timeout: 30_000 })
+        .toBeGreaterThan(socketsBeforeReconnect);
+      await expect
+        .poll(() => authenticatedSocketId, { timeout: 30_000 })
         .toBeGreaterThan(socketsBeforeReconnect);
       await expect
         .poll(() => page.evaluate(() => window.store.serverConnected), {
           timeout: 30_000,
         })
         .toBe(true);
+      const transportReplacement =
+        'app-initiated genuine transport replacement; not network-origin loss';
       await page.waitForTimeout(35_000);
       expect(commitAttempts.httpPosts).toHaveLength(postsAfterRefusal);
       expect(commitAttempts.websocketCommits).toBe(framesAfterRefusal);
@@ -1696,13 +2170,14 @@ if (manifest && identities) {
       await testInfo.attach('websocket-owner-mode-refusal.json', {
         body: JSON.stringify(
           {
+            transportReplacement,
+            authenticatedReplacementSocketId: authenticatedSocketId,
             websocketCommitFrames: framesAfterRefusal,
             websocketErrorFrames: commitAttempts.websocketErrors,
             httpCommitPostsAfterReconnect: commitAttempts.httpPosts.length,
-            retainedEdit: retainedName,
+            retainedEditPreserved: true,
             refusal: redact(attempt.error ?? ''),
             guidance: guidanceText,
-            retainedEditAfterReconnect: retainedAfterReconnect,
           },
           null,
           2,
@@ -1712,8 +2187,12 @@ if (manifest && identities) {
       // Toaster renders SDK guidance with Clear/Copy, not a sign-in button.
       // Prove its supported handover destination is a real usable sign-in page
       // only AFTER proving live retained-edit/reconnect/no-retry behavior.
+      const publicHomeDrive = await page.evaluate(
+        async () => window.store.getAgent()?.privateDriveSubject() ?? null,
+      );
+      expect(publicHomeDrive).not.toBeNull();
       const destination = new URL(routeUrl('privateResource'));
-      const next = `${destination.pathname}${destination.search}`;
+      const next = destination.toString();
       const handover = new URL('/app/welcome', manifest.origin);
       handover.searchParams.set('step', 'signin');
       handover.searchParams.set('next', next);
@@ -1730,9 +2209,18 @@ if (manifest && identities) {
           user: 'outsider',
           viewport: 'desktop',
           expected:
-            'actual HTTP 403 and WebSocket refusal; no later HTTP commit or WS send; retained edit and existing-identity handover',
+            'actual HTTP 403 and WebSocket refusal; app-initiated genuine transport replacement (not network-origin loss); no later HTTP commit or WS send; retained edit and existing-identity handover',
         },
         diagnostics,
+        {
+          publicHomeDrive: publicHomeDrive!,
+          ownerModeRefusal: {
+            subject: attempt.subject,
+            result: attempt.error!,
+            guidanceText,
+            document: refusalDocument,
+          },
+        },
       );
     });
   });

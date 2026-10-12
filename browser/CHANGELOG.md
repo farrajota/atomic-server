@@ -4,6 +4,19 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- `@tomic/lib`: a connected server-backed save keeps waiting for its server
+  acknowledgement when an optional local database first attaches during queue
+  hydration, even if that cache is denied. Replacing an existing database worker
+  or signing identity still fences obsolete work.
+- Existing identities no longer republish their conversation encryption key when
+  a stale local profile differs from the server. The publisher checks an
+  independent signed server response without replacing pending local profile
+  edits; only a genuinely missing or different server key is published. Failed
+  or cancelled reads do not create publication work.
+- Development-drive bootstrap keeps its original live signing identity while
+  final access details are stored, so concurrent saves are not cancelled by
+  reparsing the same identity. The created drive hint and reload identity are
+  retained; changing to a genuinely different identity still fences old saves.
 - A definitive owner-policy refusal when a new device tries to create a hosted
   workspace no longer loops through automatic sync retries: the local edit is
   kept and that outbox entry waits for user action. Sign in with the existing
@@ -16,11 +29,23 @@ This changelog covers all five packages, as they are (for now) updated as a whol
   `canCreateDrives` capability, while ordinary workspace access still follows
   the server's existing admission and ACL checks. On mobile, onboarding screens
   no longer render the workspace sidebar or navigation chrome.
-- When the browser's local database cannot open OPFS and selects its implemented
-  server-only mode, onboarding can proceed with server-backed reads but has no
-  local database for cache, offline use, or durable edits. Edits in this mode
-  are not guaranteed to survive a reload; this is not a general guarantee for
-  private-browsing modes.
+  Before sign-in, protected-route parent query parameters no longer cause eager
+  navbar resource fetches; anonymous public resource subjects remain readable.
+- Local-only saves require a durable resource snapshot but do not enroll edits in
+  the server-drain outbox; offline saves require the snapshot and applicable
+  outbox write. If storage is absent, refused, times out while opening, is
+  replaced during the write, or a required write fails, the save rejects before
+  saved notification and offline outbox publication; the edit remains in memory
+  as unsaved. An acknowledged online save is not made to fail by its optional
+  bounded local mirror. When storage is denied or unsupported, server-backed
+  reads still work without cache or offline durability; a supported late open
+  resumes only current-worker/current-agent optional work. First-start seeding
+  waits for actual database open, not seeded readiness, and records its
+  fingerprint only after required seed writes land. This does not certify
+  physical private-browsing behavior.
+- `@tomic/lib`: explicitly parentless creation, including local-only Drives, no
+  longer tries to normalize an absent `serverUrl`. No-server local-only saves
+  still require a signing Agent and an actually opened client database.
 - Private images and files keep loading after the first five minutes: the session cookie is refreshed while a user is signed in (every minute and on focus), so same-origin media URLs stay authenticated.
 - `@tomic/lib`: `Resource.get` reads a `did:ad:`/`atomic:` property under either stored spelling; `set` and `remove` act on the spelling already stored, or on both when both are stored (an explicit edit settles a conflict, as on the server). When both spellings hold different values it returns the requested one, warns once, and `getPropertyAliasConflict` describes the conflict (the server refuses such a read).
 - `@tomic/lib`: new resources and uploads take their `drive` from the parent lineage (explicit `drive`, else the nearest Drive, at most 32 steps); when it is unknown no drive is stamped rather than the active drive or the parent.
@@ -29,6 +54,15 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 - Opening a resource keeps the current page's query parameters (view, filter, drive) unless the link overrides them.
 - Tables: pressing Enter in a tag cell while no option matches no longer clears the cell. Tag options update as their tag resources load.
 - `@tomic/react`: local file previews (`useFileObjectUrl`) only keep allowlisted media types (raster images, video, audio, PDF); other bytes become `application/octet-stream`, SVG a `data:` URL, so an uploaded HTML or SVG file never opens as a page of the app.
+
+## [v0.41.0-beta.8] - 2026-10-10
+
+- Phones: the chat view no longer scrolls sideways by a few pixels, the "more" menu no longer opens the on-screen keyboard, and the Back button closes an open dropdown menu.
+- Schemas (#2151): `ensureOntology` creates or updates an ontology with content-addressed properties, classes and class constraints, and running it twice writes nothing; `ensureSchema` is now a deprecated alias. `ontologyFromJsonSchema` and `ontologyToJsonSchema` convert JSON Schema draft 2020-12 to and from that input. New: `propertyId`, `getEffectiveConstraint`, `setClassConstraint`, `useEffectiveConstraint`, `ensureLens`, `loadLenses`, and `store.newResource({ contentAddressedProperty: true })`.
+- `ad-generate ontology push | lock | check` writes the same lockfile as `atomic-cli schema` (#2151).
+- Tables, kanban, the ontology editor and forms store select options, single pick, limits and linked classes on the class instead of on the Property; each property in a class card has a Constraints section. Renaming a property's shortname or changing its datatype creates a new property and a lens that keeps old values visible (#2151).
+- AI assistant: `find_schema` returns matching classes as JSON Schema (replaces `get_user_classes`), and `ensure_ontology` creates an ontology from a JSON Schema (#2151).
+
 - Calendar: the repeat "Last day" date keeps focus while you type and is saved when you leave the field or press Enter, instead of after every keystroke (#2137).
 - Documents: after mentioning a resource with `@` or the toolbar button, the caret sits in a paragraph after the card (one is added if needed), so typing no longer replaces the card (#2139).
 

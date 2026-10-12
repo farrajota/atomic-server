@@ -105,11 +105,17 @@ export const STORAGE_BLOCKED_MARKER = 'ATOMIC_DB_STORAGE_BLOCKED';
  * nothing to repair, nothing to delete, and retrying cannot help. Callers
  * degrade to server-only mode and say so in one sentence, rather than logging
  * a wasm stack trace on every page load for a state the user may have chosen.
+ * Legacy migration can wrap that same refusal as a plain Error containing the
+ * native `SecurityError: Storage access denied` message, so classify that
+ * narrow representation here as well.
  */
 export function isStorageBlockedDbError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
 
-  return message.includes(STORAGE_BLOCKED_MARKER);
+  return (
+    message.includes(STORAGE_BLOCKED_MARKER) ||
+    /SecurityError:\s*Storage access denied\b/i.test(message)
+  );
 }
 
 /**

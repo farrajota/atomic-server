@@ -14,7 +14,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { core } from './ontologies/core.js';
 import { Resource, ResourceEvents } from './resource.js';
-import { testStore } from './test-store.js';
+import { attachSnapshotDb, testStore } from './test-store.js';
 
 const FOLDER = 'https://atomicdata.dev/classes/Folder';
 const DRIVE = 'https://atomicdata.dev/classes/Drive';
@@ -84,9 +84,13 @@ describe('unsaved state', () => {
   it('offline: the edit stays unsaved and is shown as queued', async () => {
     const { store, resource } = await savedFolder();
     store.setServerConnected(false);
+    const { rows } = attachSnapshotDb(store);
+
     await resource.set(core.properties.name, 'Offline edit', false);
 
     await expect(resource.save()).resolves.toBe('offline');
+
+    expect(rows.get(resource.subject)?.snapshot?.length).toBeGreaterThan(0);
 
     expect(resource.hasUnsavedChanges()).toBe(true);
     expect(store.outbox.hasPending(resource.subject)).toBe(true);

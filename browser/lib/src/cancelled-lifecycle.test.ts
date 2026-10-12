@@ -54,6 +54,8 @@ describe('cancelled resource lifecycle', () => {
     const error = new RequestCancelledError('ClientDb worker destroyed');
     store.setClientDb({
       isReady: true,
+      isOpen: true,
+      whenOpen: async () => true,
       putResourceWithSnapshot: async () => {
         throw error;
       },
@@ -75,6 +77,8 @@ describe('cancelled resource lifecycle', () => {
     const error = new Error('disk write failed');
     store.setClientDb({
       isReady: true,
+      isOpen: true,
+      whenOpen: async () => true,
       putResourceWithSnapshot: async () => {
         throw error;
       },

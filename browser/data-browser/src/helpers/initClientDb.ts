@@ -265,8 +265,8 @@ async function startForIdentity(
 
   /** Write `subjects` in order. Those without a Loro history go in one
    *  batch; each one with a history is written with its snapshot. Returns
-   *  how many were written. */
-  const seed = async (subjects: string[]): Promise<number> => {
+   *  how many were written, or undefined if this worker lost ownership. */
+  const seed = async (subjects: string[]): Promise<number | undefined> => {
     const plain: string[] = [];
     const withHistory: {
       subject: string;
@@ -287,12 +287,20 @@ async function startForIdentity(
       }
     }
 
-    await clientDb.putResources(plain).catch(() => {});
+    await clientDb.putResources(plain);
+    if (
+      currentWorker !== clientDb ||
+      store.getAgent()?.subject !== agentSubject
+    )
+      return undefined;
 
     for (const { subject, jsonAd, snapshot } of withHistory) {
-      await clientDb
-        .putResourceWithSnapshot(subject, jsonAd, snapshot)
-        .catch(() => {});
+      await clientDb.putResourceWithSnapshot(subject, jsonAd, snapshot);
+      if (
+        currentWorker !== clientDb ||
+        store.getAgent()?.subject !== agentSubject
+      )
+        return undefined;
     }
 
     return plain.length + withHistory.length;
@@ -364,6 +372,14 @@ async function startForIdentity(
     )
       return;
 
+    if (!(await clientDb.whenOpen())) return;
+
+    if (
+      currentWorker !== clientDb ||
+      store.getAgent()?.subject !== agentSubject
+    )
+      return;
+
     const endPostInit = perfSpan('clientdb.postInit');
     // Skip the seed entirely when:
     //   - The WASM DB is already populated from OPFS (prior session), AND
@@ -398,12 +414,27 @@ async function startForIdentity(
       return;
     }
 
+    let existing: string[] | undefined;
+
     try {
-      const existing = await clientDb.allSubjects();
-      for (const s of existing) existingSet.add(s);
-      opfsHasData = existing.length > 0;
+      existing = await clientDb.allSubjects();
     } catch {
       // allSubjects failed — proceed with seed as fallback.
+    }
+
+    if (
+      currentWorker !== clientDb ||
+      store.getAgent()?.subject !== agentSubject
+    ) {
+      endAllSubjects({ skipped: true });
+      endPostInit({ seeded: false, skipped: true });
+
+      return;
+    }
+
+    if (existing) {
+      for (const s of existing) existingSet.add(s);
+      opfsHasData = existing.length > 0;
     }
 
     endAllSubjects({ count: existingSet.size });
@@ -464,10 +495,46 @@ async function startForIdentity(
     // one worker call. The worker still processes them in order, so the
     // datatype-priming property is preserved.
     const endSeed = perfSpan('clientdb.seed');
-    const seededProperties = await seed(properties);
+    let seededProperties: number;
+    let seededOthers: number;
 
-    // Then seed everything else in one batch too.
-    const seededOthers = await seed(others);
+    try {
+      const propertyCount = await seed(properties);
+
+      if (
+        propertyCount === undefined ||
+        currentWorker !== clientDb ||
+        store.getAgent()?.subject !== agentSubject
+      ) {
+        endSeed({ skipped: true });
+        endPostInit({ seeded: false, skipped: true });
+
+        return;
+      }
+
+      seededProperties = propertyCount;
+
+      // Then seed everything else in one batch too.
+      const otherCount = await seed(others);
+
+      if (
+        otherCount === undefined ||
+        currentWorker !== clientDb ||
+        store.getAgent()?.subject !== agentSubject
+      ) {
+        endSeed({ properties: seededProperties, skipped: true });
+        endPostInit({ seeded: false, skipped: true });
+
+        return;
+      }
+
+      seededOthers = otherCount;
+    } catch (error) {
+      endSeed({ failed: true });
+      endPostInit({ seeded: false, failed: true });
+      throw error;
+    }
+
     endSeed({
       properties: seededProperties,
       others: seededOthers,

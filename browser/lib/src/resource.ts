@@ -6,6 +6,16 @@ import type {
   VersionVector,
 } from 'loro-crdt';
 import { ulid } from 'ulidx';
+import {
+  addChatLogEntry,
+  countChatLogEntries,
+  getChatLogEntry,
+  listChatLogEntries,
+  putChatLogEntry,
+  removeChatLogEntry,
+  type ChatLogEntry,
+  type NewChatLogEntry,
+} from './chat-log.js';
 import { enableLoro, LoroLoader } from './loro-loader.js';
 import { decodeB64, encodeB64 } from './base64.js';
 import { EventManager } from './EventManager.js';
@@ -24,6 +34,7 @@ import {
   schemeAlias,
   currentAgentSubject,
 } from './subject.js';
+import { checkResourceConstraints } from './class-constraints.js';
 import { perfSpan } from './perf-trace.js';
 import { validateDatatype, datatypeTag, Datatype } from './datatypes.js';
 import { isUnauthorized, RequestCancelledError } from './error.js';
@@ -39,7 +50,7 @@ import {
   type QuickAccessPropType,
 } from './ontology.js';
 import type { ChangeSource, Store } from './store.js';
-import type { ClientDbOutboxWrite } from './client-db.js';
+import type { ClientDbOutboxWrite, ClientDbWorker } from './client-db.js';
 import {
   forkResource,
   isFork,
@@ -73,6 +84,15 @@ import {
   type JSONObject,
   type AtomicValue,
 } from './value.js';
+
+/**
+ * Loro property-map keys are raw strings, so a legacy `did:ad:prop:` key would
+ * be a different key from its `atomic:prop:` twin. Always key by the canonical
+ * form. Other property URLs pass through untouched.
+ */
+function canonicalPropKey(prop: string): string {
+  return prop.startsWith('did:ad:prop:') ? canonicalizeScheme(prop) : prop;
+}
 
 /** Contains the PropertyURL / Value combinations */
 export type PropVals = Map<string, AtomicValue>;
@@ -215,6 +235,10 @@ export class Resource<C extends OptionalClass = any> {
 
   private _subject: string;
   /** Memoized read cache derived from Loro. Rebuilt lazily when #cacheDirty. */
+  private _genesisCertCache?: {
+    encoded: string;
+    cert: ReturnType<typeof decodeGenesisCert> | undefined;
+  };
   #cache: Record<string, JSONValue> = Object.create(null);
   /** True when Loro has been modified but #cache hasn't been rebuilt yet. */
   #cacheDirty = false;
@@ -501,6 +525,18 @@ export class Resource<C extends OptionalClass = any> {
           if (!isDerivedByServer(key)) {
             this.loroSetProperty(key, value);
           }
+        }
+
+        // Seeding from server-provided propvals is hydration, not an edit:
+        // leave it open and the next seal (a refetch's `applyHydratedValues`)
+        // commits it as a local write, which the outbox signs as the current
+        // agent, even for someone else's resource.
+        if (
+          !this.new &&
+          !this._dirty &&
+          this._loroDoc.getPendingTxnLength() > 0
+        ) {
+          this._loroDoc.commit({ origin: SYSTEM_COMMIT_ORIGIN });
         }
       }
 
@@ -827,7 +863,38 @@ export class Resource<C extends OptionalClass = any> {
       }
     }
 
+    // Lenses derive values for the properties the doc does not really hold.
+    // The doc is never changed; only this cache gets them.
+    const lenses = this._store?.lenses;
+
+    if (lenses && lenses.size > 0) {
+      lenses.apply(nextCache);
+    }
+
     this.#cache = nextCache;
+  }
+
+  /**
+   * Re-derive lens values after the store learned of a lens that touches one of
+   * `props`. True when this resource holds one of them and was rebuilt.
+   *
+   * @internal
+   */
+  public refreshDerivedValues(props: string[]): boolean {
+    if (!this._loroDoc || this._loading) {
+      return false;
+    }
+
+    const holds = props.some(prop => this.#cache[prop] !== undefined);
+
+    if (!holds) {
+      return false;
+    }
+
+    this.rebuildCacheFromLoro();
+    this.#cacheDirty = false;
+
+    return true;
   }
 
   /**
@@ -889,8 +956,9 @@ export class Resource<C extends OptionalClass = any> {
     let wroteAnything = false;
 
     for (const [prop, loroValue] of Object.entries(props)) {
+      // Keys are canonical on write (`canonicalPropKey`); lookup also canonicalizes legacy docs.
       const datatype = this.store?.resources
-        .get(prop)
+        .get(canonicalizeScheme(prop))
         ?.get(core.properties.datatype)
         ?.toString();
 
@@ -1928,8 +1996,10 @@ export class Resource<C extends OptionalClass = any> {
   ): Returns {
     this.ensureFreshCache();
 
+    const canonicalProp = canonicalPropKey(propUrl);
     const directValue = this.storedValue(propUrl);
-    const alias = schemeAlias(propUrl);
+    const alias =
+      canonicalProp !== propUrl ? canonicalProp : schemeAlias(propUrl);
     const aliasValue = alias ? this.storedValue(alias) : undefined;
 
     if (directValue === undefined) {
@@ -2174,6 +2244,72 @@ export class Resource<C extends OptionalClass = any> {
     this.eventManager.emit(ResourceEvents.LocalChange, '', undefined);
   }
 
+  /**
+   * Chat log pages (class `ChatLog`): add an entry, authored by the current
+   * agent unless `a` is given, and mark the resource for saving. The entry
+   * travels in the next commit's `loroUpdate` like any other change.
+   * Returns the entry key, or undefined when Loro is not loaded.
+   */
+  public addChatLogEntry(entry: NewChatLogEntry): string | undefined {
+    const doc = this.getLoroDoc();
+    const author = entry.a ?? this.store.getAgent()?.subject;
+
+    if (!doc || !author) return undefined;
+
+    this.armStagedCommitToken();
+    const key = addChatLogEntry(doc, {
+      ...entry,
+      a: author,
+      c: entry.c ?? Date.now(),
+    });
+    this.markDirty();
+
+    return key;
+  }
+
+  /** Replace the chat log entry under `key` (an edit). Only its author may. */
+  public putChatLogEntry(key: string, entry: ChatLogEntry): void {
+    const doc = this.getLoroDoc();
+
+    if (!doc) return;
+
+    this.armStagedCommitToken();
+    putChatLogEntry(doc, key, entry);
+    this.markDirty();
+  }
+
+  /** Remove the chat log entry under `key`. Only its author or a writer of the chat may. */
+  public removeChatLogEntry(key: string): void {
+    const doc = this.getLoroDoc();
+
+    if (!doc) return;
+
+    this.armStagedCommitToken();
+    removeChatLogEntry(doc, key);
+    this.markDirty();
+  }
+
+  /** The chat log entry under `key`, if the page holds it. */
+  public getChatLogEntry(key: string): ChatLogEntry | undefined {
+    const doc = this.getLoroDoc();
+
+    return doc ? getChatLogEntry(doc, key) : undefined;
+  }
+
+  /** How many entries the chat log page holds. */
+  public countChatLogEntries(): number {
+    const doc = this.getLoroDoc();
+
+    return doc ? countChatLogEntries(doc) : 0;
+  }
+
+  /** The chat log entries, oldest first. */
+  public listChatLogEntries(): { key: string; entry: ChatLogEntry }[] {
+    const doc = this.getLoroDoc();
+
+    return doc ? listChatLogEntries(doc) : [];
+  }
+
   /** Returns a Collection with all children of this resource
    * @param pageSize The amount of children per page (default: 100)
    */
@@ -2326,11 +2462,24 @@ export class Resource<C extends OptionalClass = any> {
       return undefined;
     }
 
-    try {
-      return decodeGenesisCert(decodeB64(encoded));
-    } catch {
-      return undefined;
+    // The certificate never changes for a given string, and a collection
+    // reads `createdAt` of every member each time one is added, so decoding
+    // it per call made opening a big table quadratic (seconds for 1500 rows).
+    if (this._genesisCertCache?.encoded === encoded) {
+      return this._genesisCertCache.cert;
     }
+
+    let cert: ReturnType<typeof decodeGenesisCert> | undefined;
+
+    try {
+      cert = decodeGenesisCert(decodeB64(encoded));
+    } catch {
+      cert = undefined;
+    }
+
+    this._genesisCertCache = { encoded, cert };
+
+    return cert;
   }
 
   /**
@@ -2387,7 +2536,16 @@ export class Resource<C extends OptionalClass = any> {
     // where containers tracked in the plugin's mapping may not yet have a
     // `children` field, crashing in `absolutePositionToCursor`. The fork has
     // its own state and no subscribers, so checkouts here are isolated.
-    const doc = liveDoc.fork();
+    // A doc restored from a "Discard history" backup is shallow: its edit
+    // history before the restore is gone, so there is little to list and
+    // forking it can be refused. Show what we can rather than throwing.
+    let doc: LoroDoc;
+
+    try {
+      doc = liveDoc.fork();
+    } catch {
+      return [];
+    }
 
     // Loro merges sequential same-peer ops into a single Change whose
     // `length` is the operation count. Iterating only over Changes therefore
@@ -2889,6 +3047,7 @@ export class Resource<C extends OptionalClass = any> {
 
   /** Appends a Resource to a ResourceArray */
   public push(propUrl: string, values: JSONArray, unique?: boolean): void {
+    propUrl = canonicalPropKey(propUrl);
     const propVal = (this.get(propUrl) as JSONArray) ?? [];
 
     if (unique) {
@@ -2930,6 +3089,7 @@ export class Resource<C extends OptionalClass = any> {
    * Used for canvas strokes and other list fields that merge per element across peers.
    */
   public pushListItem(propUrl: string, item: JSONValue): void {
+    propUrl = canonicalPropKey(propUrl);
     const propVal = (this.get(propUrl) as JSONArray) ?? [];
     this.#cache[propUrl] = [...propVal, item];
     this.#cacheDirty = true;
@@ -3000,6 +3160,7 @@ export class Resource<C extends OptionalClass = any> {
    * `pushListItem`, just batched.
    */
   public replaceListItems(propUrl: string, items: JSONArray): void {
+    propUrl = canonicalPropKey(propUrl);
     this.#cache[propUrl] = [...items];
     this.#cacheDirty = true;
     this._dirty = true;
@@ -3029,7 +3190,9 @@ export class Resource<C extends OptionalClass = any> {
     const { LoroList, LoroMap } = LoroLoader.Loro;
 
     for (const [key, value] of Object.entries(obj)) {
-      if (
+      if (value === null) {
+        map.set(key, null);
+      } else if (
         typeof value === 'string' ||
         typeof value === 'number' ||
         typeof value === 'boolean'
@@ -3166,7 +3329,9 @@ export class Resource<C extends OptionalClass = any> {
     const { LoroList, LoroMap } = LoroLoader.Loro;
 
     for (const item of arr) {
-      if (Array.isArray(item)) {
+      if (item === null) {
+        list.push(null);
+      } else if (Array.isArray(item)) {
         const nested = list.pushContainer(new LoroList());
         this.writeJsonToLoroList(nested, item);
       } else if (item && typeof item === 'object') {
@@ -3260,10 +3425,12 @@ export class Resource<C extends OptionalClass = any> {
 
   /** Removes a property value combination from the resource */
   public remove(propertyUrl: string): void {
+    const requestedPropertyUrl = propertyUrl;
     const storedKeys = this.storedSpellings(propertyUrl);
+    propertyUrl = canonicalPropKey(propertyUrl);
     this.removeUnsafe(propertyUrl);
     this._dirty = true;
-    this.emitLocalChange(propertyUrl, storedKeys, undefined);
+    this.emitLocalChange(requestedPropertyUrl, storedKeys, undefined);
   }
 
   /** Notifies readers of the requested and every stored spelling. */
@@ -3611,6 +3778,8 @@ export class Resource<C extends OptionalClass = any> {
 
   /** The save currently running, so a concurrent `save()` waits for it. */
   private _inflightSave?: Promise<SaveResult>;
+  /** Local-only commits retained until their required snapshot is durable. */
+  private _pendingLocalOnlyCommits: Commit[] = [];
 
   public async save(): Promise<SaveResult> {
     // Two saves running at once each sign their own commit from the same
@@ -3639,6 +3808,7 @@ export class Resource<C extends OptionalClass = any> {
     if (
       !hasChanges &&
       !this._pendingGenesis &&
+      this._pendingLocalOnlyCommits.length === 0 &&
       !this.store.outbox.hasPending(this.subject)
     ) {
       // Save called on a clean resource (typical on blur with no edits) — not
@@ -3666,10 +3836,36 @@ export class Resource<C extends OptionalClass = any> {
       throw new Error('No agent has been set, you cannot save.');
     }
 
+    if (this._pendingGenesis && this._pendingGenesis.signer !== agent.subject) {
+      throw new RequestCancelledError(
+        'Pending genesis belongs to another identity',
+      );
+    }
+
+    for (const commit of this._pendingLocalOnlyCommits) {
+      if (commit.signer !== agent.subject) {
+        throw new RequestCancelledError(
+          'Pending local-only commit belongs to another identity',
+        );
+      }
+    }
+
     if (this.store.requireOnlineWrites && !this.store.serverConnected) {
       throw new Error(
         'The local node is not connected; this change was not saved.',
       );
+    }
+
+    // Class `constraints`, for classes already in the local store. Never
+    // fetches: an unloaded class is skipped and the server is the authority.
+    if (hasChanges) {
+      checkResourceConstraints(this, subject => {
+        const local =
+          this.store.resources.get(subject) ??
+          this.store.resources.get(canonicalizeScheme(subject));
+
+        return local?.isReady() ? local : undefined;
+      });
     }
 
     if (!this._lastCommit) {
@@ -3691,16 +3887,15 @@ export class Resource<C extends OptionalClass = any> {
       return this.saveLocalOnly(agent, hasChanges);
     }
 
+    let newlyQueuedGenesis:
+      | { subject: string; commit: Commit; hadEntry: boolean }
+      | undefined;
+
     try {
-      // A genesis signed at creation time by `store.newResource` is held
-      // on the resource (`_pendingGenesis`) — NOT the outbox — so an
-      // unsaved placeholder (e.g. a table row created on mount but never
-      // filled) is never POSTed. Now that the user is explicitly
-      // saving, move it into the outbox to drain.
-      if (this._pendingGenesis) {
-        this.store.outbox.setGenesisCommit(this.subject, this._pendingGenesis);
-        this._pendingGenesis = undefined;
-      } else if (
+      let genesis = this._pendingGenesis;
+
+      if (
+        !genesis &&
         hasChanges &&
         (this.subject.startsWith('_new:') ||
           (this.new &&
@@ -3710,18 +3905,15 @@ export class Resource<C extends OptionalClass = any> {
         // Genesis path for drafts whose genesis was not signed at creation:
         // `store.newResource({ deferGenesis: true })` (the new-resource form,
         // table rows, forks), and legacy `_new:` placeholders from older
-        // builds, which are `set()` + `save()`d with no explicit genesis step.
-        // Sign now: `signChanges` auto-detects genesis (no lastCommit stamp +
-        // DID-eligible). For a legacy `_new:` subject the real `did:ad:<sig>`
-        // only exists after signing, so it derives the DID and renames this
-        // resource in place; we enqueue the signed genesis under the NEW
-        // subject. Without this a `_new:`
-        // subject would be marked dirty and the drain would POST a commit
-        // with `subject: "_new:…"`, which the server rejects ("Unable to
-        // parse string as URL") and retries forever.
+        // builds. Keep the signed envelope on the Resource until an offline
+        // snapshot is durable; online saves move it to the outbox before drain.
         try {
-          const genesis = await this.signChanges(agent);
-          this.store.outbox.setGenesisCommit(this.subject, genesis);
+          genesis = await this.signChanges(agent);
+          this._pendingGenesis = genesis;
+
+          if (this.store.getAgent() !== agent) {
+            throw new RequestCancelledError('Identity changed during save');
+          }
         } catch (e) {
           if (
             e instanceof Error &&
@@ -3735,10 +3927,18 @@ export class Resource<C extends OptionalClass = any> {
       }
 
       if (!this.store.serverConnected) {
-        // Offline: the snapshot and the outbox entry are written together.
-        await this.saveOffline(hasChanges);
+        await this.saveOffline(hasChanges, genesis, agent);
 
         return 'offline';
+      }
+
+      if (genesis) {
+        const subject = this.subject;
+        const hadEntry = !!this.store.outbox.getEntry(subject);
+        this.store.outbox.setGenesisCommit(subject, genesis);
+        newlyQueuedGenesis = { subject, commit: genesis, hadEntry };
+
+        if (this._pendingGenesis === genesis) this._pendingGenesis = undefined;
       }
 
       if (hasChanges) {
@@ -3758,6 +3958,10 @@ export class Resource<C extends OptionalClass = any> {
       const entry = this.store.outbox.getEntry(this.subject);
       const savingVersion = this._loroDoc?.oplogVersion().toJSON();
       await this.store.syncDirtyResources();
+
+      if (this.store.getAgent() !== agent) {
+        throw new RequestCancelledError('Identity changed during save');
+      }
 
       if (entry?.lastAttemptFailure) {
         throw entry.lastAttemptFailure.cause;
@@ -3789,15 +3993,26 @@ export class Resource<C extends OptionalClass = any> {
       // canvas, a second comments folder). A local database that is stuck
       // behind another tab gets a short wait, then the save reports success.
       await withDeadline(
-        this.persistToClientDb(),
+        this.mirrorToClientDb(),
         LOCAL_MIRROR_AFTER_ACK_DEADLINE_MS,
         false,
       );
+
+      if (this.store.getAgent() !== agent) {
+        throw new RequestCancelledError('Identity changed during save');
+      }
+
       this.commitError = undefined;
 
       return 'persisted';
     } catch (e) {
+      if (e instanceof RequestCancelledError) throw e;
+
       if (isNetworkError(e)) {
+        if (this.store.getAgent() !== agent) {
+          throw new RequestCancelledError('Identity changed during save');
+        }
+
         this.store.setServerConnected(false);
 
         if (this.store.requireOnlineWrites) {
@@ -3808,7 +4023,26 @@ export class Resource<C extends OptionalClass = any> {
           );
         }
 
-        await this.saveOffline();
+        try {
+          await this.saveOffline(hasChanges, undefined, agent);
+        } catch (offlineError) {
+          if (
+            this.store.getAgent() === agent &&
+            newlyQueuedGenesis &&
+            !newlyQueuedGenesis.hadEntry
+          ) {
+            const queued = this.store.outbox.getEntry(
+              newlyQueuedGenesis.subject,
+            );
+
+            if (queued?.signedGenesis === newlyQueuedGenesis.commit) {
+              this.store.outbox.discard(newlyQueuedGenesis.subject);
+              this._pendingGenesis = newlyQueuedGenesis.commit;
+            }
+          }
+
+          throw offlineError;
+        }
 
         return 'offline';
       }
@@ -3816,6 +4050,24 @@ export class Resource<C extends OptionalClass = any> {
       this.commitError = e;
       this.applyToStore('local-pre-push');
       throw e;
+    }
+  }
+
+  private restoreSaveMetadata(
+    lastCommit: string | undefined,
+    createdAt: number | undefined,
+  ): void {
+    if (lastCommit === undefined) {
+      this._lastCommit = undefined;
+      this.removeUnsafe(properties.commit.lastCommit);
+    } else {
+      this.setLastCommitValue(lastCommit);
+    }
+
+    if (createdAt === undefined) {
+      this.removeUnsafe(commits.properties.createdAt);
+    } else {
+      this.setCreatedAtValue(createdAt);
     }
   }
 
@@ -3832,43 +4084,79 @@ export class Resource<C extends OptionalClass = any> {
     agent: Agent,
     hasChanges: boolean,
   ): Promise<SaveResult> {
-    const settled: Commit[] = [];
-    const genesis = this._pendingGenesis;
-    this._pendingGenesis = undefined;
+    if (this.store.getAgent() !== agent) {
+      throw new RequestCancelledError(
+        'Identity changed during local-only save',
+      );
+    }
 
-    if (genesis) {
-      settled.push(genesis);
-      // The delta sign below uses lastCommit as the "already exists"
-      // stamp — point it at the genesis first.
-      this.setLastCommitValue(commitSubject(genesis.signature));
+    const clientDb = await this.requiredClientDb(agent);
+
+    this.assertPersistenceOwner(clientDb, agent);
+
+    const genesis = this._pendingGenesis;
+    const pending = this._pendingLocalOnlyCommits;
+
+    if (genesis && !pending.includes(genesis)) pending.push(genesis);
+
+    const previousLastCommit =
+      this._lastCommit ??
+      (this.get(properties.commit.lastCommit) as string | undefined);
+    const previousCreatedAt = this.get(commits.properties.createdAt) as
+      | number
+      | undefined;
+
+    if (pending.length > 0) {
+      this.setLastCommitValue(
+        commitSubject(pending[pending.length - 1].signature),
+      );
     }
 
     if (hasChanges) {
       try {
-        settled.push(await this.signChanges(agent));
+        const commit = await this.signChanges(agent);
+        pending.push(commit);
+
+        if (this.store.getAgent() !== agent) {
+          throw new RequestCancelledError(
+            'Identity changed during local-only save',
+          );
+        }
       } catch (e) {
         if (e instanceof Error && e.message.startsWith('No changes to sign')) {
-          if (settled.length === 0) return 'noop';
+          if (pending.length === 0) return 'noop';
         } else {
+          this.restoreSaveMetadata(previousLastCommit, previousCreatedAt);
           throw e;
         }
       }
     }
 
-    // Server sets `createdAt` on apply; local-only resources need it
-    // locally for sorting (mirrors `saveOffline`).
+    if (pending.length === 0) return 'noop';
+
     if (this.get(commits.properties.createdAt) === undefined) {
       this.setCreatedAtValue(Date.now());
     }
 
-    for (const commit of settled) {
-      this.setLastCommitValue(commitSubject(commit.signature));
-      this.store.logLocalOnlyCommitSettled(commit);
+    this.setLastCommitValue(
+      commitSubject(pending[pending.length - 1].signature),
+    );
+
+    try {
+      await this.persistToOwnedClientDb(clientDb, agent);
+      this.assertPersistenceOwner(clientDb, agent);
+    } catch (e) {
+      this.restoreSaveMetadata(previousLastCommit, previousCreatedAt);
+      throw e;
     }
 
-    await this.persistToClientDb();
-    for (const commit of settled) this.store.publishPeerCommit(commit);
+    for (const commit of pending) {
+      this.store.logLocalOnlyCommitSettled(commit);
+      this.store.publishPeerCommit(commit);
+    }
 
+    if (genesis && pending.includes(genesis)) this._pendingGenesis = undefined;
+    pending.length = 0;
     this.commitError = undefined;
     this.loading = false;
     this.applyToStore('local-acked');
@@ -3892,15 +4180,38 @@ export class Resource<C extends OptionalClass = any> {
    *    both or neither. The entry changes in memory only after that write,
    *    so `pendingDirtyCount > 0` still means the edit is durable.
    */
-  private async saveOffline(markDirty = false): Promise<void> {
-    // Server sets createdAt on apply; we need it locally for sort.
-    if (this.get(commits.properties.createdAt) === undefined) {
-      this.setCreatedAtValue(Date.now());
+  private async saveOffline(
+    markDirty: boolean,
+    genesis: Commit | undefined,
+    agent: Agent,
+  ): Promise<void> {
+    if (this.store.getAgent() !== agent) {
+      throw new RequestCancelledError('Identity changed during offline save');
     }
 
-    const signedGenesis = this.store.outbox.getEntry(
-      this.subject,
-    )?.signedGenesis;
+    const clientDb = await this.requiredClientDb(agent);
+
+    this.assertPersistenceOwner(clientDb, agent);
+
+    // Server sets createdAt on apply; we need it locally for sort.
+    const previousLastCommit =
+      this._lastCommit ??
+      (this.get(properties.commit.lastCommit) as string | undefined);
+    const previousCreatedAt = this.get(commits.properties.createdAt) as
+      | number
+      | undefined;
+    const signedGenesis =
+      genesis ?? this.store.outbox.getEntry(this.subject)?.signedGenesis;
+
+    if (signedGenesis && signedGenesis.signer !== agent.subject) {
+      throw new RequestCancelledError(
+        'Pending genesis belongs to another identity',
+      );
+    }
+
+    if (previousCreatedAt === undefined) {
+      this.setCreatedAtValue(Date.now());
+    }
 
     if (signedGenesis) {
       this.setLastCommitValue(commitSubject(signedGenesis.signature));
@@ -3922,11 +4233,31 @@ export class Resource<C extends OptionalClass = any> {
       ? undefined
       : this.getEncodedSaveCursor() || undefined;
 
-    await this.store.outbox.recordOfflineSave(
-      this.subject,
-      { baseVersion, dirty: markDirty },
-      outbox => this.persistToClientDb(outbox),
-    );
+    try {
+      await this.store.outbox.recordOfflineSave(
+        this.subject,
+        { baseVersion, dirty: markDirty, signedGenesis },
+        outbox => this.persistToOwnedClientDb(clientDb, agent, outbox),
+        () =>
+          this.store.getAgent() === agent &&
+          this.store.getClientDb() === clientDb,
+      );
+    } catch (e) {
+      this.restoreSaveMetadata(previousLastCommit, previousCreatedAt);
+      throw e;
+    }
+
+    if (
+      this.store.getAgent() !== agent ||
+      this.store.getClientDb() !== clientDb
+    ) {
+      this.restoreSaveMetadata(previousLastCommit, previousCreatedAt);
+      throw new RequestCancelledError('Owner changed during offline save');
+    }
+
+    if (genesis && this._pendingGenesis === genesis) {
+      this._pendingGenesis = undefined;
+    }
 
     this.commitError = undefined;
     this.loading = false;
@@ -3954,33 +4285,110 @@ export class Resource<C extends OptionalClass = any> {
   public async persistToClientDb(
     outbox?: ClientDbOutboxWrite,
   ): Promise<boolean> {
-    // The identity database can be between workers while its key is derived.
-    // A save must not resolve in that gap without writing its snapshot.
-    const identity = this.store.getAgent()?.subject;
-    await this.store.waitForClientDb(10_000);
+    const agent = this.store.getAgent();
+    const clientDb = await this.requiredClientDb(agent);
 
-    const opening = this.store.getClientDb();
+    return this.persistToOwnedClientDb(clientDb, agent, outbox);
+  }
 
+  private assertPersistenceOwner(
+    clientDb: ClientDbWorker,
+    agent: Agent | undefined,
+  ): void {
     if (
-      opening &&
-      !opening.unsupportedEnvironment &&
-      opening.isOpen === false
+      this.store.getAgent() !== agent ||
+      this.store.getClientDb() !== clientDb
     ) {
+      throw new RequestCancelledError('Owner changed during local persistence');
+    }
+  }
+
+  private async mirrorToClientDb(): Promise<boolean> {
+    const agent = this.store.getAgent();
+    let clientDb = this.store.getClientDb();
+
+    if (!clientDb) {
+      if (!(await this.store.waitForClientDb(10_000))) return false;
+      clientDb = this.store.getClientDb();
+    }
+
+    if (!clientDb || clientDb.unsupportedEnvironment) return false;
+    this.assertPersistenceOwner(clientDb, agent);
+
+    if (clientDb.isOpen !== true) {
+      const opened = await clientDb.whenOpen();
+
+      this.assertPersistenceOwner(clientDb, agent);
+
+      if (!opened) return false;
+    }
+
+    return this.persistToOwnedClientDb(clientDb, agent);
+  }
+
+  private async requiredClientDb(
+    agent: Agent | undefined,
+  ): Promise<ClientDbWorker> {
+    let clientDb = this.store.getClientDb();
+
+    if (!clientDb) {
+      const attached = await this.store.waitForClientDb(10_000);
+
+      clientDb = this.store.getClientDb();
+
+      if (!attached || !clientDb) {
+        throw new Error(
+          'Local database did not become available for this save',
+        );
+      }
+    }
+
+    if (this.store.getAgent() !== agent) {
+      throw new RequestCancelledError(
+        'Identity changed before local persistence',
+      );
+    }
+
+    if (!clientDb) {
+      throw new Error('Local database did not become available for this save');
+    }
+
+    if (clientDb.unsupportedEnvironment) {
+      throw new Error('Local database is unavailable for required persistence');
+    }
+
+    if (clientDb.isOpen !== true) {
       console.info(
         '[persistToClientDb] waiting for the local database to finish opening',
       );
-      await opening.whenOpen(LOCAL_COPY_OPEN_WAIT_MS);
+      const opened = await clientDb.whenOpen(LOCAL_COPY_OPEN_WAIT_MS);
+
+      if (
+        this.store.getAgent() !== agent ||
+        this.store.getClientDb() !== clientDb
+      ) {
+        throw new RequestCancelledError(
+          'Owner changed before local persistence',
+        );
+      }
+
+      if (!opened) {
+        throw new Error('Local database did not open for required persistence');
+      }
     }
 
-    if (this.store.getAgent()?.subject !== identity) {
-      throw new Error('Identity changed before local persistence');
-    }
+    this.assertPersistenceOwner(clientDb, agent);
 
-    const clientDb = this.store.getClientDb();
-    if (!clientDb || clientDb.unsupportedEnvironment) return false;
+    return clientDb;
+  }
 
-    // Rows for the queue's own database only; otherwise the outbox writes
-    // them itself once this resolves.
+  private async persistToOwnedClientDb(
+    clientDb: ClientDbWorker,
+    agent: Agent | undefined,
+    outbox?: ClientDbOutboxWrite,
+  ): Promise<boolean> {
+    this.assertPersistenceOwner(clientDb, agent);
+
     const withOutbox =
       outbox && this.store.outbox.isStoredIn(clientDb) ? outbox : undefined;
 
@@ -4006,6 +4414,16 @@ export class Resource<C extends OptionalClass = any> {
         exact: true,
         outbox: withOutbox,
       });
+
+      if (
+        this.store.getAgent() !== agent ||
+        this.store.getClientDb() !== clientDb
+      ) {
+        throw new RequestCancelledError(
+          'Owner changed during local persistence',
+        );
+      }
+
       closePersist();
 
       return !!withOutbox;
@@ -4041,6 +4459,9 @@ export class Resource<C extends OptionalClass = any> {
     /** A trusted built-in datatype: validate and tag without fetching Property metadata. */
     knownDatatype?: Datatype,
   ): Promise<void> {
+    const requestedProp = prop;
+    prop = canonicalPropKey(prop) as Prop;
+
     if (value instanceof Uint8Array) {
       throw new Error('Binary values (Uint8Array) cannot be set via set().');
     }
@@ -4088,7 +4509,7 @@ export class Resource<C extends OptionalClass = any> {
 
     if (value === undefined) {
       // `remove` emits the `LocalChange` for this property.
-      this.remove(prop);
+      this.remove(requestedProp);
 
       return;
     }
@@ -4111,10 +4532,12 @@ export class Resource<C extends OptionalClass = any> {
     this.#cacheDirty = true;
 
     this._dirty = true;
-    this.emitLocalChange(prop, storedKeys, value as JSONValue);
+    this.emitLocalChange(requestedProp, storedKeys, value as JSONValue);
   }
 
   public removeUnsafe(prop: string): void {
+    prop = canonicalPropKey(prop);
+
     if (prop === commits.properties.loroUpdate) {
       this._loroSnapshotBytes = undefined;
       this.resetLoroState();

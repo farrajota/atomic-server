@@ -21,6 +21,7 @@ import { useSettings } from '../../helpers/AppSettings';
 import { constructOpenURL } from '../../helpers/navigation';
 import { Button } from '../Button';
 import { ResourceSideBar } from './ResourceSideBar/ResourceSideBar';
+import { SidebarSelectionProvider } from './ResourceSideBar/SidebarSelection';
 import { SideBarHeader } from './SideBarHeader';
 import { SimpleErrorBlock } from '../ErrorLook';
 import { DriveSwitcher } from './DriveSwitcher';
@@ -30,12 +31,9 @@ import { buildDefaultTrigger } from '../Dropdown/DefaultTrigger';
 import { LuChevronsUpDown } from 'react-icons/lu';
 import { useCurrentSubject } from '../../helpers/useCurrentSubject';
 import { ScrollArea } from '../ScrollArea';
-import { useSidebarDnd } from './useSidebarDnd';
-import { closestCenter, DndContext, DragOverlay } from '@dnd-kit/core';
-import { SidebarItemTitle } from './ResourceSideBar/SidebarItemTitle';
+import { SidebarTrashLink } from './SidebarTrashLink';
 import { DropEdge } from './ResourceSideBar/DropEdge';
 import { SIDEBAR_CHILD_LIMIT, SideBarMoreRow } from './SideBarMoreRow';
-import { createPortal } from 'react-dom';
 import { useNavigateWithTransition } from '../../hooks/useNavigateWithTransition';
 import { LoaderInline } from '../Loader';
 import { QuickCreateRow } from '../NewInstanceButton';
@@ -45,25 +43,15 @@ import { paths } from '../../routes/paths';
 
 interface SideBarDriveProps {
   onItemClick: () => unknown;
-  onIsRearangingChange: (isRearanging: boolean) => void;
 }
 
-/** Shows the current Drive, it's children and an option to change to a different Drive */
-export function SideBarDrive({
-  onItemClick,
-  onIsRearangingChange,
-}: SideBarDriveProps): JSX.Element {
+/**
+ * Shows the current Drive, it's children and an option to change to a different Drive.
+ * Must render inside the sidebar's `DndContext` (see `SideBar`).
+ */
+export function SideBarDrive({ onItemClick }: SideBarDriveProps): JSX.Element {
   const store = useStore();
   const { drive, agent } = useSettings();
-  const {
-    handleDragStart,
-    handleDragEnd,
-    draggingResource,
-    sensors,
-    animateDrop,
-    dndExplanation,
-    announcements,
-  } = useSidebarDnd(onIsRearangingChange);
   const driveResource = useResource(drive);
   const {
     subjects: allChildren,
@@ -92,6 +80,11 @@ export function SideBarDrive({
   // And the Inbox (on the personal drive): it opens from Notifications in the
   // app menu.
   const [inbox] = useString(driveResource, notifications.properties.inbox);
+  // And the Trash folder: reached through its own row below the tree.
+  const [trashFolder] = useString(
+    driveResource,
+    dataBrowser.properties.trashFolder,
+  );
   const subResources = useMemo(
     () =>
       allChildren.filter(subject => {
@@ -101,10 +94,18 @@ export function SideBarDrive({
           canonical !== canonicalizeScheme(defaultOntology ?? '') &&
           canonical !== canonicalizeScheme(commentsFolder ?? '') &&
           canonical !== canonicalizeScheme(aiChatsFolder ?? '') &&
-          canonical !== canonicalizeScheme(inbox ?? '')
+          canonical !== canonicalizeScheme(inbox ?? '') &&
+          canonical !== canonicalizeScheme(trashFolder ?? '')
         );
       }),
-    [allChildren, defaultOntology, commentsFolder, aiChatsFolder, inbox],
+    [
+      allChildren,
+      defaultOntology,
+      commentsFolder,
+      aiChatsFolder,
+      inbox,
+      trashFolder,
+    ],
   );
   const [title] = useTitle(driveResource);
   const isPrivateDrive = useIsPrivateDrive(drive);
@@ -118,6 +119,9 @@ export function SideBarDrive({
   const [currentSubject] = useCurrentSubject();
   const currentResource = useResource(currentSubject);
   const [ancestry, setAncestry] = useState<string[]>([]);
+  // One array for the whole render: a fresh `[drive]` per render defeats the
+  // memo on every top-level row, and with it the rows below.
+  const driveHierarchy = useMemo(() => [drive], [drive]);
 
   useEffect(() => {
     store.getResourceAncestry(currentResource.stable).then(result => {
@@ -165,27 +169,11 @@ export function SideBarDrive({
           <DriveSwitcher Trigger={DriveSwitcherTrigger} />
         )}
       </SideBarHeader>
-      <DndContext
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        sensors={sensors}
-        // `closestCenter` lets the 3-pixel `DropEdge` strips between
-        // siblings win over the much-taller "drop onto folder row"
-        // targets when the dragged item is over a sibling gap. With the
-        // default `rectIntersection` the bigger row always swallowed
-        // every drop and inter-sibling reordering became unreachable.
-        collisionDetection={closestCenter}
-        accessibility={{
-          announcements,
-          screenReaderInstructions: {
-            draggable: dndExplanation,
-          },
-        }}
-      >
+      <SidebarSelectionProvider current={currentSubject} ancestry={ancestry}>
         <StyledScrollArea>
           <ListWrapper>
             <DropEdge
-              parentHierarchy={[drive]}
+              parentHierarchy={driveHierarchy}
               index={0}
               prevSubject={undefined}
               nextSubject={subResources[0]}
@@ -203,12 +191,11 @@ export function SideBarDrive({
                   <Fragment key={child}>
                     <ResourceSideBar
                       subject={child}
-                      renderedHierarchy={[drive]}
-                      ancestry={ancestry}
+                      renderedHierarchy={driveHierarchy}
                       onClick={onItemClick}
                     />
                     <DropEdge
-                      parentHierarchy={[drive]}
+                      parentHierarchy={driveHierarchy}
                       index={index + 1}
                       prevSubject={child}
                       nextSubject={subResources[index + 1]}
@@ -267,6 +254,9 @@ export function SideBarDrive({
                 onClick={onItemClick}
               />
             )}
+            {trashFolder && (
+              <SidebarTrashLink subject={trashFolder} onClick={onItemClick} />
+            )}
             {agentCanWrite && (
               <NewResourceRow gap='0' center>
                 <QuickCreateRow
@@ -279,19 +269,7 @@ export function SideBarDrive({
             )}
           </ListWrapper>
         </StyledScrollArea>
-        {createPortal(
-          <DragOverlay dropAnimation={animateDrop}>
-            {draggingResource && (
-              <SidebarItemTitle
-                subject={draggingResource}
-                hideActionButtons
-                isDragging
-              />
-            )}
-          </DragOverlay>,
-          document.body,
-        )}
-      </DndContext>
+      </SidebarSelectionProvider>
     </>
   );
 }

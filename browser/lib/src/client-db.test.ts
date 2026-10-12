@@ -33,6 +33,23 @@ describe('ClientDbWorker without a secure context', () => {
     expect(db.initError).toBeInstanceOf(Error);
     expect(db.initError?.message).toMatch(/insecure connection/i);
   });
+  it('settles a pre-init whenOpen waiter when Web Locks are unavailable', async () => {
+    vi.stubGlobal('navigator', { locks: undefined });
+    const db = new ClientDbWorker('wasm-url', 'worker-url');
+    const opened = db.whenOpen();
+
+    try {
+      await expect(
+        db.init('http://homeassistant.local:9883'),
+      ).resolves.toBeUndefined();
+      const outcome = await Promise.race([opened, Promise.resolve(undefined)]);
+
+      expect(outcome).toBe(false);
+    } finally {
+      db.destroy();
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe('ClientDbWorker cold initialization', () => {
@@ -115,6 +132,7 @@ describe('ClientDbWorker cold initialization', () => {
     const db = new ClientDbWorker('wasm-url', 'worker-url');
 
     try {
+      const lateOpen = db.whenOpen();
       const initialized = db.init('https://example.com');
       await vi.advanceTimersByTimeAsync(LEADER_ELECTION_AND_STEAL_MS);
       await initialized;
@@ -130,6 +148,7 @@ describe('ClientDbWorker cold initialization', () => {
       // And it recovers on its own once the boot lands, without a reload.
       await vi.advanceTimersByTimeAsync(14_000);
       expect(db.initError).toBeUndefined();
+      await expect(lateOpen).resolves.toBe(true);
       await expect(db.waitForReady()).resolves.toBe(true);
     } finally {
       db.destroy();
@@ -485,12 +504,14 @@ describe('ClientDbWorker when OPFS is denied', () => {
         close() {}
       },
     );
+    const workerInits = vi.fn();
     vi.stubGlobal(
       'Worker',
       class {
         onmessage?: (event: unknown) => void;
         postMessage(message: { id: string; type?: string }) {
           if (message.type !== 'init') return;
+          workerInits();
 
           queueMicrotask(() =>
             this.onmessage?.({
@@ -525,6 +546,56 @@ describe('ClientDbWorker when OPFS is denied', () => {
       expect(db.initError?.message).toContain(
         'nothing is kept locally between reloads',
       );
+      // A definitive OPFS denial must settle before election recovery can
+      // steal the lock and attempt another open.
+      await vi.advanceTimersByTimeAsync(LEADER_ELECTION_AND_STEAL_MS + 1000);
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(workerInits).toHaveBeenCalledTimes(1);
+    } finally {
+      db.destroy();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+  it('does not steal the lock after native Web Locks SecurityError', async () => {
+    vi.useFakeTimers();
+    const request = vi
+      .fn()
+      .mockRejectedValue(
+        new DOMException('storage access denied', 'SecurityError'),
+      );
+    vi.stubGlobal('navigator', { locks: { request } });
+    vi.stubGlobal(
+      'BroadcastChannel',
+      class {
+        postMessage() {}
+        close() {}
+      },
+    );
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const db = new ClientDbWorker('wasm-url', 'worker-url');
+
+    try {
+      const initialized = db.init('https://example.com');
+      await vi.advanceTimersByTimeAsync(3000);
+
+      await expect(initialized).resolves.toBeUndefined();
+      await expect(db.waitForReady()).resolves.toBe(false);
+      expect(db.initError?.name).toBe('StorageBlockedError');
+      expect(db.isOpen).toBe(false);
+      await expect(db.whenOpen()).resolves.toBe(false);
+      expect(db.initError?.message).toContain(
+        'Local caching and offline support are disabled',
+      );
+      expect(db.initError?.message).toContain(
+        'reading directly from the server',
+      );
+      expect(db.initError?.message).toContain(
+        'nothing is kept locally between reloads',
+      );
+      await vi.advanceTimersByTimeAsync(LEADER_ELECTION_AND_STEAL_MS + 1000);
+      expect(request).toHaveBeenCalledTimes(1);
     } finally {
       db.destroy();
       vi.restoreAllMocks();

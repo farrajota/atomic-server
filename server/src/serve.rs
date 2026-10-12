@@ -205,7 +205,12 @@ async fn clear_remote_cache(appstate: &crate::appstate::AppState) -> AtomicServe
 /// avoid broadcasting throwaway test drives to the DHT.
 const DEV_DRIVE_MARKER: &str = "[atomic-data:dev-drive]";
 
-/// Publish this server's Iroh NodeID to the pkarr DHT, one record per drive
+/// How often the pkarr records are published again. A record that is only
+/// published once at boot expires from the relay, so a long-running server
+/// refreshes it.
+const PKARR_REANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Publish this server's Iroh NodeID and public https origin to the pkarr DHT, one record per drive
 /// it hosts. Pkarr keys the record by a keypair derived from the drive's DID
 /// (see `atomic_lib::discovery::publish_node_id`), so clients resolving a
 /// `?drive=did:ad:...` hint can find the node(s) hosting that specific drive.
@@ -214,7 +219,8 @@ const DEV_DRIVE_MARKER: &str = "[atomic-data:dev-drive]";
 /// development and publishing each is pure noise).
 async fn announce_drives_pkarr(
     appstate: &crate::appstate::AppState,
-    node_id: &str,
+    node_id: Option<&str>,
+    http_origin: Option<&str>,
 ) -> Result<(), String> {
     use atomic_lib::Storelike;
 
@@ -251,7 +257,7 @@ async fn announce_drives_pkarr(
             continue;
         }
 
-        match atomic_lib::discovery::publish_node_id(drive_did, node_id).await {
+        match atomic_lib::discovery::publish_drive_record(drive_did, node_id, http_origin).await {
             Ok(_) => published += 1,
             Err(e) => tracing::warn!("Pkarr: failed for drive {drive_did}: {e}"),
         }
@@ -263,17 +269,24 @@ async fn announce_drives_pkarr(
     );
     Ok(())
 }
+/// Whether discovery publication is allowed by the operator's P2P switch.
+fn should_announce_pkarr(
+    disable_p2p: bool,
+    node_id: Option<&str>,
+    http_origin: Option<&str>,
+) -> bool {
+    !disable_p2p && (node_id.is_some() || http_origin.is_some())
+}
 
-/// Start the Iroh peer-to-peer transport and announce this node on pkarr,
-/// unless the operator switched p2p off with `--disable-p2p`. Returns the
-/// router, which must be kept alive for incoming connections, or `None` when
-/// p2p is off or failed to start.
-async fn start_p2p(appstate: &crate::appstate::AppState) -> Option<impl Sized> {
+/// Start the Iroh peer-to-peer transport unless the operator switched it off
+/// with `--disable-p2p`. Returns the router, which must stay alive for incoming
+/// connections, and its node ID for the opt-in discovery publication.
+async fn start_p2p(appstate: &crate::appstate::AppState) -> Option<(impl Sized, String)> {
     if appstate.config.opts.disable_p2p {
-        // Nothing below may run: binding the endpoint already contacts the n0
-        // relays, and the announcement publishes every hosted Drive's DID.
+        // Binding the endpoint contacts the n0 relays, so the switch must stop
+        // before starting Iroh.
         tracing::info!(
-            "P2P disabled (--disable-p2p): no Iroh endpoint, relay or pkarr announcement"
+            "P2P disabled (--disable-p2p): no Iroh endpoint, relay or pkarr publication"
         );
         return None;
     }
@@ -286,17 +299,7 @@ async fn start_p2p(appstate: &crate::appstate::AppState) -> Option<impl Sized> {
                 atomic_lib::sync::peer::effective_device_name(&store),
                 atomic_lib::identifiers::node_subject(&node_id.to_string())
             );
-
-            // Announce this server's NodeID via pkarr relay, one record per
-            // drive (see `announce_drives_pkarr`).
-            let appstate_clone = appstate.clone();
-            actix_web::rt::spawn(async move {
-                if let Err(e) = announce_drives_pkarr(&appstate_clone, &node_id.to_string()).await {
-                    tracing::warn!("Pkarr announcement failed: {e}");
-                }
-            });
-
-            Some(router)
+            Some((router, node_id.to_string()))
         }
         Err(e) => {
             tracing::warn!("Failed to start Iroh transport: {e}");
@@ -449,8 +452,40 @@ where
     // crash is owned by `atomic_lib` (`Db::init_redb_file` spawns it), so the
     // desktop and Flutter bindings get it without remembering to.
 
-    // Start Iroh peer-to-peer transport
-    let _iroh_router = start_p2p(&appstate).await;
+    // Start Iroh only when enabled; its node ID is the optional P2P discovery value.
+    let p2p = start_p2p(&appstate).await;
+    let pkarr_node_id = p2p.as_ref().map(|(_, node_id)| node_id.clone());
+    let _iroh_router = p2p.map(|(router, _)| router);
+
+    // Announce the Iroh NodeID (when enabled) and public HTTPS origin so a
+    // browser can find a drive from its secret. --disable-p2p suppresses this
+    // outbound publication even when the HTTP origin alone is public.
+    // Re-publish hourly because the record expires.
+    {
+        let appstate_clone = appstate.clone();
+        let http_origin = atomic_lib::discovery::public_https_origin(&appstate.config.get_origin());
+        if should_announce_pkarr(
+            appstate.config.opts.disable_p2p,
+            pkarr_node_id.as_deref(),
+            http_origin.as_deref(),
+        ) {
+            actix_web::rt::spawn(async move {
+                let mut interval = actix_web::rt::time::interval(PKARR_REANNOUNCE_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = announce_drives_pkarr(
+                        &appstate_clone,
+                        pkarr_node_id.as_deref(),
+                        http_origin.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("Pkarr announcement failed: {e}");
+                    }
+                }
+            });
+        }
+    }
 
     // Catch up any drive the user asked us to replicate elsewhere. A target is
     // standing config, not a one-shot command, so anything committed while the
@@ -737,11 +772,24 @@ mod connection_budget_tests {
 #[cfg(test)]
 mod p2p_switch_tests {
     /// `--disable-p2p` (`ATOMIC_DISABLE_P2P`) keeps the node off the public
-    /// p2p network: no Iroh endpoint is bound, so there is no node ID, no relay
-    /// connection, and nothing for the pkarr announcement to publish (it runs
-    /// only for a started endpoint's node ID). The node ID is process-global;
-    /// no other server unit test starts Iroh, so it is unset unless this call
-    /// set it.
+    /// P2P network: no Iroh endpoint is bound, and the same switch suppresses
+    /// pkarr publication even when a public HTTP origin is configured. The node
+    /// ID is process-global; no other server unit test starts Iroh, so it is
+    /// unset unless this call set it.
+    #[test]
+    fn disabled_p2p_suppresses_origin_only_discovery_publication() {
+        assert!(!super::should_announce_pkarr(
+            true,
+            None,
+            Some("https://atomic.example"),
+        ));
+        assert!(super::should_announce_pkarr(
+            false,
+            None,
+            Some("https://atomic.example"),
+        ));
+    }
+
     #[actix_rt::test]
     async fn disable_p2p_starts_no_iroh_endpoint() {
         use clap::Parser;

@@ -1,8 +1,9 @@
 import { enableLoro } from './loro-loader.js';
-import { describe, it, vi, afterEach } from 'vitest';
+import { describe, it, vi, afterEach, expect as assert } from 'vitest';
 import { Resource, Store, core, Core, Datatype } from './index.js';
 import { bootstrapCoreVocab } from './test-vocab.js';
 import { testStore } from './test-store.js';
+import { RequestCancelledError } from './error.js';
 
 describe('Store', () => {
   it('settles concurrent readers when a WebSocket GET fails', async ({
@@ -455,8 +456,8 @@ describe('Store', () => {
     );
     const putResourceWithSnapshot = vi.fn().mockResolvedValue(undefined);
     store.setClientDb({
-      isReady: true,
-      flush: async () => undefined,
+      isOpen: true,
+      unsupportedEnvironment: false,
       putResourceWithSnapshot,
     } as unknown as Parameters<Store['setClientDb']>[0]);
     await resource.set(core.properties.name, 'After', false);
@@ -486,13 +487,13 @@ describe('Store', () => {
     });
     await resource.save();
     let release!: () => void;
-    const pendingWrite = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    const putResourceWithSnapshot = vi.fn(() => pendingWrite);
+    const pendingWrite = Promise.withResolvers<void>();
+    release = () => pendingWrite.resolve();
+    const putResourceWithSnapshot = vi.fn(() => pendingWrite.promise);
     const flush = vi.fn(() => Promise.reject(new Error('worker destroyed')));
     store.setClientDb({
-      isReady: true,
+      isOpen: true,
+      unsupportedEnvironment: false,
       flush,
       putResourceWithSnapshot,
     } as unknown as Parameters<Store['setClientDb']>[0]);
@@ -508,7 +509,6 @@ describe('Store', () => {
       );
       // The server is already mocked as acknowledged; only the local write
       // remains blocked. Leaving now must not expose the pre-edit cache.
-      await new Promise(resolve => setTimeout(resolve, 20));
       expect(finished).toBe(false);
     } finally {
       release();
@@ -519,22 +519,215 @@ describe('Store', () => {
     expect(flush).not.toHaveBeenCalled();
   });
 
-  it('does not write to a database in unsupported server-only mode', async ({
+  it('keeps an existing Agent save pending through cache attachment until server acknowledgement', async ({
+    expect,
+  }) => {
+    const { store, agentDID, posted, postCommitSpy } = await testStore();
+    const resource = new Resource(agentDID);
+    await resource.set(core.properties.name, 'Before attachment', false);
+    resource.loading = false;
+    store.addResource(resource);
+    const subject = resource.subject;
+    store.expectClientDb();
+    await resource.set(core.properties.name, 'After attachment', false);
+
+    const initialization = Promise.withResolvers<boolean>();
+    const opening = Promise.withResolvers<boolean>();
+    const acknowledgement = Promise.withResolvers<void>();
+    const initError = Object.assign(new Error('cache storage denied'), {
+      name: 'StorageBlockedError',
+    });
+    const database = {
+      isOpen: false,
+      isReady: false,
+      isInitialized: false,
+      initError,
+      unsupportedEnvironment: false,
+      waitForInit: () => initialization.promise,
+      whenOpen: () => opening.promise,
+      outboxEntries: async () => [],
+      outboxWrite: async () => undefined,
+    } as unknown as Parameters<Store['setClientDb']>[0];
+
+    postCommitSpy.mockImplementationOnce(async commit => {
+      await acknowledgement.promise;
+      const created = {
+        ...commit,
+        id: `https://example.com/commits/${commit.signature}`,
+      } as typeof commit;
+      posted.push(created);
+
+      return created;
+    });
+
+    let settled = false;
+    const saving = resource.save().then(
+      value => {
+        settled = true;
+
+        return { value };
+      },
+      error => {
+        settled = true;
+
+        return { error };
+      },
+    );
+    await vi.waitFor(() => expect(store.outbox.hasPending(subject)).toBe(true));
+
+    store.setClientDb(database);
+    expect(settled).toBe(false);
+    initialization.resolve(false);
+    opening.resolve(false);
+
+    try {
+      await vi.waitFor(() => expect(postCommitSpy).toHaveBeenCalledOnce());
+      expect(settled).toBe(false);
+      expect(store.outbox.hasPending(subject)).toBe(true);
+    } finally {
+      acknowledgement.resolve();
+    }
+
+    expect(await saving).toEqual({ value: 'persisted' });
+    expect(store.outbox.hasPending(subject)).toBe(false);
+    expect(store.getSyncStatus().pendingDirtyCount).toBe(0);
+  });
+
+  it('waits for the captured database to open before publishing optional cache state', async ({
+    expect,
+  }) => {
+    await enableLoro();
+    const store = new Store({ serverUrl: 'https://example.com' });
+    let isOpen = false;
+    const opening = Promise.withResolvers<boolean>();
+
+    const opened = (value: boolean) => {
+      isOpen = value;
+      opening.resolve(value);
+    };
+
+    const putResourceWithSnapshot = vi.fn().mockResolvedValue(undefined);
+    const database = {
+      initError: undefined,
+      unsupportedEnvironment: false,
+      get isOpen() {
+        return isOpen;
+      },
+      whenOpen: vi.fn(() => opening.promise),
+      putResourceWithSnapshot,
+    } as unknown as Parameters<Store['setClientDb']>[0];
+    store.setClientDb(database);
+
+    const resource = new Resource('did:ad:slow-cache-open');
+    resource.setStore(store);
+    await resource.set(core.properties.name, 'Retained during open', false);
+    resource.loading = false;
+    resource.new = false;
+    store.addResource(resource);
+
+    expect(putResourceWithSnapshot).not.toHaveBeenCalled();
+    expect(resource.get(core.properties.name)).toBe('Retained during open');
+
+    opened(true);
+    await vi.waitFor(() =>
+      expect(putResourceWithSnapshot).toHaveBeenCalledOnce(),
+    );
+    expect(putResourceWithSnapshot).toHaveBeenCalledWith(
+      resource.subject,
+      expect.any(String),
+      expect.any(Uint8Array),
+      undefined,
+    );
+  });
+
+  it('does not publish a deferred cache write into a replacement database', async ({
+    expect,
+  }) => {
+    await enableLoro();
+    const store = new Store({ serverUrl: 'https://example.com' });
+    let isOpen = false;
+    const opening = Promise.withResolvers<boolean>();
+
+    const opened = (value: boolean) => {
+      isOpen = value;
+      opening.resolve(value);
+    };
+
+    const oldWrite = vi.fn().mockResolvedValue(undefined);
+    const oldDatabase = {
+      initError: undefined,
+      unsupportedEnvironment: false,
+      get isOpen() {
+        return isOpen;
+      },
+      whenOpen: vi.fn(() => opening.promise),
+      putResourceWithSnapshot: oldWrite,
+    } as unknown as Parameters<Store['setClientDb']>[0];
+    store.setClientDb(oldDatabase);
+
+    const resource = new Resource('did:ad:replaced-cache-open');
+    resource.setStore(store);
+    await resource.set(core.properties.name, 'Old identity state', false);
+    resource.loading = false;
+    resource.new = false;
+    store.addResource(resource);
+    store.setClientDb(undefined);
+    const replacementWrite = vi.fn().mockResolvedValue(undefined);
+    store.setClientDb({
+      initError: undefined,
+      unsupportedEnvironment: false,
+      isOpen: true,
+      putResourceWithSnapshot: replacementWrite,
+    } as unknown as Parameters<Store['setClientDb']>[0]);
+
+    opened(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(oldWrite).not.toHaveBeenCalled();
+    expect(replacementWrite).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch optional cache writes after storage is refused', async ({
+    expect,
+  }) => {
+    await enableLoro();
+    const store = new Store({ serverUrl: 'https://example.com' });
+    const putResourceWithSnapshot = vi.fn();
+    store.setClientDb({
+      initError: new Error('Local storage denied'),
+      unsupportedEnvironment: true,
+      isOpen: false,
+      putResourceWithSnapshot,
+    } as unknown as Parameters<Store['setClientDb']>[0]);
+
+    const resource = new Resource('did:ad:refused-cache-open');
+    resource.setStore(store);
+    await resource.set(core.properties.name, 'Online state', false);
+    resource.loading = false;
+    resource.new = false;
+    store.addResource(resource);
+
+    expect(putResourceWithSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('rejects direct required persistence in unsupported server-only mode', async ({
     expect,
   }) => {
     const store = new Store();
-    const putResourceWithSnapshot = vi
-      .fn()
-      .mockRejectedValue(new Error('unsupported'));
+    const putResourceWithSnapshot = vi.fn();
     store.setClientDb({
       initError: new Error('unsupported'),
       unsupportedEnvironment: true,
-      flush: async () => undefined,
+      isOpen: false,
       putResourceWithSnapshot,
     } as unknown as Parameters<Store['setClientDb']>[0]);
     const resource = new Resource('did:ad:server-only');
     resource.setStore(store);
-    await resource.persistToClientDb();
+
+    await expect(resource.persistToClientDb()).rejects.toThrow(
+      /local database|storage/i,
+    );
     expect(putResourceWithSnapshot).not.toHaveBeenCalled();
   });
 
@@ -575,8 +768,8 @@ describe('Store', () => {
     expect(finished).toBe(false);
     const putResourceWithSnapshot = vi.fn().mockResolvedValue(undefined);
     store.setClientDb({
-      isReady: true,
-      flush: async () => undefined,
+      isOpen: true,
+      unsupportedEnvironment: false,
       putResourceWithSnapshot,
     } as unknown as Parameters<Store['setClientDb']>[0]);
     await persisted;
@@ -588,6 +781,60 @@ describe('Store', () => {
     );
   });
 
+  it.each(['readiness', 'subjects', 'slice'] as const)(
+    'cancels a version-vector scan replaced during %s',
+    async boundary => {
+      const store = new Store({ serverUrl: 'https://example.com' });
+      const waiting = Promise.withResolvers<void>();
+      const reached = Promise.withResolvers<void>();
+      const subjects = Array.from({ length: 1001 }, (_, i) => `atomic:vv-${i}`);
+
+      const gate = async (at: typeof boundary) => {
+        if (at === boundary) {
+          reached.resolve();
+          await waiting.promise;
+        }
+      };
+
+      const slices: string[][] = [];
+      const database = {
+        isReady: boundary !== 'readiness',
+        waitForReady: async () => {
+          await gate('readiness');
+
+          return true;
+        },
+        getDriveSubjects: async () => {
+          await gate('subjects');
+
+          return subjects;
+        },
+        getVersionVectorsForSubjects: async (chunk: string[]) => {
+          slices.push(chunk);
+          await gate('slice');
+
+          return Object.fromEntries(
+            chunk.map(subject => [subject, { peer: 1 }]),
+          );
+        },
+        getVersionVectorsForDrive: async () => ({}),
+      };
+
+      store.setClientDb(database as never);
+
+      const scanning = store.computeDriveSyncState('atomic:vv-drive');
+      const rejected = assert(scanning).rejects.toBeInstanceOf(
+        RequestCancelledError,
+      );
+
+      await reached.promise;
+      store.setClientDb({ isReady: true } as never);
+      waiting.resolve();
+      await rejected;
+      assert(slices).toHaveLength(boundary === 'slice' ? 1 : 0);
+    },
+  );
+
   it('writes the same client-DB row from addResource and persistToClientDb', async ({
     expect,
   }) => {
@@ -595,8 +842,8 @@ describe('Store', () => {
     const store = new Store({ serverUrl: 'https://example.com' });
     const putResourceWithSnapshot = vi.fn().mockResolvedValue(undefined);
     store.setClientDb({
-      isReady: true,
-      flush: async () => undefined,
+      isOpen: true,
+      unsupportedEnvironment: false,
       putResourceWithSnapshot,
     } as unknown as Parameters<Store['setClientDb']>[0]);
 
@@ -623,6 +870,14 @@ describe('Store', () => {
 
     store.addResource(resource);
     expect(putResourceWithSnapshot).toHaveBeenCalledTimes(1);
+    // Finish the optional write before requesting a separate durable write;
+    // an in-flight identical write is intentionally reused by persistState.
+    await store.persistState(
+      store.getClientDb()!,
+      resource.subject,
+      putResourceWithSnapshot.mock.calls[0][1],
+      putResourceWithSnapshot.mock.calls[0][2],
+    );
     await resource.persistToClientDb();
     expect(putResourceWithSnapshot).toHaveBeenCalledTimes(2);
 
@@ -654,8 +909,8 @@ describe('Store', () => {
       const store = new Store({ serverUrl: 'https://example.com' });
       const putResourceWithSnapshot = vi.fn().mockResolvedValue(undefined);
       store.setClientDb({
-        isReady: true,
-        flush: async () => undefined,
+        isOpen: true,
+        unsupportedEnvironment: false,
         putResourceWithSnapshot,
       } as unknown as Parameters<Store['setClientDb']>[0]);
       // Canonical spelling: `persistToClientDb` keys the row by the

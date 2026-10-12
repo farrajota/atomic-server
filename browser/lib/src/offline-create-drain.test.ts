@@ -3,6 +3,38 @@ import { server } from './ontologies/server.js';
 import { testStore } from './test-store.js';
 import type { ClientDbWorker } from './client-db.js';
 import { canonicalizeScheme, isAtomicIdentifier } from './subject.js';
+import type { Store } from './store.js';
+
+function attachDurableSnapshotDb(store: Store) {
+  const snapshots = new Map<string, { jsonAd: string; snapshot: Uint8Array }>();
+  store.setClientDb({
+    isOpen: true,
+    isReady: true,
+    isInitialized: true,
+    whenOpen: async () => true,
+    waitForInit: async () => true,
+    waitForReady: async () => true,
+    getResourceWithSnapshot: async (subject: string) =>
+      snapshots.get(subject) ?? { jsonAd: null, snapshot: undefined },
+    getResourcesWithSnapshots: async (subjects: string[]) =>
+      subjects.map(
+        subject =>
+          snapshots.get(subject) ?? { jsonAd: null, snapshot: undefined },
+      ),
+    flush: async () => undefined,
+    unsupportedEnvironment: false,
+    putResourceWithSnapshot: async (
+      subject: string,
+      jsonAd: string,
+      snapshot?: Uint8Array,
+    ) => {
+      if (!snapshot) throw new Error('Expected a durable resource snapshot');
+      snapshots.set(subject, { jsonAd, snapshot: snapshot.slice() });
+    },
+  } as never);
+
+  return snapshots;
+}
 
 /**
  * Reproduces the develop full-e2e failure of
@@ -19,6 +51,7 @@ describe('offline create drain', () => {
     const { store } = await testStore();
     await store.createDrive('Home', { personal: true });
     store.setServerConnected(false);
+    attachDurableSnapshotDb(store);
 
     const extra = await store.createDrive('Offline-Created Drive', {
       personal: false,
@@ -41,6 +74,7 @@ describe('offline create drain', () => {
     const { store } = await testStore();
     await store.createDrive('Home', { personal: true });
     store.setServerConnected(false);
+    attachDurableSnapshotDb(store);
 
     const extra = await store.createDrive('Offline-Created Drive', {
       personal: false,
@@ -62,6 +96,7 @@ describe('offline create drain', () => {
     const { store } = await testStore();
     await store.createDrive('Home', { personal: true });
     store.setServerConnected(false);
+    attachDurableSnapshotDb(store);
 
     const extra = await store.createDrive('Offline-Created Drive', {
       personal: false,
@@ -84,6 +119,7 @@ describe('offline create drain', () => {
     expect(store.outbox.getEntry(ontology)).toBeUndefined();
     expect(store.getSyncStatus().pendingDirtyCount).toBe(0);
   });
+
   it.each([true, false])(
     'only clears an unchanged offline baseline with a complete local snapshot (available: %s)',
     async available => {
