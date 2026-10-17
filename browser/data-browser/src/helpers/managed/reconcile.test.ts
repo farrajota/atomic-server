@@ -92,7 +92,7 @@ describe('evaluateServerReconciliation', () => {
       unregisterLocalOnlyDrive: (drive: string) => events.push(drive),
     };
     const persist = vi.fn();
-    expect(await connectHostedDrive(store, 'did:ad:drive1', persist)).toBe(
+    expect(await connectHostedDrive(store, 'did:ad:drive1', persist, () => true)).toBe(
       true,
     );
     expect(events).toEqual(['did:ad:drive1', 'https://node1.atomicserver.eu']);
@@ -111,7 +111,7 @@ describe('evaluateServerReconciliation', () => {
         setServerUrl: vi.fn(),
         unregisterLocalOnlyDrive: vi.fn(),
       };
-      expect(await connectHostedDrive(store, 'did:ad:drive1', vi.fn())).toBe(
+      expect(await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), () => true)).toBe(
         false,
       );
       expect(store.setServerUrl).not.toHaveBeenCalled();
@@ -128,7 +128,7 @@ describe('evaluateServerReconciliation', () => {
       setServerUrl: vi.fn(),
       unregisterLocalOnlyDrive: vi.fn(),
     };
-    expect(await connectHostedDrive(store, 'did:ad:other', vi.fn())).toBe(
+    expect(await connectHostedDrive(store, 'did:ad:other', vi.fn(), () => true)).toBe(
       false,
     );
     expect(store.setServerUrl).not.toHaveBeenCalled();
@@ -148,7 +148,7 @@ describe('evaluateServerReconciliation', () => {
       setServerUrl: vi.fn(),
       unregisterLocalOnlyDrive: vi.fn(),
     };
-    expect(await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), 1)).toBe(
+    expect(await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), () => true, 1)).toBe(
       false,
     );
     mockFetch({
@@ -158,6 +158,47 @@ describe('evaluateServerReconciliation', () => {
     resolve(new Response(JSON.stringify({ email: 'a@example.com' })));
     await new Promise(done => setTimeout(done, 0));
     expect(store.setServerUrl).not.toHaveBeenCalled();
+  });
+
+  it('leaves the replacement session untouched when hosting discovery becomes obsolete', async () => {
+    mockFetch({
+      account: { email: 'a@example.com' },
+      enrollments: [enrollment({})],
+    });
+    const fetchNormally = globalThis.fetch;
+    const started = Promise.withResolvers<void>();
+    const lookup = Promise.withResolvers<Response>();
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/sync-enrollments')) {
+        started.resolve();
+
+        return lookup.promise;
+      }
+
+      return fetchNormally(input, init);
+    }) as typeof fetch;
+    const store = {
+      waitForServerConnected: vi.fn(),
+      setServerUrl: vi.fn(),
+      unregisterLocalOnlyDrive: vi.fn(),
+    };
+    const persist = vi.fn();
+    let current = true;
+    const connecting = connectHostedDrive(
+      store,
+      'did:ad:drive1',
+      persist,
+      () => current,
+    );
+    await started.promise;
+    current = false;
+    lookup.resolve(Response.json([enrollment({})]));
+
+    expect(await connecting).toBe(false);
+    expect(store.unregisterLocalOnlyDrive).not.toHaveBeenCalled();
+    expect(store.setServerUrl).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    expect(store.waitForServerConnected).not.toHaveBeenCalled();
   });
 
   it('is ok with no managed session (self-hosted / local-only)', async () => {

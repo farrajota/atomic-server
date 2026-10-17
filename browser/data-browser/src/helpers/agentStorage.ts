@@ -10,12 +10,17 @@ import { del, get, set } from 'idb-keyval';
 import { adoptAgentOnDevice } from './adoptAgent';
 import {
   clearSessionDbKeys,
-  ensureDbKeyOnSignIn,
+  DbKeyConflictError,
+  prepareDbKeyOnSignIn,
   trackDbKeySignIn,
+  type PreparedDbKeyOnSignIn,
   type SignInCredentials,
 } from './localDbKey';
 
 const AGENT_IDB_KEY = 'atomic.agent';
+
+const IDB_KEYVAL_DATABASE = 'keyval-store';
+const IDB_KEYVAL_OBJECT_STORE = 'keyval';
 
 interface StoredAgent {
   keyPair: CryptoKeyPair;
@@ -152,6 +157,198 @@ export interface SaveAgentOptions {
    * guest) that must not become the node's identity.
    */
   adoptOnDevice?: boolean;
+  /** Stop the sign-in attempt before later storage stages or device adoption. */
+  signal?: AbortSignal;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError');
+  }
+}
+
+function waitForAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      callback();
+    };
+    const abort = () =>
+      finish(() =>
+        reject(new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError')),
+      );
+
+    signal.addEventListener('abort', abort, { once: true });
+    work.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    );
+    if (signal.aborted) abort();
+  });
+}
+
+/** Commit the Agent record and cache-key records in one cancellable write. */
+function commitSignInRecords(
+  writes: Array<{ key: string; value: unknown }>,
+  deletes: string[],
+  preparedDbKey: PreparedDbKeyOnSignIn | undefined,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  throwIfAborted(signal);
+  const { promise, resolve, reject } = Promise.withResolvers<boolean>();
+  let request: IDBOpenDBRequest | undefined;
+  let database: IDBDatabase | undefined;
+  let transaction: IDBTransaction | undefined;
+  let settled = false;
+  let retryForSessionKey = false;
+
+  const cleanup = () => {
+    signal?.removeEventListener('abort', abort);
+    database?.close();
+  };
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    callback();
+  };
+  const abort = () => {
+    const error = new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError');
+
+    if (!transaction) {
+      finish(() => reject(error));
+
+      return;
+    }
+
+    try {
+      transaction.abort();
+    } catch (abortError) {
+      if (
+        abortError instanceof DOMException &&
+        abortError.name === /* @wc-ignore */ 'InvalidStateError'
+      ) {
+        // If the transaction already committed, its completion event wins.
+        return;
+      }
+      finish(() => reject(abortError));
+    }
+  };
+
+  signal?.addEventListener('abort', abort, { once: true });
+
+  try {
+    request = indexedDB.open(IDB_KEYVAL_DATABASE, 1);
+  } catch (error) {
+    finish(() => reject(error));
+
+    return promise;
+  }
+
+  request.onupgradeneeded = () => {
+    const opened = request?.result;
+    if (opened && !opened.objectStoreNames.contains(IDB_KEYVAL_OBJECT_STORE)) {
+      opened.createObjectStore(IDB_KEYVAL_OBJECT_STORE);
+    }
+  };
+  request.onerror = () =>
+    finish(() =>
+      reject(request?.error ?? new Error('Could not open browser storage.')),
+    );
+  request.onblocked = () =>
+    finish(() =>
+      reject(new Error('Browser storage is blocked by another open tab.')),
+    );
+  request.onsuccess = () => {
+    const opened = request?.result;
+
+    if (!opened) {
+      finish(() => reject(new Error('Could not open browser storage.')));
+
+      return;
+    }
+
+    if (settled) {
+      opened.close();
+
+      return;
+    }
+
+    database = opened;
+
+    try {
+      transaction = opened.transaction(IDB_KEYVAL_OBJECT_STORE, 'readwrite');
+      const objectStore = transaction.objectStore(IDB_KEYVAL_OBJECT_STORE);
+
+      const persistChanges = () => {
+        if (settled) return;
+
+        try {
+          for (const key of deletes) objectStore.delete(key);
+          for (const write of writes) {
+            objectStore.put(write.value, write.key);
+          }
+        } catch (error) {
+          try {
+            transaction?.abort();
+          } finally {
+            finish(() => reject(error));
+          }
+        }
+      };
+
+      transaction.oncomplete = () => finish(() => resolve(true));
+      transaction.onabort = () => {
+        if (signal?.aborted) {
+          finish(() =>
+            reject(
+              new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError'),
+            ),
+          );
+        } else if (retryForSessionKey) {
+          finish(() => resolve(false));
+        } else {
+          finish(() =>
+            reject(
+              transaction?.error ??
+                new Error('Could not save identity to browser storage.'),
+            ),
+          );
+        }
+      };
+
+      if (preparedDbKey?.source === 'generated') {
+        const sessionKeyRequest = objectStore.get(preparedDbKey.sessionKeyKey);
+        sessionKeyRequest.onsuccess = () => {
+          if (settled) return;
+
+          if (sessionKeyRequest.result !== undefined) {
+            retryForSessionKey = true;
+            transaction?.abort();
+
+            return;
+          }
+
+          persistChanges();
+        };
+      } else {
+        persistChanges();
+      }
+
+      if (signal?.aborted) abort();
+    } catch (error) {
+      finish(() => reject(error));
+    }
+  };
+
+  if (signal?.aborted) abort();
+
+  return promise;
 }
 
 export async function saveAgentToIDB(
@@ -184,19 +381,22 @@ export async function saveAgentToIDB(
   }
 
   if (typeof keyPairOrSecret === 'string') {
-    const stored = storeSecret(keyPairOrSecret);
-    // Announced before anything is awaited: callers often set the agent first,
-    // and the database opener that event starts must know a sign-in is about
-    // to deliver this agent's key (see `waitForSessionDbKey`).
+    throwIfAborted(options?.signal);
+    const stored = waitForAbort(
+      storeSecret(keyPairOrSecret, options?.signal),
+      options?.signal,
+    );
+    // Announce before awaiting so a database opener can wait for the key this
+    // sign-in is preparing, even though the Agent is not installed yet.
     const signingIn = subjectOfSecret(keyPairOrSecret);
 
     if (signingIn) trackDbKeySignIn(signingIn, stored);
 
     await stored;
+    throwIfAborted(options?.signal);
 
-    // The device now holds this agent; its node should sign as this agent too.
-    // Best-effort and last, so a node that isn't up yet can't block sign-in.
     if (options?.adoptOnDevice !== false) {
+      throwIfAborted(options?.signal);
       await adoptAgentOnDevice(keyPairOrSecret);
     }
 
@@ -240,28 +440,45 @@ function subjectOfSecret(secret: string): string | undefined {
 }
 
 /** Persist the agent's key, preferring a non-extractable keypair. */
-async function storeSecret(secret: string): Promise<void> {
-  // The secret is a base64-encoded JSON containing { privateKey, subject }.
-  // The raw private key is needed below for the JS fallback record, and to
-  // derive the wrapping key for the local-database encryption key — this is
-  // the only moment it passes through JS once the keypair is stored
-  // non-extractably.
+async function storeSecret(
+  secret: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
   const decoded = JSON.parse(atob(secret));
-  // Derived here, once, from the raw key — the stored keypair cannot
-  // reproduce it. See `StoredAgent.privateDrive`.
   const privateDrive = await Agent.privateDriveSubjectFromSecret(secret);
+  throwIfAborted(signal);
   const vaultProof = await Agent.vaultProofFromSecret(secret);
+  throwIfAborted(signal);
   const aiChatsFolders = await Agent.aiChatsFoldersFromSecret(secret);
+  throwIfAborted(signal);
 
-  {
-    // Prefer the non-extractable keypair. Once stored this way the private key
-    // cannot be read back out of IndexedDB by anything running on this origin,
-    // so no readable copy may be left beside it.
-    if (hasSubtleCrypto()) {
-      try {
-        const [keyPair, resolvedSubject] =
-          await SubtleCryptoProvider.createKeysFromSecret(secret);
-        await set(AGENT_IDB_KEY, {
+  const credentials = { privateKey: decoded.privateKey, vaultProof };
+  let identity:
+    | {
+        key: string;
+        value: StoredAgent | StoredAgentFallback;
+        obsoleteKey: string;
+      }
+    | undefined;
+
+  if (hasSubtleCrypto()) {
+    let keyMaterial:
+      | [keyPair: CryptoKeyPair, subject: string, initialDrive?: string]
+      | undefined;
+
+    try {
+      keyMaterial = await SubtleCryptoProvider.createKeysFromSecret(secret);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+    throwIfAborted(signal);
+
+    if (keyMaterial) {
+      const [keyPair, resolvedSubject] = keyMaterial;
+      identity = {
+        key: AGENT_IDB_KEY,
+        value: {
           keyPair,
           subject: resolvedSubject,
           legacySubject: legacySubjectFromSecret(secret),
@@ -269,58 +486,76 @@ async function storeSecret(secret: string): Promise<void> {
           privateDrive,
           aiChatsFolders,
           vaultProof,
-        } satisfies StoredAgent);
-        await del(AGENT_FALLBACK_KEY);
-
-        await ensureLocalDbKey(resolvedSubject, {
-          privateKey: decoded.privateKey,
-          vaultProof,
-        });
-
-        return;
-      } catch {
-        // SubtleCrypto refused the key — fall through to the readable record.
-      }
+        } satisfies StoredAgent,
+        obsoleteKey: AGENT_FALLBACK_KEY,
+      };
     }
+  }
 
-    // Insecure context (plain-HTTP self-hosted origin): Web Crypto is absent,
-    // so a readable key is the only way to sign at all. The secret is no more
-    // exposed than the unencrypted connection already carrying it.
-    const [, newSubject] = JSCryptoProvider.fromSecret(secret);
-    await set(AGENT_FALLBACK_KEY, {
-      privateKey: decoded.privateKey,
-      subject: newSubject,
-      legacySubject: legacySubjectFromSecret(secret),
-      initialDrive: decoded.initialDrive,
-      privateDrive,
-      aiChatsFolders,
-      vaultProof,
-    } satisfies StoredAgentFallback);
-    // Drop a keypair from a previous account, so it can't be loaded instead.
-    await del(AGENT_IDB_KEY);
+  if (!identity) {
+    throwIfAborted(signal);
+    const { privateKey, subject: newSubject } = decodeSecret(secret);
+    identity = {
+      key: AGENT_FALLBACK_KEY,
+      value: {
+        privateKey,
+        subject: newSubject,
+        legacySubject: legacySubjectFromSecret(secret),
+        initialDrive: decoded.initialDrive,
+        privateDrive,
+        aiChatsFolders,
+        vaultProof,
+      } satisfies StoredAgentFallback,
+      obsoleteKey: AGENT_IDB_KEY,
+    };
+  }
 
-    await ensureLocalDbKey(newSubject, {
-      privateKey: decoded.privateKey,
-      vaultProof,
-    });
+  if (!identity) throw new Error('Could not prepare an identity for storage.');
+  let preparedDbKey = await prepareLocalDbKey(
+    identity.value.subject,
+    credentials,
+    signal,
+  );
+  while (true) {
+    throwIfAborted(signal);
+    const committed = await commitSignInRecords(
+      [
+        ...(preparedDbKey?.writes ?? []),
+        { key: identity.key, value: identity.value },
+      ],
+      [...(preparedDbKey?.deletes ?? []), identity.obsoleteKey],
+      preparedDbKey,
+      signal,
+    );
+
+    if (committed) return;
+
+    preparedDbKey = await prepareLocalDbKey(
+      identity.value.subject,
+      credentials,
+      signal,
+    );
   }
 }
 
-/**
- * Set up this agent's local-database encryption key (unwrap the durable copy,
- * or create one). Best-effort: a failure here degrades to a fresh cache key,
- * never blocks sign-in.
- */
-async function ensureLocalDbKey(
+/** Preparing the local DB key is best-effort, but it must not write early. */
+async function prepareLocalDbKey(
   subject: string,
   credentials: SignInCredentials,
-): Promise<void> {
+  signal?: AbortSignal,
+): Promise<PreparedDbKeyOnSignIn | undefined> {
   try {
-    await ensureDbKeyOnSignIn(subject, credentials);
-  } catch (e) {
-    console.warn('Failed to prepare local database key:', e);
+    throwIfAborted(signal);
+
+    return await prepareDbKeyOnSignIn(subject, credentials, undefined, signal);
+  } catch (error) {
+    if (signal?.aborted || error instanceof DbKeyConflictError) throw error;
+    console.warn('Failed to prepare local database key:', error);
+
+    return undefined;
   }
 }
+
 
 const PREVIOUS_IDENTITIES_KEY = 'atomic.previousIdentities';
 

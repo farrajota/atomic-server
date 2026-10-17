@@ -1,9 +1,9 @@
 import { driveDisplayName } from '../../helpers/driveDisplayName';
 import { canonicalizeScheme } from '@tomic/lib';
 import styled from 'styled-components';
-import { useAccountDriveCatalog } from '../../hooks/useAccountDriveCatalog';
-import { useDriveHostingStates } from '../../hooks/useDriveHostingStates';
-import { Resource, core, server, useResources } from '@tomic/react';
+import { useEffect, useState } from 'react';
+import { Resource, core, server, useResources, useStore } from '@tomic/react';
+import { findAccessibleDrives } from '../../helpers/driveData';
 import {
   FaCaretDown,
   FaGear,
@@ -18,6 +18,8 @@ import { constructOpenURL } from '../../helpers/navigation';
 import { useDriveHistory } from '../../hooks/useDriveHistory';
 import { useSavedDrives } from '../../hooks/useSavedDrives';
 import { usePrivateDrive } from '../../hooks/usePrivateDrive';
+import { useDriveHostingStates } from '../../hooks/useDriveHostingStates';
+import { useAccountDriveCatalog } from '../../hooks/useAccountDriveCatalog';
 import { paths } from '../../routes/paths';
 import { type DropdownItem, DIVIDER, DropdownMenu } from '../Dropdown';
 import { buildDefaultTrigger } from '../Dropdown/DefaultTrigger';
@@ -52,6 +54,46 @@ export function DriveSwitcher({
   const { privateDrive } = usePrivateDrive();
   const [savedDrives] = useSavedDrives();
   const [history, addToHistory] = useDriveHistory(savedDrives, 5);
+  const store = useStore();
+  const [accessibleDriveSnapshot, setAccessibleDriveSnapshot] = useState<{
+    agent: string;
+    subjects: string[];
+  } | null>(null);
+  const accessibleDrives =
+    accessibleDriveSnapshot !== null &&
+    accessibleDriveSnapshot.agent === agent?.subject &&
+    store.getAgent()?.subject === agent?.subject
+      ? accessibleDriveSnapshot.subjects
+      : [];
+  useEffect(() => {
+    let cancelled = false;
+    const subject = agent?.subject;
+
+    if (!subject || store.getAgent()?.subject !== subject) {
+      setAccessibleDriveSnapshot(null);
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void findAccessibleDrives(store)
+      .then(subjects => {
+        if (!cancelled && store.getAgent()?.subject === subject) {
+          setAccessibleDriveSnapshot({ agent: subject, subjects });
+        }
+      })
+      .catch(error => {
+        if (!cancelled && store.getAgent()?.subject === subject) {
+          console.warn('Could not discover accessible Drives:', error);
+          setAccessibleDriveSnapshot({ agent: subject, subjects: [] });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [store, agent?.subject]);
 
   // The private drive leads the menu; keep it out of the lists below.
   const catalog = useAccountDriveCatalog(
@@ -70,6 +112,15 @@ export function DriveSwitcher({
       !catalog.removed.some(removed => same(subject, removed)) &&
       !myDrives.some(mine => same(subject, mine)),
   );
+  const otherAccessibleDrives = accessibleDrives.filter(
+    subject =>
+      !same(subject, privateDrive) &&
+      !savedDrives.some(saved => same(subject, saved)) &&
+      !recentDrives.some(recent => same(subject, recent)) &&
+      !catalog.removed.some(removed => same(subject, removed)),
+  );
+
+  const accessibleDriveMap = useResources(otherAccessibleDrives);
 
   const myDrivesMap = useResources(savedDrives);
   const recentDrivesMap = useResources(recentDrives);
@@ -115,6 +166,28 @@ export function DriveSwitcher({
         icon: subject === drive ? <FaSquareCheck /> : <FaRegCircle />,
       };
     }),
+    ...(otherAccessibleDrives.length > 0
+      ? [
+          DIVIDER,
+          ...otherAccessibleDrives.map(subject => {
+            const resource = accessibleDriveMap.get(subject);
+            const label =
+              resource && !resource.error
+                ? getTitle(resource)
+                : driveDisplayName(undefined, subject);
+
+            return {
+              id: subject,
+              suffix: badge(subject),
+              label,
+              helper: `Switch to ${label}`,
+              disabled: false,
+              onClick: (): void => switchTo(subject),
+              icon: subject === drive ? <FaSquareCheck /> : <FaRegCircle />,
+            };
+          }),
+        ]
+      : []),
     {
       id: 'new-drive',
       label: 'New Drive',

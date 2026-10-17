@@ -167,6 +167,48 @@ describe('persistent local database keys', () => {
     ).not.toEqual(legacyKey);
   });
 
+  it('rejects conflicting credentials without replacing a surviving cache key or wrapped records', async () => {
+    const original = await ensureDbKeyOnSignIn(subject, credentials, withWasm);
+    const before = new Map(records);
+
+    await expect(
+      ensureDbKeyOnSignIn(subject, otherCredentials, withWasm),
+    ).rejects.toThrow(/existing local cache key.*retry/i);
+    expect([...records.entries()]).toEqual([...before.entries()]);
+    expect(await getSessionDbKey(subject)).toEqual(original);
+    expect(await ensureDbKeyOnSignIn(subject, credentials, withWasm)).toEqual(
+      original,
+    );
+  });
+
+  it('does not overwrite a usable session key with a different readable wrapped key', async () => {
+    const original = await ensureDbKeyOnSignIn(subject, credentials, withWasm);
+    const fingerprint = await agentDbFingerprint(subject);
+    const sessionKey = generateDbKey();
+    records.set(`atomic.clientdb.session-key.${fingerprint}`, sessionKey);
+    const before = new Map(records);
+
+    await expect(
+      ensureDbKeyOnSignIn(subject, credentials, withWasm),
+    ).rejects.toThrow(/existing local cache key.*retry/i);
+    expect([...records.entries()]).toEqual([...before.entries()]);
+    expect(await getSessionDbKey(subject)).toEqual(sessionKey);
+    expect(sessionKey).not.toEqual(original);
+  });
+
+  it('preserves a surviving session key when its only wrapped record is corrupt', async () => {
+    const original = await ensureDbKeyOnSignIn(subject, credentials, withWasm);
+    const { v2 } = await recordKeys();
+    records.set(v2, { version: 2, envelope: '{broken' });
+    const before = new Map(records);
+
+    await expect(
+      ensureDbKeyOnSignIn(subject, credentials, withWasm),
+    ).rejects.toThrow(/existing local cache key.*retry/i);
+    expect([...records.entries()]).toEqual([...before.entries()]);
+    expect(await getSessionDbKey(subject)).toEqual(original);
+  });
+
   it('keeps a v2 record when wasm cannot load, and opens it on the next try', async () => {
     const { v2 } = await recordKeys();
     const original = await ensureDbKeyOnSignIn(subject, credentials, withWasm);
@@ -223,6 +265,30 @@ describe('persistent local database keys', () => {
         new Uint8Array(64).fill(3),
       ),
     ).toEqual(legacyKey);
+  });
+
+  it('uses a valid legacy key when a v2 envelope unwraps to the wrong length', async () => {
+    const { v1, v2 } = await recordKeys();
+    const legacyKey = generateDbKey();
+    records.set(
+      v1,
+      await wrapDbKey(
+        await deriveKek(credentials.privateKey, subject),
+        legacyKey,
+      ),
+    );
+    records.set(v2, {
+      version: 2,
+      envelope: fakeOps.wrap(
+        new Uint8Array(31),
+        new Uint8Array(64).fill(3),
+      ),
+    });
+
+    expect(await ensureDbKeyOnSignIn(subject, credentials, withWasm)).toEqual(
+      legacyKey,
+    );
+    expect(await getSessionDbKey(subject)).toEqual(legacyKey);
   });
 
   it('a database opener waits for a sign-in whose wasm loads slowly', async () => {

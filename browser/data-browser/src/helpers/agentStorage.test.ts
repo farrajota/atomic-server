@@ -1,19 +1,84 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { Agent } from '@tomic/react';
+import { Agent, decodeSecret } from '@tomic/react';
 
-/** In-memory stand-in for IndexedDB, so we can inspect exactly what got stored. */
+/** In-memory IndexedDB; transactions apply all writes together or none. */
 const store = new Map<string, unknown>();
-/** Extra latency on every write, for tests that race a slow sign-in. */
-let writeDelayMs = 0;
+let holdNextTransaction = false;
+let transactionStarted: (() => void) | undefined;
+let pendingTransaction: { complete: () => void } | undefined;
+
+const memoryDatabase = {
+  transaction() {
+    const writes = new Map<string, unknown>();
+    const deletes = new Set<string>();
+    let aborted = false;
+    const transaction = {
+      oncomplete: undefined as ((event: Event) => void) | undefined,
+      onabort: undefined as ((event: Event) => void) | undefined,
+      onerror: undefined as ((event: Event) => void) | undefined,
+      objectStore: () => ({
+        get: (key: IDBValidKey) => {
+          const request = {
+            result: undefined as unknown,
+            onsuccess: undefined as ((event: Event) => void) | undefined,
+          };
+          queueMicrotask(() => {
+            request.result = store.get(String(key));
+            request.onsuccess?.(new Event('success'));
+          });
+
+          return request as unknown as IDBRequest;
+        },
+        put: (value: unknown, key: IDBValidKey) => writes.set(String(key), value),
+        delete: (key: IDBValidKey) => deletes.add(String(key)),
+      }),
+      abort() {
+        aborted = true;
+        transaction.onabort?.(new Event('abort'));
+      },
+    };
+    const complete = () => {
+      if (aborted) return;
+      for (const key of deletes) store.delete(key);
+      for (const [key, value] of writes) store.set(key, value);
+      transaction.oncomplete?.(new Event('complete'));
+    };
+
+    pendingTransaction = { complete };
+    transactionStarted?.();
+    transactionStarted = undefined;
+    if (holdNextTransaction) holdNextTransaction = false;
+    else queueMicrotask(() => queueMicrotask(complete));
+
+    return transaction as unknown as IDBTransaction;
+  },
+  close() {},
+};
+
+const memoryIndexedDB = {
+  open() {
+    const request = {
+      result: memoryDatabase,
+      onsuccess: undefined as ((event: Event) => void) | undefined,
+      onerror: undefined as ((event: Event) => void) | undefined,
+      onblocked: undefined as ((event: Event) => void) | undefined,
+    };
+    queueMicrotask(() => request.onsuccess?.(new Event('success')));
+
+    return request as unknown as IDBOpenDBRequest;
+  },
+};
 
 vi.mock('idb-keyval', () => ({
   get: async (key: string) => store.get(key),
   set: async (key: string, value: unknown) => {
-    if (writeDelayMs) await new Promise(r => setTimeout(r, writeDelayMs));
     store.set(key, value);
   },
   del: async (key: string) => void store.delete(key),
   keys: async () => [...store.keys()],
+  update: async (key: string, updater: (value: unknown) => unknown) => {
+    store.set(key, updater(store.get(key)));
+  },
 }));
 
 const {
@@ -24,6 +89,17 @@ const {
 } = await import('./agentStorage');
 const { waitForSessionDbKey } = await import('./localDbKey');
 
+beforeEach(() => {
+  store.clear();
+  holdNextTransaction = false;
+  transactionStarted = undefined;
+  pendingTransaction = undefined;
+  vi.stubGlobal('indexedDB', memoryIndexedDB);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 const AGENT_IDB_KEY = 'atomic.agent';
 const AGENT_FALLBACK_KEY = 'atomic.agent.fallback';
 const SESSION_KEY_PREFIX = 'atomic.clientdb.session-key.';
@@ -33,7 +109,7 @@ const WRAPPED_KEY_V2_PREFIX = 'atomic.clientdb.wrapped-key-v2.';
 async function makeSecret(): Promise<string> {
   const keys = await Agent.generateKeyPair();
 
-  return Agent.buildSecret(keys.privateKey, 'http://localhost/agents/test');
+  return Agent.buildSecret(keys.privateKey, `atomic:agent:${keys.publicKey}`);
 }
 
 /** Simulates an insecure context (plain-HTTP origin), where Web Crypto is absent. */
@@ -54,20 +130,24 @@ function withoutSubtleCrypto(run: () => Promise<void>): Promise<void> {
 
 describe('agent key storage', () => {
   beforeEach(() => store.clear());
-  afterEach(() => store.clear());
 
   it('announces a sign-in before its first await, so the database opener waits for it', async () => {
     const secret = await makeSecret();
+    const { subject } = decodeSecret(secret);
     const order: string[] = [];
-    // A sign-in slower than the opener's own patience, as one that loads the
-    // wasm bundle on a cold page is.
-    writeDelayMs = 300;
-    // What callers do: set the agent (which starts the opener), then save.
+    const started = Promise.withResolvers<void>();
+    holdNextTransaction = true;
+    transactionStarted = started.resolve;
     const saving = saveAgentToIDB(secret).then(() => order.push('saved'));
-    const opening = waitForSessionDbKey('atomic:agent:test', 100).then(() =>
+    const opening = waitForSessionDbKey(subject, 100).then(() =>
       order.push('opened'),
     );
-    await Promise.all([saving, opening]).finally(() => (writeDelayMs = 0));
+    await started.promise;
+
+    expect(order).toEqual([]);
+    expect(pendingTransaction).toBeDefined();
+    pendingTransaction!.complete();
+    await Promise.all([saving, opening]);
 
     expect(order).toEqual(['saved', 'opened']);
   });
@@ -109,6 +189,10 @@ describe('agent key storage', () => {
       const agent = await getAgentFromIDB();
       expect(agent).toBeDefined();
       expect(store.has(AGENT_FALLBACK_KEY)).toBe(true);
+      expect(store.get(AGENT_FALLBACK_KEY)).toMatchObject({
+        privateKey: JSON.parse(atob(secret)).privateKey,
+      });
+      expect(agent!.subject).toBe((await Agent.fromSecret(secret)).subject);
     });
   });
 
@@ -131,6 +215,104 @@ describe('agent key storage', () => {
     expect(store.has(`${WRAPPED_KEY_PREFIX}fingerprint`)).toBe(true);
     expect(store.has(`${WRAPPED_KEY_V2_PREFIX}fingerprint`)).toBe(true);
   });
+});
+
+it('preserves the stored identity and wrapped cache keys when a save is cancelled', async () => {
+  const currentSecret = await makeSecret();
+  await saveAgentToIDB(currentSecret, { adoptOnDevice: false });
+  const before = new Map(store);
+  const controller = new AbortController();
+  controller.abort();
+
+  await expect(
+    saveAgentToIDB(await makeSecret(), { signal: controller.signal }),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+
+  expect([...store.entries()]).toEqual([...before.entries()]);
+});
+
+it('does not let an aborted save overwrite identity storage when it finishes late', async () => {
+  const currentSecret = await makeSecret();
+  const lateSecret = await makeSecret();
+  await saveAgentToIDB(currentSecret, { adoptOnDevice: false });
+  const before = new Map(store);
+  const privateDriveStarted = Promise.withResolvers<void>();
+  const privateDrive = Promise.withResolvers<string>();
+  const privateDriveSpy = vi
+    .spyOn(Agent, 'privateDriveSubjectFromSecret')
+    .mockImplementationOnce(() => {
+      privateDriveStarted.resolve();
+
+      return privateDrive.promise;
+    });
+  const vaultProofSpy = vi.spyOn(Agent, 'vaultProofFromSecret');
+  const controller = new AbortController();
+  const saving = saveAgentToIDB(lateSecret, {
+    adoptOnDevice: false,
+    signal: controller.signal,
+  });
+
+  await privateDriveStarted.promise;
+  controller.abort();
+  await expect(saving).rejects.toMatchObject({ name: 'AbortError' });
+  privateDrive.resolve('did:ad:agent:late');
+  await Promise.resolve();
+  expect(vaultProofSpy).not.toHaveBeenCalled();
+  privateDriveSpy.mockRestore();
+  vaultProofSpy.mockRestore();
+
+  expect([...store.entries()]).toEqual([...before.entries()]);
+});
+
+it('fails a same-subject different-key sign-in without changing the identity or cache, then permits the original identity to retry', async () => {
+  const original = await makeSecret();
+  await saveAgentToIDB(original, { adoptOnDevice: false });
+  const conflicting = JSON.parse(atob(await makeSecret()));
+  conflicting.subject = JSON.parse(atob(original)).subject;
+  const before = new Map(store);
+
+  await expect(
+    saveAgentToIDB(btoa(JSON.stringify(conflicting)), { adoptOnDevice: false }),
+  ).rejects.toThrow(/existing local cache key.*retry/i);
+  expect([...store.entries()]).toEqual([...before.entries()]);
+
+  await saveAgentToIDB(original, { adoptOnDevice: false });
+  expect((await getAgentFromIDB())?.subject).toBe(
+    (await Agent.fromSecret(original)).subject,
+  );
+  for (const [key, value] of before) {
+    if (key.startsWith('atomic.clientdb.')) expect(store.get(key)).toEqual(value);
+  }
+});
+
+it('aborts a pending identity and cache-key transaction before a retry', async () => {
+  await saveAgentToIDB(await makeSecret(), { adoptOnDevice: false });
+  const before = new Map(store);
+  const oldSecret = await makeSecret();
+  const controller = new AbortController();
+  const started = Promise.withResolvers<void>();
+  holdNextTransaction = true;
+  transactionStarted = started.resolve;
+  const saving = saveAgentToIDB(oldSecret, {
+    adoptOnDevice: false,
+    signal: controller.signal,
+  });
+  await started.promise;
+  const lateTransaction = pendingTransaction;
+
+  controller.abort();
+  await expect(saving).rejects.toMatchObject({ name: 'AbortError' });
+  expect([...store.entries()]).toEqual([...before.entries()]);
+
+  const retrySecret = await makeSecret();
+  await saveAgentToIDB(retrySecret, { adoptOnDevice: false });
+  const afterRetry = new Map(store);
+  lateTransaction?.complete();
+
+  expect([...store.entries()]).toEqual([...afterRetry.entries()]);
+  expect((store.get(AGENT_IDB_KEY) as { subject: string }).subject).toBe(
+    (await Agent.fromSecret(retrySecret)).subject,
+  );
 });
 
 it('persists folder identities through non-extractable key restoration and keypair updates', async () => {

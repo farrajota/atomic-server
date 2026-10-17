@@ -18,24 +18,48 @@ const state = vi.hoisted(() => ({
   hosted: false,
   acceptsNewDrives: true,
   navigate: vi.fn(),
-  setAgent: vi.fn(),
+  agentChangedListener: undefined as
+    | ((agent: { subject: string } | undefined) => void)
+    | undefined,
+  setAgent: vi.fn((agent: { subject: string } | undefined) => {
+    state.agent = agent ?? { subject: '' };
+    state.rootAgent = agent;
+    state.agentChangedListener?.(agent);
+  }),
   setDrive: vi.fn(),
   setServer: vi.fn(),
   recovery: vi.fn(),
   account: null as { email: string } | null,
   hasData: true,
   driveData: undefined as Record<string, boolean> | undefined,
+  accessibleDrives: [] as string[],
+  findAccessibleDrives: vi.fn(),
+  wrapperKinds: { hasPasskey: true, hasCode: false },
+  decryptPasskey: vi.fn(),
+  decryptRecoveryCode: vi.fn(),
+  assistedWrapper: false,
+  decryptAssisted: vi.fn(),
+  saveAgent: vi.fn(),
   agent: { subject: 'did:ad:agent:test' },
   rootAgent: undefined as { subject: string } | undefined,
   agentName: 'Robin' as string | undefined,
   store: {
     ensurePrivateDrive: vi.fn(async () => undefined),
+    on: (
+      _event: unknown,
+      listener: (agent: { subject: string } | undefined) => void,
+    ) => {
+      state.agentChangedListener = listener;
+
+      return () => {
+        if (state.agentChangedListener === listener) {
+          state.agentChangedListener = undefined;
+        }
+      };
+    },
     getServerUrl: () => 'https://node.example',
     getAgent: () => state.agent,
     privateDriveSubject: async () => 'did:ad:home',
-    // The home is titled after its owner, which means reading the Agent. The
-    // literal subject is `core.properties.name`; this block is hoisted above
-    // the imports, so it cannot say so by name.
     getResource: async (subject: string) => ({
       get: (prop: string) =>
         subject === state.agent.subject &&
@@ -102,7 +126,13 @@ vi.mock('../../helpers/managed/recovery', () => ({
   getUnlockableRecoverySecret: () => state.recovery(),
   getRecoverySecret: () => state.recovery(),
   readUnlockableCachedBackups: () => [],
-  envelopeWrapperKinds: () => ({ hasPasskey: true, hasCode: false }),
+  envelopeWrapperKinds: () => state.wrapperKinds,
+  decryptEnvelopeWithPasskey: state.decryptPasskey,
+  decryptEnvelopeV2: state.decryptRecoveryCode,
+  decryptRecoverySecret: state.decryptRecoveryCode,
+  hasAssistedWrapper: () => state.assistedWrapper,
+  decryptEnvelopeWithAssisted: state.decryptAssisted,
+  FreshSignInRequiredError: class extends Error {},
   secretAccountConflict: (
     stored: { owner_email: string; agent_subject: string } | null,
     secretAgent: string,
@@ -126,7 +156,9 @@ vi.mock('../../helpers/managed/reconcile', () => ({
 vi.mock('../../helpers/discoverHomeServer', () => ({
   discoverHomeServerForApp: async () => false,
 }));
-vi.mock('../../helpers/agentStorage', () => ({ saveAgentToIDB: vi.fn() }));
+vi.mock('../../helpers/agentStorage', () => ({
+  saveAgentToIDB: (...args: unknown[]) => state.saveAgent(...args),
+}));
 vi.mock('../../helpers/deviceLock', () => ({ beat: vi.fn() }));
 vi.mock('../../helpers/privateDrive', () => ({
   fetchPrivateDriveSubject: async () => 'did:ad:home',
@@ -134,6 +166,7 @@ vi.mock('../../helpers/privateDrive', () => ({
 vi.mock('../../helpers/driveData', () => ({
   deviceHasDriveData: async (_store: unknown, subject: string) =>
     state.driveData ? state.driveData[subject] === true : state.hasData,
+  findAccessibleDrives: state.findAccessibleDrives,
 }));
 vi.mock('../../helpers/originNode', () => ({
   isOriginWithoutNode: () => false,
@@ -215,8 +248,15 @@ const showOnboarding = async () => {
 };
 
 beforeEach(() => {
+  state.agentChangedListener = undefined;
   vi.clearAllMocks();
+  state.accessibleDrives = [];
+  state.findAccessibleDrives.mockImplementation(
+    async () => state.accessibleDrives,
+  );
+  state.saveAgent.mockResolvedValue(undefined);
   state.hosted = false;
+  state.agent = { subject: 'did:ad:agent:test' };
   state.rootAgent = undefined;
   state.portal = 'https://portal.example';
   state.acceptsNewDrives = true;
@@ -224,6 +264,11 @@ beforeEach(() => {
   state.account = null;
   state.hasData = true;
   state.driveData = undefined;
+  state.wrapperKinds = { hasPasskey: true, hasCode: false };
+  state.decryptPasskey.mockResolvedValue('passkey-secret');
+  state.decryptRecoveryCode.mockResolvedValue('recovery-secret');
+  state.assistedWrapper = false;
+  state.decryptAssisted.mockResolvedValue('assisted-secret');
   state.restoreVault.mockResolvedValue({
     status: 'no-backup',
     reason: 'no backup',
@@ -237,6 +282,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 it('offers device recovery for an existing identity with no server home', async () => {
@@ -512,6 +558,180 @@ it('offers device connection instead of creating a home on an owner host', async
   expect(state.navigate).not.toHaveBeenCalled();
   expect(screen.getByText('Connect device')).toBeTruthy();
   expect(state.setDrive).not.toHaveBeenCalled();
+});
+
+it('opens the sole readable shared drive when the identity has no home metadata', async () => {
+  state.acceptsNewDrives = false;
+  state.driveData = {
+    'did:ad:home': false,
+    'did:ad:shared': true,
+  };
+  state.accessibleDrives = ['did:ad:shared'];
+  await show('?step=signin');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.navigate).toHaveBeenCalledWith(
+    '/app/show?subject=did:ad:shared',
+  );
+  expect(state.setDrive).toHaveBeenCalledWith('did:ad:shared');
+  expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
+});
+
+it('bounds identity persistence and ignores a stale completion after retry', async () => {
+  vi.useFakeTimers();
+  const firstAttempt = Promise.withResolvers<void>();
+  state.saveAgent
+    .mockImplementationOnce(() => firstAttempt.promise)
+    .mockResolvedValueOnce(undefined);
+  await show('?step=signin');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+
+  expect(screen.getByText(/could not save.*identity/i)).toBeTruthy();
+  expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
+  expect(state.navigate).not.toHaveBeenCalled();
+  expect(state.setAgent).not.toHaveBeenCalled();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+  });
+  const navigationCountAfterRetry = state.navigate.mock.calls.length;
+  expect(state.setAgent).toHaveBeenCalledTimes(1);
+  await act(async () => firstAttempt.resolve());
+
+  expect(state.saveAgent).toHaveBeenCalledTimes(2);
+  expect(state.navigate).toHaveBeenCalledTimes(navigationCountAfterRetry);
+  expect(state.navigate).toHaveBeenCalledWith('/app/show?subject=did:ad:home');
+});
+
+it('stops workspace navigation when the active Agent changes during drive discovery', async () => {
+  state.acceptsNewDrives = false;
+  state.hasData = false;
+  const discovery = Promise.withResolvers<string[]>();
+  const started = Promise.withResolvers<void>();
+  state.findAccessibleDrives.mockImplementationOnce(() => {
+    started.resolve();
+
+    return discovery.promise;
+  });
+  await show('?step=signin');
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+  await started.promise;
+
+  state.agent = { subject: 'did:ad:agent:another-account' };
+  state.agentChangedListener?.(state.agent);
+  await act(async () => {
+    discovery.resolve(['did:ad:shared']);
+    await discovery.promise;
+  });
+
+  expect(state.navigate).not.toHaveBeenCalled();
+  expect(state.setDrive).not.toHaveBeenCalled();
+});
+
+it.each(['passkey-secret', 'recovery-secret'])(
+  'keeps the persistence failure visible and retries the decrypted identity: %s',
+  async secret => {
+    state.recovery.mockResolvedValue({
+      owner_email: 'owner@example.com',
+      agent_subject: 'did:ad:agent:test',
+      format_version: 2,
+    });
+    state.wrapperKinds = { hasPasskey: true, hasCode: true };
+    state.saveAgent
+      .mockRejectedValueOnce(new Error('storage quota is unavailable'))
+      .mockResolvedValueOnce(undefined);
+    await show('?step=signin');
+
+    if (secret === 'passkey-secret') {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole('button', { name: 'Unlock with your passkey' }),
+        );
+      });
+    } else {
+      fireEvent.click(
+        await screen.findByRole('button', {
+          name: 'Use a recovery code instead',
+        }),
+      );
+      fireEvent.change(await screen.findByLabelText('Recovery code'), {
+        target: { value: 'recovery-code' },
+      });
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole('button', { name: 'Restore & sign in' }),
+        );
+      });
+    }
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(
+      /could not save.*identity/i,
+    );
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Retry saving identity' }),
+      );
+    });
+
+    expect(state.saveAgent.mock.calls.map(([saved]) => saved)).toEqual([
+      secret,
+      secret,
+    ]);
+  },
+);
+
+it('keeps an assisted persistence failure stable until an explicit retry', async () => {
+  vi.useFakeTimers();
+  state.account = { email: 'owner@example.com' };
+  state.recovery.mockResolvedValue({
+    owner_email: 'owner@example.com',
+    agent_subject: 'did:ad:agent:test',
+    format_version: 2,
+  });
+  state.assistedWrapper = true;
+  state.saveAgent.mockImplementation(() => new Promise<void>(() => undefined));
+  await show('?step=signin');
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+
+  expect(screen.getByRole('alert').textContent).toMatch(/could not save.*identity/i);
+  expect(screen.getByRole('button', { name: 'Retry saving identity' })).toBeTruthy();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(screen.getByRole('alert').textContent).toMatch(/could not save.*identity/i);
+  expect(screen.getByRole('button', { name: 'Retry saving identity' })).toBeTruthy();
+  expect(state.saveAgent).toHaveBeenCalledTimes(1);
+  expect(state.decryptAssisted).toHaveBeenCalledTimes(1);
+  expect(state.setAgent).not.toHaveBeenCalled();
+  expect(state.navigate).not.toHaveBeenCalled();
+
+  state.saveAgent.mockResolvedValue(undefined);
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Retry saving identity' }));
+  });
+  expect(state.saveAgent.mock.calls.map(([secret]) => secret)).toEqual([
+    'assisted-secret',
+    'assisted-secret',
+  ]);
+  expect(state.decryptAssisted).toHaveBeenCalledTimes(1);
+  expect(state.navigate).toHaveBeenCalledWith('/app/show?subject=did:ad:home');
 });
 it('offers existing-identity sign-in from direct onboarding on an owner host', async () => {
   state.acceptsNewDrives = false;

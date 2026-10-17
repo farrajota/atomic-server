@@ -1,4 +1,4 @@
-import type { Store } from '@tomic/lib';
+import { Collection, core, server, type Store } from '@tomic/lib';
 import { isOriginWithoutNode } from './originNode';
 
 /**
@@ -88,4 +88,46 @@ export function driveHasServer(
   return (
     !store.isLocalOnlyDrive(drive) && !isOriginWithoutNode(store.getServerUrl())
   );
+}
+
+/**
+ * Enumerate existing Drives visible to the current signed-in Agent. The
+ * unscoped class query is server-authorized; each result is then read with the
+ * active Agent before it can be used as a landing target.
+ */
+export async function findAccessibleDrives(store: Store): Promise<string[]> {
+  const agent = store.getAgent();
+
+  if (!agent) return [];
+
+  const drives = new Collection(
+    store,
+    store.getServerUrl(),
+    {
+      property: core.properties.isA,
+      value: server.classes.drive,
+      page_size: '100',
+      include_nested: false,
+      drive: undefined,
+    },
+    false,
+    { serverOnly: true },
+  );
+  let subjects: string[];
+  try {
+    subjects = await drives.getAllMembers();
+  } catch (error) {
+    console.warn('Could not query server-readable Drives:', error);
+
+    return [];
+  }
+  if (store.getAgent() !== agent) return [];
+  const readable = await Promise.all(
+    subjects.map(subject =>
+      deviceHasDriveData(store, subject, { refresh: true }),
+    ),
+  );
+  if (store.getAgent() !== agent) return [];
+
+  return subjects.filter((_, index) => readable[index]).sort();
 }

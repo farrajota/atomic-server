@@ -335,6 +335,7 @@ export class Collection {
   private static completedByServer = new WeakMap<Store, Set<string>>();
   private legacyQuery = false;
   private readonly preferServer: boolean;
+  private readonly serverOnly: boolean;
   private legacyMembers?: Promise<string[]>;
 
   public constructor(
@@ -342,12 +343,13 @@ export class Collection {
     server: string,
     params: CollectionParams,
     noFetch = false,
-    options: { preferServer?: boolean } = {},
+    options: { preferServer?: boolean; serverOnly?: boolean } = {},
   ) {
     this.store = store;
     this.server = server;
     this.params = params;
     this.preferServer = !!options.preferServer;
+    this.serverOnly = !!options.serverOnly;
 
     if (!noFetch) {
       store.registerBulkRefreshable(this);
@@ -937,6 +939,15 @@ export class Collection {
       new URL(this.server).origin !== new URL(this.store.getServerUrl()).origin
     ) {
       await this.fetchPageFromServer(page);
+
+      return;
+    }
+
+    // A server-authorized listing cannot use a partial local index as proof
+    // that the complete set is empty. Use HTTP directly so the current Agent
+    // signs the query without waiting for WebSocket authentication.
+    if (this.serverOnly) {
+      await this.fetchPageFromServer(page, true);
 
       return;
     }
@@ -1580,7 +1591,10 @@ export class Collection {
     return subjects;
   }
 
-  private async fetchPageFromServer(page: number): Promise<void> {
+  private async fetchPageFromServer(
+    page: number,
+    noWebSocket = false,
+  ): Promise<void> {
     if (
       this.legacyQuery ||
       (/^https?:\/\//.test(this.params.drive ?? '') &&
@@ -1589,7 +1603,10 @@ export class Collection {
       return this.fetchLegacyPage(page);
     const subject = this.buildSubject(page);
     const resource =
-      await this.store.fetchResourceFromServer<Collections.Collection>(subject);
+      await this.store.fetchResourceFromServer<Collections.Collection>(
+        subject,
+        { noWebSocket },
+      );
 
     if (!resource) {
       throw new Error('Invalid collection: resource does not exist');

@@ -4,6 +4,19 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- Provisioned Agents without home-drive metadata can open an existing readable
+  shared Drive after sign-in. Signed-in bare-root navigation resolves an
+  accessible Drive instead of a server-root placeholder; explicit requested
+  destinations retain precedence. Discovery does not create Drives or change
+  their access grants.
+- Device identity persistence now fails actionably instead of leaving sign-in
+  pending indefinitely. Identity and cache-key writes commit together;
+  cancellation prevents late writes, and conflicting usable cache keys are
+  preserved rather than replaced. Failed assisted recovery waits for explicit
+  retry, and obsolete attempts cannot change another account's server or route.
+- `@tomic/lib`: server-authoritative collection discovery can query readable
+  membership before WebSocket authentication or optional local indexes are ready.
+
 - `@tomic/lib`: a connected server-backed save keeps waiting for its server
   acknowledgement when an optional local database first attaches during queue
   hydration, even if that cache is denied. Replacing an existing database worker
