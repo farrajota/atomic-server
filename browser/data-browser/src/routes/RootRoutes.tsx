@@ -22,10 +22,7 @@ import { isDev } from '../config';
 import { getLocalServerOrigin, isRunningInTauri } from '../helpers/tauri';
 import { fetchPrivateDriveSubject } from '../helpers/privateDrive';
 import { constructOpenURL } from '../helpers/navigation';
-import {
-  deviceHasDriveData,
-  findAccessibleDrives,
-} from '../helpers/driveData';
+import { deviceHasDriveData, findAccessibleDrives } from '../helpers/driveData';
 import { fetchManagedInfo } from '../helpers/managedServer';
 import { withDeadline } from '../helpers/withDeadline';
 import { getHomeDrive } from '../helpers/homeDrive';

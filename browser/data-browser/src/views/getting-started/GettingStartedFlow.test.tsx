@@ -660,7 +660,9 @@ it.each(['passkey-secret', 'recovery-secret'])(
     if (secret === 'passkey-secret') {
       await act(async () => {
         fireEvent.click(
-          await screen.findByRole('button', { name: 'Unlock with your passkey' }),
+          await screen.findByRole('button', {
+            name: 'Unlock with your passkey',
+          }),
         );
       });
     } else {
@@ -710,13 +712,21 @@ it('keeps an assisted persistence failure stable until an explicit retry', async
     await vi.advanceTimersByTimeAsync(30_000);
   });
 
-  expect(screen.getByRole('alert').textContent).toMatch(/could not save.*identity/i);
-  expect(screen.getByRole('button', { name: 'Retry saving identity' })).toBeTruthy();
+  expect(screen.getByRole('alert').textContent).toMatch(
+    /could not save.*identity/i,
+  );
+  expect(
+    screen.getByRole('button', { name: 'Retry saving identity' }),
+  ).toBeTruthy();
   await act(async () => {
     await vi.advanceTimersByTimeAsync(60_000);
   });
-  expect(screen.getByRole('alert').textContent).toMatch(/could not save.*identity/i);
-  expect(screen.getByRole('button', { name: 'Retry saving identity' })).toBeTruthy();
+  expect(screen.getByRole('alert').textContent).toMatch(
+    /could not save.*identity/i,
+  );
+  expect(
+    screen.getByRole('button', { name: 'Retry saving identity' }),
+  ).toBeTruthy();
   expect(state.saveAgent).toHaveBeenCalledTimes(1);
   expect(state.decryptAssisted).toHaveBeenCalledTimes(1);
   expect(state.setAgent).not.toHaveBeenCalled();
@@ -724,7 +734,9 @@ it('keeps an assisted persistence failure stable until an explicit retry', async
 
   state.saveAgent.mockResolvedValue(undefined);
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: 'Retry saving identity' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Retry saving identity' }),
+    );
   });
   expect(state.saveAgent.mock.calls.map(([secret]) => secret)).toEqual([
     'assisted-secret',

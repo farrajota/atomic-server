@@ -440,9 +440,13 @@ export async function prepareDbKeyOnSignIn(
 ): Promise<PreparedDbKeyOnSignIn> {
   const assertActive = () => {
     if (signal?.aborted) {
-      throw new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError');
+      throw new DOMException(
+        'Identity save was cancelled.',
+        /* @wc-ignore */ 'AbortError',
+      );
     }
   };
+
   const fingerprint = await agentDbFingerprint(agentSubject);
   assertActive();
   const proof = decodeVaultProof(credentials.vaultProof);
@@ -488,6 +492,7 @@ export async function prepareDbKeyOnSignIn(
   } catch (error) {
     opsError = error;
   }
+
   assertActive();
 
   const v2Record = (await get(v2Key)) as WrappedDbKeyRecordV2 | undefined;
@@ -601,9 +606,13 @@ export async function ensureDbKeyOnSignIn(
 ): Promise<Uint8Array> {
   const assertActive = () => {
     if (signal?.aborted) {
-      throw new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError');
+      throw new DOMException(
+        'Identity save was cancelled.',
+        /* @wc-ignore */ 'AbortError',
+      );
     }
   };
+
   let prepared = await prepareDbKeyOnSignIn(
     agentSubject,
     credentials,

@@ -53,10 +53,16 @@ vi.mock('../../hooks/useNavigateWithTransition', () => ({
 vi.mock('../../hooks/useNewResourceUI', () => ({
   useNewResourceUI: () => vi.fn(),
 }));
-vi.mock('../../routes/paths', () => ({ paths: { agentSettings: '/app/agent' } }));
+vi.mock('../../routes/paths', () => ({
+  paths: { agentSettings: '/app/agent' },
+}));
 vi.mock('../Dropdown', () => ({
   DIVIDER: 'divider',
-  DropdownMenu: ({ items }: { items: Array<{ id?: string; label?: string }> }) => (
+  DropdownMenu: ({
+    items,
+  }: {
+    items: Array<{ id?: string; label?: string }>;
+  }) => (
     <div>
       {items
         .filter(item => item.id?.startsWith('did:'))

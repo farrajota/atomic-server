@@ -623,14 +623,17 @@ export function GettingStartedFlow({
       }
     });
     let watchingAgent = true;
+
     const stopWatchingAgent = () => {
       if (!watchingAgent) return;
       watchingAgent = false;
       offAgentChanged();
     };
+
     controller.signal.addEventListener('abort', stopWatchingAgent, {
       once: true,
     });
+
     const isCurrentAttempt = () => {
       if (attempt !== signInAttemptRef.current || identityChanged) return false;
       if (store.getAgent()?.subject === expectedAgentSubject) return true;
@@ -640,11 +643,13 @@ export function GettingStartedFlow({
 
       return false;
     };
+
     setLoading(true);
     setError(undefined);
     setIdentitySaveFailed(false);
 
     failedIdentitySecretRef.current = null;
+
     try {
       const newAgent = await Agent.fromSecret(secret);
       if (!isCurrentAttempt()) return;
@@ -678,7 +683,7 @@ export function GettingStartedFlow({
           signal: controller.signal,
         }).then(
           (): true => true,
-          (error: unknown) => ({ error }),
+          (cause: unknown) => ({ error: cause }),
         ),
         IDENTITY_SAVE_TIMEOUT_MS,
         IDENTITY_SAVE_TIMED_OUT,
@@ -717,6 +722,7 @@ export function GettingStartedFlow({
           undefined,
         );
       }
+
       if (!isCurrentAttempt()) return;
 
       // One sign-in: the identity just unlocked signs the account in too, so
@@ -959,10 +965,12 @@ export function GettingStartedFlow({
     } finally {
       if (attempt === signInAttemptRef.current) {
         setLoading(false);
+
         if (signInAbortRef.current === controller) {
           signInAbortRef.current = null;
         }
       }
+
       stopWatchingAgent();
     }
   }
@@ -975,6 +983,7 @@ export function GettingStartedFlow({
     ) {
       return;
     }
+
     let cancelled = false;
     setRestore({ phase: 'checking' });
     if (!identitySaveFailed) setError(undefined);
@@ -1470,6 +1479,7 @@ export function GettingStartedFlow({
                             setIdentitySaveFailed(false);
                             setError(undefined);
                           }
+
                           setSecretValue(e.target.value);
                           void trySecret(e.target.value);
                         }}
@@ -1505,6 +1515,7 @@ export function GettingStartedFlow({
                         disabled={loading || !failedIdentitySecretRef.current}
                         onClick={() => {
                           const failedSecret = failedIdentitySecretRef.current;
+
                           if (failedSecret) {
                             void handleSignInWithSecret(failedSecret);
                           }

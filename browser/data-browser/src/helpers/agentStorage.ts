@@ -163,7 +163,10 @@ export interface SaveAgentOptions {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
-    throw new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError');
+    throw new DOMException(
+      'Identity save was cancelled.',
+      /* @wc-ignore */ 'AbortError',
+    );
   }
 }
 
@@ -172,15 +175,22 @@ function waitForAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
 
   return new Promise<T>((resolve, reject) => {
     let settled = false;
+
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
       signal.removeEventListener('abort', abort);
       callback();
     };
+
     const abort = () =>
       finish(() =>
-        reject(new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError')),
+        reject(
+          new DOMException(
+            'Identity save was cancelled.',
+            /* @wc-ignore */ 'AbortError',
+          ),
+        ),
       );
 
     signal.addEventListener('abort', abort, { once: true });
@@ -211,14 +221,19 @@ function commitSignInRecords(
     signal?.removeEventListener('abort', abort);
     database?.close();
   };
+
   const finish = (callback: () => void) => {
     if (settled) return;
     settled = true;
     cleanup();
     callback();
   };
+
   const abort = () => {
-    const error = new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError');
+    const error = new DOMException(
+      'Identity save was cancelled.',
+      /* @wc-ignore */ 'AbortError',
+    );
 
     if (!transaction) {
       finish(() => reject(error));
@@ -236,6 +251,7 @@ function commitSignInRecords(
         // If the transaction already committed, its completion event wins.
         return;
       }
+
       finish(() => reject(abortError));
     }
   };
@@ -252,10 +268,12 @@ function commitSignInRecords(
 
   request.onupgradeneeded = () => {
     const opened = request?.result;
+
     if (opened && !opened.objectStoreNames.contains(IDB_KEYVAL_OBJECT_STORE)) {
       opened.createObjectStore(IDB_KEYVAL_OBJECT_STORE);
     }
   };
+
   request.onerror = () =>
     finish(() =>
       reject(request?.error ?? new Error('Could not open browser storage.')),
@@ -264,6 +282,7 @@ function commitSignInRecords(
     finish(() =>
       reject(new Error('Browser storage is blocked by another open tab.')),
     );
+
   request.onsuccess = () => {
     const opened = request?.result;
 
@@ -290,6 +309,7 @@ function commitSignInRecords(
 
         try {
           for (const key of deletes) objectStore.delete(key);
+
           for (const write of writes) {
             objectStore.put(write.value, write.key);
           }
@@ -303,11 +323,15 @@ function commitSignInRecords(
       };
 
       transaction.oncomplete = () => finish(() => resolve(true));
+
       transaction.onabort = () => {
         if (signal?.aborted) {
           finish(() =>
             reject(
-              new DOMException('Identity save was cancelled.', /* @wc-ignore */ 'AbortError'),
+              new DOMException(
+                'Identity save was cancelled.',
+                /* @wc-ignore */ 'AbortError',
+              ),
             ),
           );
         } else if (retryForSessionKey) {
@@ -324,6 +348,7 @@ function commitSignInRecords(
 
       if (preparedDbKey?.source === 'generated') {
         const sessionKeyRequest = objectStore.get(preparedDbKey.sessionKeyKey);
+
         sessionKeyRequest.onsuccess = () => {
           if (settled) return;
 
@@ -472,6 +497,7 @@ async function storeSecret(
     } catch (error) {
       if (signal?.aborted) throw error;
     }
+
     throwIfAborted(signal);
 
     if (keyMaterial) {
@@ -516,6 +542,7 @@ async function storeSecret(
     credentials,
     signal,
   );
+
   while (true) {
     throwIfAborted(signal);
     const committed = await commitSignInRecords(
@@ -555,7 +582,6 @@ async function prepareLocalDbKey(
     return undefined;
   }
 }
-
 
 const PREVIOUS_IDENTITIES_KEY = 'atomic.previousIdentities';
 

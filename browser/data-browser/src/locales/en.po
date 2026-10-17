@@ -2139,7 +2139,9 @@ msgid "Add tag"
 msgstr "Add tag"
 
 #. 0: label
+#. 0: label
 #. 0: getTitle(resource)
+#: src/components/SideBar/DriveSwitcher.tsx
 #: src/components/SideBar/DriveSwitcher.tsx
 #: src/components/SideBar/DriveSwitcher.tsx
 msgid "Switch to {0}"
@@ -12943,3 +12945,34 @@ msgstr "Could not reach that address."
 #: src/components/ConnectDevice.tsx
 msgid "That address answers, but it is not an AtomicServer."
 msgstr "That address answers, but it is not an AtomicServer."
+
+#: src/helpers/agentStorage.ts
+#: src/helpers/agentStorage.ts
+#: src/helpers/agentStorage.ts
+msgid "Identity save was cancelled."
+msgstr "Identity save was cancelled."
+
+#: src/helpers/agentStorage.ts
+#: src/helpers/agentStorage.ts
+msgid "Could not open browser storage."
+msgstr "Could not open browser storage."
+
+#: src/helpers/agentStorage.ts
+msgid "Browser storage is blocked by another open tab."
+msgstr "Browser storage is blocked by another open tab."
+
+#: src/helpers/agentStorage.ts
+msgid "Could not save identity to browser storage."
+msgstr "Could not save identity to browser storage."
+
+#: src/views/getting-started/GettingStartedFlow.tsx
+msgid "Could not save this identity"
+msgstr "Could not save this identity"
+
+#: src/views/getting-started/GettingStartedFlow.tsx
+msgid "Retry saving identity"
+msgstr "Retry saving identity"
+
+#: src/helpers/localDbKey.ts
+msgid "The existing local cache key conflicts with this identity or its wrapped records. Retry with the original identity; your stored identity and cache have not been changed."
+msgstr "The existing local cache key conflicts with this identity or its wrapped records. Retry with the original identity; your stored identity and cache have not been changed."

@@ -92,9 +92,9 @@ describe('evaluateServerReconciliation', () => {
       unregisterLocalOnlyDrive: (drive: string) => events.push(drive),
     };
     const persist = vi.fn();
-    expect(await connectHostedDrive(store, 'did:ad:drive1', persist, () => true)).toBe(
-      true,
-    );
+    expect(
+      await connectHostedDrive(store, 'did:ad:drive1', persist, () => true),
+    ).toBe(true);
     expect(events).toEqual(['did:ad:drive1', 'https://node1.atomicserver.eu']);
     expect(persist).toHaveBeenCalledWith('https://node1.atomicserver.eu');
   });
@@ -111,9 +111,9 @@ describe('evaluateServerReconciliation', () => {
         setServerUrl: vi.fn(),
         unregisterLocalOnlyDrive: vi.fn(),
       };
-      expect(await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), () => true)).toBe(
-        false,
-      );
+      expect(
+        await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), () => true),
+      ).toBe(false);
       expect(store.setServerUrl).not.toHaveBeenCalled();
     },
   );
@@ -128,9 +128,9 @@ describe('evaluateServerReconciliation', () => {
       setServerUrl: vi.fn(),
       unregisterLocalOnlyDrive: vi.fn(),
     };
-    expect(await connectHostedDrive(store, 'did:ad:other', vi.fn(), () => true)).toBe(
-      false,
-    );
+    expect(
+      await connectHostedDrive(store, 'did:ad:other', vi.fn(), () => true),
+    ).toBe(false);
     expect(store.setServerUrl).not.toHaveBeenCalled();
   });
 
@@ -148,9 +148,9 @@ describe('evaluateServerReconciliation', () => {
       setServerUrl: vi.fn(),
       unregisterLocalOnlyDrive: vi.fn(),
     };
-    expect(await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), () => true, 1)).toBe(
-      false,
-    );
+    expect(
+      await connectHostedDrive(store, 'did:ad:drive1', vi.fn(), () => true, 1),
+    ).toBe(false);
     mockFetch({
       account: { email: 'a@example.com' },
       enrollments: [enrollment({})],

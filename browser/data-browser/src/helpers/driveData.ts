@@ -114,6 +114,7 @@ export async function findAccessibleDrives(store: Store): Promise<string[]> {
     { serverOnly: true },
   );
   let subjects: string[];
+
   try {
     subjects = await drives.getAllMembers();
   } catch (error) {
@@ -121,6 +122,7 @@ export async function findAccessibleDrives(store: Store): Promise<string[]> {
 
     return [];
   }
+
   if (store.getAgent() !== agent) return [];
   const readable = await Promise.all(
     subjects.map(subject =>

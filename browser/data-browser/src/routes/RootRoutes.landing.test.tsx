@@ -79,8 +79,11 @@ vi.mock('../helpers/managedServer', () => ({
   fetchManagedInfo: async () => ({ acceptsNewDrives: false }),
 }));
 vi.mock('../helpers/withDeadline', () => ({
-  withDeadline: async (work: Promise<unknown>, _ms: number, fallback: unknown) =>
-    work.catch(() => fallback),
+  withDeadline: async (
+    work: Promise<unknown>,
+    _ms: number,
+    fallback: unknown,
+  ) => work.catch(() => fallback),
 }));
 vi.mock('../helpers/homeDrive', () => ({
   getHomeDrive: () => state.homeDrive,
@@ -193,7 +196,9 @@ it('finishes root resolution when the only readable target is the server root', 
   renderTopRoute();
 
   await waitFor(() => {
-    expect(screen.getByTestId('resource-page').textContent).toContain(rootSubject);
+    expect(screen.getByTestId('resource-page').textContent).toContain(
+      rootSubject,
+    );
   });
   expect(state.navigate).not.toHaveBeenCalled();
 });

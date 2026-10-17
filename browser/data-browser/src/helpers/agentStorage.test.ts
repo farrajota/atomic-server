@@ -29,7 +29,8 @@ const memoryDatabase = {
 
           return request as unknown as IDBRequest;
         },
-        put: (value: unknown, key: IDBValidKey) => writes.set(String(key), value),
+        put: (value: unknown, key: IDBValidKey) =>
+          writes.set(String(key), value),
         delete: (key: IDBValidKey) => deletes.add(String(key)),
       }),
       abort() {
@@ -37,6 +38,7 @@ const memoryDatabase = {
         transaction.onabort?.(new Event('abort'));
       },
     };
+
     const complete = () => {
       if (aborted) return;
       for (const key of deletes) store.delete(key);
@@ -280,8 +282,10 @@ it('fails a same-subject different-key sign-in without changing the identity or 
   expect((await getAgentFromIDB())?.subject).toBe(
     (await Agent.fromSecret(original)).subject,
   );
+
   for (const [key, value] of before) {
-    if (key.startsWith('atomic.clientdb.')) expect(store.get(key)).toEqual(value);
+    if (key.startsWith('atomic.clientdb.'))
+      expect(store.get(key)).toEqual(value);
   }
 });
 

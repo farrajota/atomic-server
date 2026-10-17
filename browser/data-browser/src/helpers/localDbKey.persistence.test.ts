@@ -279,10 +279,7 @@ describe('persistent local database keys', () => {
     );
     records.set(v2, {
       version: 2,
-      envelope: fakeOps.wrap(
-        new Uint8Array(31),
-        new Uint8Array(64).fill(3),
-      ),
+      envelope: fakeOps.wrap(new Uint8Array(31), new Uint8Array(64).fill(3)),
     });
 
     expect(await ensureDbKeyOnSignIn(subject, credentials, withWasm)).toEqual(
