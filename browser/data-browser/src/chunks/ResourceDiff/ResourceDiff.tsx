@@ -3,7 +3,6 @@ import { createMarkdownDiff } from '@components/datatypes/markdown/MarkdownDiff'
 import { JsonDiff } from '@components/datatypes/json/JsonDiff';
 import { Column, Row } from '@components/Row';
 import {
-  dataBrowser,
   Datatype,
   isJSONObject,
   useProperty,
@@ -16,7 +15,7 @@ import { FaArrowRight } from 'react-icons/fa6';
 import styled from 'styled-components';
 import ValueComp from '@components/ValueComp';
 import type { AtomicDiff } from '@components/ResourceDiff/resourceDiffUtils';
-import { LoroDocMarkdownDiff } from './LoroDocMarkdownDiff';
+import { LoroDocDiff } from './LoroDocDiff';
 import {
   calendarDateToLocalDate,
   formatCalendarDate,
@@ -35,6 +34,7 @@ export const ResourceDiff: React.FC<ResourceDiffProps> = ({
 
   return (
     <Column className={className}>
+      {diff.bodyChanged && <BodyLine diff={diff} />}
       {changedProps.map(prop => (
         <PropertyLine
           key={prop}
@@ -44,6 +44,23 @@ export const ResourceDiff: React.FC<ResourceDiffProps> = ({
         />
       ))}
     </Column>
+  );
+};
+
+const BodyLine = ({ diff }: { diff: AtomicDiff }) => {
+  const type = diff.oldResource ? 'changed' : 'added';
+
+  return (
+    <PropLineWrapper>
+      <Row center gap='1ch'>
+        <DiffTag type={type}>{type}</DiffTag>
+        <Title>Document body</Title>
+      </Row>
+      <LoroDocDiff
+        oldResource={diff.oldResource}
+        newResource={diff.newResource}
+      />
+    </PropLineWrapper>
   );
 };
 
@@ -165,18 +182,6 @@ export const ChangeSwitcher: React.FC<ChangeSwitcherProps> = ({
 
   const valOld = oldResource.get(property.subject);
   const valNew = newResource.get(property.subject);
-
-  // TODO: Document content is not stored on this property anymore, we should update this code.
-  if (property.subject === dataBrowser.properties.documentContent) {
-    return (
-      <LoroDocMarkdownDiff
-        oldResource={oldResource}
-        newResource={newResource}
-        propertySubject={property.subject}
-        showFullValue={showFullValue}
-      />
-    );
-  }
 
   if (
     property.datatype === Datatype.JSON ||

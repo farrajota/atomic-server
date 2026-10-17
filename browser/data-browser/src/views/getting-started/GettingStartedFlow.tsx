@@ -244,18 +244,29 @@ export function GettingStartedFlow({
     }
   }
 
-  const nextPath =
-    requestedNextUrl?.origin === window.location.origin &&
+  const isLocalAppNext =
+    requestedNextUrl !== undefined &&
+    requestedNextUrl.origin === window.location.origin &&
     (requestedNextUrl.pathname === pathNames.app ||
-      requestedNextUrl.pathname.startsWith(`${pathNames.app}/`))
+      requestedNextUrl.pathname.startsWith(`${pathNames.app}/`));
+  const isAuthFlowNext =
+    requestedNextUrl !== undefined &&
+    isLocalAppNext &&
+    (requestedNextUrl.pathname === paths.welcome ||
+      requestedNextUrl.pathname === paths.onboarding);
+  const nextPath =
+    requestedNextUrl !== undefined && isLocalAppNext && !isAuthFlowNext
       ? `${requestedNextUrl.pathname}${requestedNextUrl.search}${requestedNextUrl.hash}`
       : undefined;
-  const nextDrive = nextPath
-    ? undefined
-    : requestedNext ||
-      new URLSearchParams(window.location.search).get('drive') ||
-      new URLSearchParams(window.location.search).get('subject') ||
-      undefined;
+  const explicitNextDrive =
+    new URLSearchParams(window.location.search).get('drive') ||
+    new URLSearchParams(window.location.search).get('subject') ||
+    undefined;
+  const nextDrive = isAuthFlowNext
+    ? explicitNextDrive
+    : isLocalAppNext
+      ? undefined
+      : requestedNext || explicitNextDrive;
   // Only this named, internal destination is accepted; never navigate to an
   // arbitrary return URL supplied by a link. Adding a passkey needs the local
   // identity unlocked before the account settings can edit its backup.

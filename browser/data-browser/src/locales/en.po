@@ -3284,9 +3284,8 @@ msgstr "Min must be a less than max"
 msgid "Document body"
 msgstr "Document body"
 
-#: src/routes/History/VersionContent.tsx
-msgid "(empty)"
-msgstr "(empty)"
+#~ msgid "(empty)"
+#~ msgstr "(empty)"
 
 #: src/chunks/RTE/SlashMenu/CommandList.tsx
 #: src/routes/Search/SearchOverlay.tsx
@@ -12976,3 +12975,36 @@ msgstr "Retry saving identity"
 #: src/helpers/localDbKey.ts
 msgid "The existing local cache key conflicts with this identity or its wrapped records. Retry with the original identity; your stored identity and cache have not been changed."
 msgstr "The existing local cache key conflicts with this identity or its wrapped records. Retry with the original identity; your stored identity and cache have not been changed."
+
+#. 0: ' '; 1: unsupportedRequired.map(columnLabel).join(', ')
+#: src/chunks/TablePage/CreateTableFormDialog.tsx
+msgid "Required columns{0} {1} are not supported in forms. Make these columns form-compatible in the table schema before creating a form."
+msgstr "Required columns{0} {1} are not supported in forms. Make these columns form-compatible in the table schema before creating a form."
+
+#: src/chunks/RTE/ResourceExtension/ResourceComponent.tsx
+msgid "Loading embedded resource"
+msgstr "Loading embedded resource"
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Before"
+msgstr "Before"
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Before document body"
+msgstr "Before document body"
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "After"
+msgstr "After"
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "After document body"
+msgstr "After document body"
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Added"
+msgstr "Added"
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Added document body"
+msgstr "Added document body"

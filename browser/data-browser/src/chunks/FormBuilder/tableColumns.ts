@@ -7,6 +7,7 @@ import {
   Store,
   CollectionBuilder,
   type Constraint,
+  type JSONValue,
 } from '@tomic/react';
 import { FIELD_TYPE_DEFAULT_OPTIONS, type FormFieldType } from './fieldTypes';
 import { columnConstraint } from './formConstraints';
@@ -93,46 +94,84 @@ export function columnLabel(property: Resource): string {
   );
 }
 
+/** Presentation settings resolved before a field resource is created. */
+interface MappedFieldPlan {
+  type: FormFieldType;
+  options: Record<string, JSONValue>;
+}
+
+/** Resolves every selected mapping before a form graph is written. */
+export async function preflightMappedFields(
+  store: Store,
+  dataClass: Resource,
+  properties: Resource[],
+): Promise<Map<string, MappedFieldPlan>> {
+  const members = new Set(classColumns(dataClass));
+  const plans = new Map<string, MappedFieldPlan>();
+
+  for (const property of properties) {
+    if (!members.has(property.subject))
+      throw new Error('Column is not part of this table');
+
+    const constraint = columnConstraint(
+      store,
+      dataClass.subject,
+      property.subject,
+    );
+    const type = compatibleFieldTypes(property, constraint)[0];
+
+    if (!type)
+      throw new Error(`${columnLabel(property)} is not supported in forms`);
+
+    const options: Record<string, JSONValue> = {};
+    Object.assign(options, FIELD_TYPE_DEFAULT_OPTIONS[type]);
+
+    // The class already caps the pick count; stating it keeps the setting
+    // visible in the builder.
+    if (constraint.maxItems !== undefined && type === 'dropdown-multi')
+      Object.assign(options, { maxItems: constraint.maxItems });
+
+    if (type === 'dropdown' && !isSelectColumn(property, constraint)) {
+      const tables = await new CollectionBuilder(store)
+        .setProperty(core.properties.classtype)
+        .setValue(constraint.class as string)
+        .setFilters([
+          { property: core.properties.isA, value: dataBrowser.classes.table },
+        ])
+        .buildAndFetch();
+      let target: string | undefined;
+
+      for await (const subject of tables) {
+        target = subject;
+        break;
+      }
+
+      if (!target) throw new Error('No table found for this relation column');
+      Object.assign(options, { optionsSource: { table: target } });
+    }
+
+    plans.set(property.subject, { type, options });
+  }
+
+  return plans;
+}
+
 /** Creates presentation only. Never writes to the class, Property, or Tags. */
+
 export async function createMappedField(
   store: Store,
   page: Resource,
   dataClass: Resource,
   property: Resource,
+  plan?: MappedFieldPlan,
 ): Promise<Resource> {
-  if (!classColumns(dataClass).includes(property.subject))
-    throw new Error('Column is not part of this table');
-  const constraint = columnConstraint(
-    store,
-    dataClass.subject,
-    property.subject,
-  );
-  const type = compatibleFieldTypes(property, constraint)[0];
-  if (!type) throw new Error('This column is not supported in forms');
-  const options = { ...(FIELD_TYPE_DEFAULT_OPTIONS[type] as object) };
-  // The class already caps the pick count; stating it keeps the setting
-  // visible in the builder.
-  if (constraint.maxItems !== undefined && type === 'dropdown-multi')
-    Object.assign(options, { maxItems: constraint.maxItems });
+  const resolved =
+    plan ??
+    (await preflightMappedFields(store, dataClass, [property])).get(
+      property.subject,
+    );
 
-  if (type === 'dropdown' && !isSelectColumn(property, constraint)) {
-    const tables = await new CollectionBuilder(store)
-      .setProperty(core.properties.classtype)
-      .setValue(constraint.class as string)
-      .setFilters([
-        { property: core.properties.isA, value: dataBrowser.classes.table },
-      ])
-      .buildAndFetch();
-    let target: string | undefined;
-
-    for await (const subject of tables) {
-      target = subject;
-      break;
-    }
-
-    if (!target) throw new Error('No table found for this relation column');
-    Object.assign(options, { optionsSource: { table: target } });
-  }
+  if (!resolved) throw new Error('Unable to resolve this form field');
 
   const field = await store.newResource({
     parent: page.subject,
@@ -140,11 +179,11 @@ export async function createMappedField(
     propVals: {
       [core.properties.name]: columnLabel(property),
       [forms.properties.formMapsTo]: property.subject,
-      [forms.properties.formFieldType]: type,
+      [forms.properties.formFieldType]: resolved.type,
       [forms.properties.required]: dataClass
         .getSubjects(core.properties.requires)
         .includes(property.subject),
-      [forms.properties.formFieldOptions]: options,
+      [forms.properties.formFieldOptions]: resolved.options,
     },
   });
   await field.save();

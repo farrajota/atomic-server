@@ -22,11 +22,11 @@ msgstr "Error al regenerar el mensaje de chat de IA"
 #: src/chunks/AI/AISidebar.tsx
 #: src/components/SideBar/AIPanel.tsx
 msgid "New Chat"
-msgstr "Nuevo Chat"
+msgstr "Nuevo chat"
 
 #: src/chunks/AI/AISidebar.tsx
 msgid "Close AI Sidebar"
-msgstr "Cerrar la barra lateral de IA"
+msgstr "Cerrar barra lateral de IA"
 
 #: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
@@ -3284,9 +3284,8 @@ msgstr "El mínimo debe ser menor que el máximo"
 msgid "Document body"
 msgstr "Cuerpo del documento"
 
-#: src/routes/History/VersionContent.tsx
-msgid "(empty)"
-msgstr "(vacío)"
+#~ msgid "(empty)"
+#~ msgstr "(vacío)"
 
 #: src/chunks/RTE/SlashMenu/CommandList.tsx
 #: src/routes/Search/SearchOverlay.tsx
@@ -8265,7 +8264,7 @@ msgstr ""
 
 #: src/chunks/AI/AISidebar.tsx
 msgid "AI chat"
-msgstr ""
+msgstr "Chat de IA"
 
 #: src/chunks/AI/AISetupPanel.tsx
 msgid "Also use for chat titles"
@@ -8278,7 +8277,7 @@ msgstr ""
 #: src/chunks/AI/AIChatPage.tsx
 #: src/chunks/AI/AISidebar.tsx
 msgid "Chat resource actions"
-msgstr ""
+msgstr "Acciones de recursos del chat"
 
 #: src/components/AI/OpenRouterLoginButton.tsx
 msgid "Could not start OpenRouter login. Allow browser storage and try again."
@@ -12962,4 +12961,37 @@ msgstr ""
 
 #: src/helpers/localDbKey.ts
 msgid "The existing local cache key conflicts with this identity or its wrapped records. Retry with the original identity; your stored identity and cache have not been changed."
+msgstr ""
+
+#. 0: ' '; 1: unsupportedRequired.map(columnLabel).join(', ')
+#: src/chunks/TablePage/CreateTableFormDialog.tsx
+msgid "Required columns{0} {1} are not supported in forms. Make these columns form-compatible in the table schema before creating a form."
+msgstr ""
+
+#: src/chunks/RTE/ResourceExtension/ResourceComponent.tsx
+msgid "Loading embedded resource"
+msgstr ""
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Before"
+msgstr ""
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Before document body"
+msgstr ""
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "After"
+msgstr ""
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "After document body"
+msgstr ""
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Added"
+msgstr ""
+
+#: src/chunks/ResourceDiff/LoroDocDiff.tsx
+msgid "Added document body"
 msgstr ""

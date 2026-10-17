@@ -1,20 +1,6 @@
 import { MarkdownManager } from '@tiptap/markdown';
 import type { Schema } from '@tiptap/pm/model';
-import type { Store } from '@tomic/react';
 import type { LoroDoc } from 'loro-crdt';
-import { getCollaborativeEditorSchema } from '@chunks/RTE/getCollaborativeEditorSchema';
-
-export function getDocumentDiffSerializeContext(store: Store): {
-  schema: Schema;
-  mdManager: MarkdownManager;
-} {
-  const { schema, extensions } = getCollaborativeEditorSchema(store);
-
-  return {
-    schema,
-    mdManager: new MarkdownManager({ extensions }),
-  };
-}
 
 function extractTextFromNode(node: unknown): string {
   if (!node || typeof node !== 'object') return '';
@@ -30,9 +16,8 @@ function extractTextFromNode(node: unknown): string {
   return '';
 }
 
-/**
- * Serialize collaborative document LoroDoc to Markdown for diffing.
- * Falls back to plain text if TipTap/Markdown serialization fails.
+/** Serializes legacy non-DocumentV2 containers for the existing read-only fallback.
+ * Falls back to plain text if Markdown serialization fails.
  */
 export function loroDocToMarkdownString(
   loroDoc: LoroDoc,

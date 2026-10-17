@@ -33,6 +33,8 @@ export interface CellProps {
   disabled?: boolean;
   align?: CellAlign;
   role?: string;
+  /** Finite exposed grid column when the logical cursor index is a sentinel. */
+  ariaColumnIndex?: number;
   /** Supplementary position/context info (e.g. "name, row 1"). Exposed as
    * `aria-description`, NOT `aria-label` — an aria-label would override the
    * cell's own content as its accessible name, hiding the actual value from
@@ -59,6 +61,7 @@ interface IndexCellProps extends CellProps {
 export function Cell({
   rowIndex,
   columnIndex,
+  ariaColumnIndex,
   className,
   children,
   disabled,
@@ -81,6 +84,7 @@ export function Cell({
     multiSelectCornerRow,
     multiSelectCornerColumn,
     cursorMode,
+    tableRef,
     setActiveCell,
     setMultiSelectCorner,
     updateActiveCellRef,
@@ -198,6 +202,7 @@ export function Cell({
         e.stopPropagation();
         setCursorMode(CursorMode.MultiSelect);
         setMultiSelectCorner(rowIndex, columnIndex);
+        ref.current?.focus({ preventScroll: true });
 
         return;
       }
@@ -221,6 +226,9 @@ export function Cell({
 
       setCursorMode(CursorMode.Visual);
       setActiveCell(rowIndex, columnIndex);
+      // Selection can suppress native mousedown focus, so explicitly focus
+      // this clicked cell instead of relying on a rerender.
+      ref.current?.focus({ preventScroll: true });
     },
     [
       readOnly,
@@ -269,38 +277,54 @@ export function Cell({
   }, [isActiveCorner, updateMultiSelectCornerCellRef]);
 
   useEffect(() => {
-    if (!ref.current) {
+    if (!ref.current || !isActive) {
       return;
     }
 
-    if (isActive) {
-      if (!ref.current.contains(document.activeElement)) {
-        ref.current.focus({ preventScroll: true });
-      }
+    // A filtered row may remount the selected cell while the search input
+    // remains focused. Reclaim focus only when it belongs to the grid or has
+    // genuinely fallen back to the document, never from another widget.
+    const activeElement = document.activeElement;
+    const gridOwnsFocus = tableRef.current?.contains(activeElement) ?? false;
+    const focusWasLost =
+      activeElement === document.body ||
+      activeElement === document.documentElement;
 
-      updateActiveCellRef(ref.current);
-
-      const unregisters = [
-        registerEventListener(
-          TableEvent.EnterEditModeWithCharacter,
-          onEnterEditModeWithCharacter,
-        ),
-        registerEventListener(TableEvent.InteractionsFired, interactions => {
-          if (
-            interactions.includes(KeyboardInteraction.EditNextRow) &&
-            isActive
-          ) {
-            onEditNextRow?.();
-          }
-        }),
-      ];
-
-      return () => {
-        for (const unregister of unregisters) {
-          unregister();
-        }
-      };
+    if (
+      !ref.current.contains(activeElement) &&
+      (gridOwnsFocus || focusWasLost)
+    ) {
+      ref.current.focus({ preventScroll: true });
     }
+  }, [isActive, tableRef]);
+
+  useEffect(() => {
+    if (!ref.current || !isActive) {
+      return;
+    }
+
+    updateActiveCellRef(ref.current);
+
+    const unregisters = [
+      registerEventListener(
+        TableEvent.EnterEditModeWithCharacter,
+        onEnterEditModeWithCharacter,
+      ),
+      registerEventListener(TableEvent.InteractionsFired, interactions => {
+        if (
+          interactions.includes(KeyboardInteraction.EditNextRow) &&
+          isActive
+        ) {
+          onEditNextRow?.();
+        }
+      }),
+    ];
+
+    return () => {
+      for (const unregister of unregisters) {
+        unregister();
+      }
+    };
   }, [
     isActive,
     onEnterEditModeWithCharacter,
@@ -312,7 +336,7 @@ export function Cell({
   return (
     <CellWrapper
       index={columnIndex}
-      aria-colindex={columnIndex + 1}
+      aria-colindex={ariaColumnIndex ?? columnIndex + 1}
       ref={ref}
       disabled={disabled}
       role={role ?? 'gridcell'}

@@ -4,6 +4,15 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- Native document history displays and restores the saved body and formatting,
+  including formatting-only changes, with labelled before/after content panels.
+- Table quick filters preserve native focus and row values across repeated
+  inline editing sessions, including rows removed and returned by filtering.
+- Table-generated forms preserve required columns, reject unsupported mappings
+  before creating resources, and remain discoverable on their table's drive.
+- Native history orders saved versions by the causal position of each message
+  bucket's final edit, so a later document-body edit remains the latest version
+  even when it reuses an older bucket or shares a wall-clock timestamp.
 - Provisioned Agents without home-drive metadata can open an existing readable
   shared Drive after sign-in. Signed-in bare-root navigation resolves an
   accessible Drive instead of a server-root placeholder; explicit requested
@@ -67,6 +76,9 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 - Opening a resource keeps the current page's query parameters (view, filter, drive) unless the link overrides them.
 - Tables: pressing Enter in a tag cell while no option matches no longer clears the cell. Tag options update as their tag resources load.
 - `@tomic/react`: local file previews (`useFileObjectUrl`) only keep allowlisted media types (raster images, video, audio, PDF); other bytes become `application/octet-stream`, SVG a `data:` URL, so an uploaded HTML or SVG file never opens as a page of the app.
+
+- Login attempts keep ownership across refresh-free identity changes, so obsolete attempts cannot change another account's server or route. Invalid required-form submissions now stop at preflight without creating a partial resource graph. Opening an existing table loads and queries its rows from the table's projected/stamped owning drive even when another navigation workspace remains active; drive changes and remounts rebuild the right collection without switching the active workspace.
+- Native selected-cell filtering kept a complete native search in the filter in local production, but the separate inline-editor-to-filter transition returned focus to the editor, appended the typed search to the cell, and persisted that edit on a later signed read; native full-word filter acceptance therefore remains open. Native history renders and diffs real marked text; both Resource factories initialize default text style on new and cloned Loro text without overriding explicit consumer styles. A real restore retains prior native history, and later body edits persist through save. Deployed new-image qualification, history-label identification, and whole-application/rollout acceptance remain open.
 
 ## [v0.41.0-beta.8] - 2026-10-10
 

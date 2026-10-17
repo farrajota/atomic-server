@@ -20,6 +20,7 @@ import {
   compatibleColumnTypes,
   columnLabel,
   createMappedField,
+  preflightMappedFields,
 } from '../FormBuilder/tableColumns';
 import { constructOpenURL } from '@helpers/navigation';
 
@@ -46,11 +47,42 @@ export function CreateTableFormDialog({
   });
 
   useEffect(() => show(), [show]);
+  const columnSupported = new Map<string, boolean>();
+
+  for (const property of columns) {
+    columnSupported.set(
+      property.subject,
+      compatibleColumnTypes(store, dataClass.subject, property).length > 0,
+    );
+  }
+
+  const unsupportedRequired = columns.filter(
+    property =>
+      requires.includes(property.subject) &&
+      !columnSupported.get(property.subject),
+  );
+
+  const selectedColumns = columns.filter(
+    property =>
+      columnSupported.get(property.subject) &&
+      (requires.includes(property.subject) ||
+        !excluded.includes(property.subject)),
+  );
 
   const create = async () => {
+    if (loading || unsupportedRequired.length || !name.trim()) return;
+
     setBusy(true);
 
     try {
+      const mappingPlans = await preflightMappedFields(
+        store,
+        dataClass,
+        selectedColumns,
+      );
+      if (selectedColumns.some(property => !mappingPlans.has(property.subject)))
+        throw new Error('Unable to resolve all selected columns');
+
       const form = await store.newResource({
         parent: table.subject,
         isA: forms.classes.form,
@@ -75,12 +107,14 @@ export function CreateTableFormDialog({
       await form.set(forms.properties.formPages, [page.subject]);
       await form.save();
 
-      for (const property of columns.filter(
-        p =>
-          !excluded.includes(p.subject) &&
-          compatibleColumnTypes(store, dataClass.subject, p).length,
-      )) {
-        const field = await createMappedField(store, page, dataClass, property);
+      for (const property of selectedColumns) {
+        const field = await createMappedField(
+          store,
+          page,
+          dataClass,
+          property,
+          mappingPlans.get(property.subject),
+        );
         await page.set(forms.properties.formFields, [
           ...page.getSubjects(forms.properties.formFields),
           field.subject,
@@ -122,26 +156,38 @@ export function CreateTableFormDialog({
               Select the columns to include. Responses will be added to this
               table.
             </p>
+            {unsupportedRequired.length > 0 && (
+              <p role='alert'>
+                Required columns{' '}
+                {unsupportedRequired.map(columnLabel).join(', ')} are not
+                supported in forms. Make these columns form-compatible in the
+                table schema before creating a form.
+              </p>
+            )}
             {columns.map(property => {
-              const supported =
-                compatibleColumnTypes(store, dataClass.subject, property)
-                  .length > 0;
+              const supported = columnSupported.get(property.subject) ?? false;
+              const required = requires.includes(property.subject);
 
               return (
                 <CheckboxLabel key={property.subject}>
                   <Checkbox
-                    disabled={!supported || busy}
-                    checked={supported && !excluded.includes(property.subject)}
-                    onChange={checked =>
+                    disabled={!supported || required || busy}
+                    checked={
+                      supported &&
+                      (required || !excluded.includes(property.subject))
+                    }
+                    onChange={checked => {
+                      if (required) return;
+
                       setExcluded(previous =>
                         checked
                           ? previous.filter(s => s !== property.subject)
                           : [...previous, property.subject],
-                      )
-                    }
+                      );
+                    }}
                   />
                   {columnLabel(property)}
-                  {requires.includes(property.subject) ? ' (required)' : ''}
+                  {required ? ' (required)' : ''}
                   {!supported ? ' — not supported in forms' : ''}
                 </CheckboxLabel>
               );
@@ -152,7 +198,12 @@ export function CreateTableFormDialog({
           <Button subtle disabled={busy} onClick={() => hide()}>
             Cancel
           </Button>
-          <Button disabled={busy || loading || !name.trim()} onClick={create}>
+          <Button
+            disabled={
+              busy || loading || !name.trim() || unsupportedRequired.length > 0
+            }
+            onClick={create}
+          >
             Create form
           </Button>
         </DialogActions>

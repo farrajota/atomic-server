@@ -10,7 +10,11 @@ import type { JSONValue } from './value.js';
 import { testStore } from './test-store.js';
 import { core } from './index.js';
 import { LoroLoader } from './loro-loader.js';
-import { LoroList as LoroListClass, LoroMap as LoroMapClass } from 'loro-crdt';
+import {
+  LoroList as LoroListClass,
+  LoroMap as LoroMapClass,
+  LoroText as LoroTextClass,
+} from 'loro-crdt';
 
 describe('resource.ts', () => {
   it('reports buffered snapshots separately until WASM can materialize them', ({
@@ -874,6 +878,299 @@ describe('resource.ts', () => {
     for (const v of history) {
       expect(v.containers.has('properties')).toBe(false);
     }
+  });
+  it('retains a native LoroText mark-only version in history', ({ expect }) => {
+    const resource = new Resource('https://example.com/native-format-history');
+    const doc = resource.getLoroDoc()!;
+    doc.configTextStyle({ textStyle: { expand: 'after' } });
+    const root = doc.getMap('doc');
+    root.set('nodeName', 'doc');
+    root.setContainer('children', new LoroListClass());
+
+    const blocks = root.get('children') as LoroListClass;
+    blocks.insertContainer(0, new LoroMapClass());
+    const paragraph = blocks.get(0) as LoroMapClass;
+    paragraph.set('nodeName', 'paragraph');
+    paragraph.set('textAlign', 'center');
+    paragraph.setContainer('children', new LoroListClass());
+
+    const paragraphChildren = paragraph.get('children') as LoroListClass;
+    paragraphChildren.insertContainer(0, new LoroTextClass());
+    const text = paragraphChildren.get(0) as LoroTextClass;
+    text.insert(0, 'native history formatting');
+    doc.commit({ message: 'native-body' });
+
+    const unformattedBody = doc.toJSON()?.doc;
+    text.applyDelta([
+      {
+        retain: text.length,
+        attributes: {
+          textStyle: { color: '#dc2626', backgroundColor: '#fef08a' },
+        },
+      },
+    ]);
+    doc.commit({ message: 'format-only' });
+
+    expect(doc.toJSON()?.doc).toEqual(unformattedBody);
+
+    const history = resource.getLoroHistory();
+    expect(history).toHaveLength(2);
+
+    const selectedDoc = doc.forkAt(history.at(-1)!.frontiers);
+    const selectedParagraph = (
+      selectedDoc.getMap('doc').get('children') as LoroListClass
+    ).get(0) as LoroMapClass;
+    const selectedText = (
+      selectedParagraph.get('children') as LoroListClass
+    ).get(0) as LoroTextClass;
+
+    expect(selectedText.toDelta()).toEqual([
+      {
+        insert: 'native history formatting',
+        attributes: {
+          textStyle: { color: '#dc2626', backgroundColor: '#fef08a' },
+        },
+      },
+    ]);
+  });
+  it('restores native marked body after cold import and clone replacement', async ({
+    expect,
+  }) => {
+    const subject = 'https://example.com/native-cold-import-restore';
+    const description = 'https://atomicdata.dev/properties/description';
+    const drive = 'https://atomicdata.dev/properties/drive';
+    const genesis = 'https://atomicdata.dev/properties/genesis';
+    const producer = new Resource(subject);
+    await producer.set(drive, 'https://example.com/drive', false);
+    await producer.set(genesis, 'immutable-genesis', false);
+    await producer.set(core.properties.parent, 'https://example.com', false);
+    await producer.set(description, 'saved description', false);
+
+    const producerDoc = producer.getLoroDoc()!;
+    producerDoc.configTextStyle({ textStyle: { expand: 'after' } });
+    const root = producerDoc.getMap('doc');
+    root.set('nodeName', 'doc');
+    root.setContainer('children', new LoroListClass());
+    const blocks = root.get('children') as LoroListClass;
+    blocks.insertContainer(0, new LoroMapClass());
+    const paragraph = blocks.get(0) as LoroMapClass;
+    paragraph.set('nodeName', 'paragraph');
+    paragraph.setContainer('children', new LoroListClass());
+    const paragraphChildren = paragraph.get('children') as LoroListClass;
+    paragraphChildren.insertContainer(0, new LoroTextClass());
+    const producerText = paragraphChildren.get(0) as LoroTextClass;
+
+    producerText.insert(0, 'B historical body');
+    producerText.applyDelta([
+      {
+        retain: producerText.length,
+        attributes: {
+          textStyle: {
+            color: '#2563eb',
+            backgroundColor: '#bbf7d0',
+            bold: true,
+          },
+        },
+      },
+    ]);
+    producerDoc.commit({ message: 'historical-B' });
+    await producer.set(description, 'current description', false);
+    producerText.delete(0, producerText.length);
+    producerText.insert(0, 'C current body');
+    producerText.applyDelta([
+      {
+        retain: producerText.length,
+        attributes: {
+          textStyle: { color: '#dc2626', backgroundColor: '#fef08a' },
+        },
+      },
+    ]);
+    producerDoc.commit({ message: 'current-C' });
+
+    const coldImport = new Resource(subject);
+    coldImport.importLoroUpdate(producerDoc.export({ mode: 'snapshot' }));
+    const cloned = coldImport.clone();
+    vi.spyOn(coldImport, 'save').mockResolvedValue('noop');
+    vi.spyOn(cloned, 'save').mockResolvedValue('noop');
+
+    const selected = coldImport
+      .getLoroHistory()
+      .find(version => version.token === 'historical-B');
+    expect(selected).toBeDefined();
+    const selectedVersion = selected!;
+    const restoredTextDelta = [
+      {
+        insert: 'B historical body',
+        attributes: {
+          textStyle: {
+            color: '#2563eb',
+            backgroundColor: '#bbf7d0',
+            bold: true,
+          },
+        },
+      },
+    ];
+
+    for (const target of [coldImport, cloned]) {
+      await expect(target.setVersion(selectedVersion)).resolves.toBeUndefined();
+      expect(target.get(description)).toBe('saved description');
+      expect(target.get(drive)).toBe('https://example.com/drive');
+      expect(target.get(genesis)).toBe('immutable-genesis');
+      expect(target.get(core.properties.parent)).toBe('https://example.com');
+
+      const targetDoc = target.getLoroDoc()!;
+      const targetParagraph = (
+        targetDoc.getMap('doc').get('children') as LoroListClass
+      ).get(0) as LoroMapClass;
+      const targetText = (targetParagraph.get('children') as LoroListClass).get(
+        0,
+      ) as LoroTextClass;
+      expect(targetText.toDelta()).toEqual(restoredTextDelta);
+
+      targetText.insert(targetText.length, ' editable');
+      targetDoc.commit({ message: 'post-restore-body-edit' });
+      expect(
+        targetText
+          .toDelta()
+          .map(({ insert }) => insert)
+          .join(''),
+      ).toBe('B historical body editable');
+    }
+  });
+  it('orders the latest untagged native body after an older tagged snapshot', ({
+    expect,
+  }) => {
+    const resource = new Resource(
+      'https://example.com/native-history-winner-order',
+    );
+    const doc = resource.getLoroDoc()!;
+    doc.configTextStyle({ textStyle: { expand: 'after' } });
+    const root = doc.getMap('doc');
+    root.set('nodeName', 'doc');
+    root.setContainer('children', new LoroListClass());
+
+    const blocks = root.get('children') as LoroListClass;
+    blocks.insertContainer(0, new LoroMapClass());
+    const paragraph = blocks.get(0) as LoroMapClass;
+    paragraph.set('nodeName', 'paragraph');
+    paragraph.setContainer('children', new LoroListClass());
+    const paragraphChildren = paragraph.get('children') as LoroListClass;
+    paragraphChildren.insertContainer(0, new LoroTextClass());
+    const text = paragraphChildren.get(0) as LoroTextClass;
+
+    text.insert(0, 'Early untagged body');
+    doc.commit({ timestamp: 1_700_000_000_000 });
+
+    text.delete(0, text.length);
+    text.insert(0, 'Tagged older snapshot');
+    doc.commit({
+      message: 'older-snapshot',
+      timestamp: 1_700_000_000_000,
+    });
+
+    text.delete(0, text.length);
+    text.insert(0, 'Newest untagged native body');
+    text.applyDelta([
+      {
+        retain: text.length,
+        attributes: {
+          textStyle: { color: '#dc2626', backgroundColor: '#fef08a' },
+        },
+      },
+    ]);
+    doc.commit({ timestamp: 1_700_000_000_000 });
+
+    const history = resource.getLoroHistory();
+    const prior = history.at(-2)!;
+    const latest = history.at(-1)!;
+
+    const bodyAt = (version: (typeof history)[number]) => {
+      const selected = doc.forkAt(version.frontiers);
+      const selectedParagraph = (
+        selected.getMap('doc').get('children') as LoroListClass
+      ).get(0) as LoroMapClass;
+
+      return (selectedParagraph.get('children') as LoroListClass).get(
+        0,
+      ) as LoroTextClass;
+    };
+
+    expect(history).toHaveLength(2);
+    expect(bodyAt(prior).toDelta()).toEqual([
+      { insert: 'Tagged older snapshot' },
+    ]);
+    expect(bodyAt(latest).toDelta()).toEqual([
+      {
+        insert: 'Newest untagged native body',
+        attributes: {
+          textStyle: { color: '#dc2626', backgroundColor: '#fef08a' },
+        },
+      },
+    ]);
+    expect(doc.toJSON()?.doc).not.toEqual(
+      doc.forkAt(prior.frontiers).toJSON()?.doc,
+    );
+  });
+  it('restores a captured native document version and preserves later edits', async ({
+    expect,
+  }) => {
+    const { store, posted } = await testStore();
+    const drive = await store.createDrive('Restore test drive');
+    store.setDrive(drive.subject);
+
+    const name = 'https://atomicdata.dev/properties/name';
+    const resource = await store.newResource({
+      parent: drive.subject,
+      propVals: { [name]: 'Historical title' },
+      deferGenesis: true,
+    });
+    const historicalBody = [
+      {
+        type: 'paragraph',
+        content: [
+          { type: 'text', text: 'Historical ' },
+          { type: 'text', text: 'body', marks: [{ type: 'bold' }] },
+        ],
+      },
+    ];
+    resource.getLoroDoc()!.getMap('doc').set('content', historicalBody);
+    await resource.save();
+
+    const historicalVersion = resource.getLoroHistory().at(-1)!;
+    expect(historicalVersion.propvals.get(name)).toBe('Historical title');
+    expect(historicalVersion.containers.get('doc')).toEqual({
+      content: historicalBody,
+    });
+    expect(historicalVersion.frontiers.length).toBeGreaterThan(0);
+
+    const currentBody = [
+      {
+        type: 'paragraph',
+        content: [{ type: 'text', text: 'Current body' }],
+      },
+    ];
+    await resource.set(name, 'Current title', false);
+    resource.getLoroDoc()!.getMap('doc').set('content', currentBody);
+    await resource.save();
+
+    await resource.setVersion(historicalVersion);
+
+    expect(resource.get(name)).toBe('Historical title');
+    expect(resource.getLoroDoc()!.getMap('doc').toJSON()).toEqual({
+      content: historicalBody,
+    });
+    expect(resource.get('https://atomicdata.dev/properties/drive')).toBe(
+      drive.subject,
+    );
+    expect(
+      posted.some(
+        commit => commit.subject === resource.subject && commit.isGenesis,
+      ),
+    ).toBe(true);
+
+    await resource.set(name, 'Edited after restore', false);
+    await resource.save();
+    expect(posted.at(-1)?.loroUpdate).toBeInstanceOf(Uint8Array);
   });
 
   /**

@@ -94,6 +94,64 @@ function canonicalPropKey(prop: string): string {
   return prop.startsWith('did:ad:prop:') ? canonicalizeScheme(prop) : prop;
 }
 
+function canonicalNativeLoroValue(value: unknown): unknown {
+  const { LoroList, LoroMap, LoroText } = LoroLoader.Loro;
+
+  if (value instanceof LoroText) {
+    return { $loroTextDelta: value.toDelta() };
+  }
+
+  if (value instanceof LoroList) {
+    const items: unknown[] = [];
+
+    for (let index = 0; index < value.length; index++) {
+      items.push(canonicalNativeLoroValue(value.get(index)));
+    }
+
+    return items;
+  }
+
+  if (value instanceof LoroMap) {
+    const entries = Object.create(null) as Record<string, unknown>;
+
+    for (const [key, child] of value.entries()) {
+      entries[key] = canonicalNativeLoroValue(child);
+    }
+
+    return entries;
+  }
+
+  return value;
+}
+
+function canonicalJsonKeys(_key: string, value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+
+  const record = value as Record<string, unknown>;
+  const sorted = Object.create(null) as Record<string, unknown>;
+
+  for (const key of Object.keys(record).sort((a, b) => a.localeCompare(b))) {
+    sorted[key] = record[key];
+  }
+
+  return sorted;
+}
+
+/** Canonical native `doc` state; LoroText deltas retain their formatting marks. */
+export function getLoroBodySignature(doc: LoroDoc | undefined): string {
+  if (!doc) return '';
+
+  const body = doc.getByPath('doc');
+
+  if (body === undefined) return '';
+
+  return (
+    JSON.stringify(canonicalNativeLoroValue(body), canonicalJsonKeys) ?? ''
+  );
+}
+
 /** Contains the PropertyURL / Value combinations */
 export type PropVals = Map<string, AtomicValue>;
 
@@ -510,6 +568,7 @@ export class Resource<C extends OptionalClass = any> {
     if (!this._loroDoc) {
       const { LoroDoc: LoroDocClass } = LoroLoader.Loro;
       this._loroDoc = new LoroDocClass();
+      this._loroDoc.configDefaultTextStyle({ expand: 'after' });
       // Match the server (`lib/src/loro.rs`): record per-change Unix seconds on commit.
       this._loroDoc.setRecordTimestamp(true);
       this._loroMap = this._loroDoc.getMap('properties');
@@ -1638,6 +1697,7 @@ export class Resource<C extends OptionalClass = any> {
 
     const { LoroDoc: LoroDocClass } = LoroLoader.Loro;
     this._loroDoc = new LoroDocClass();
+    this._loroDoc.configDefaultTextStyle({ expand: 'after' });
     this._loroDoc.import(snapshot);
     this._loroMap = this._loroDoc.getMap('properties');
 
@@ -2517,9 +2577,8 @@ export class Resource<C extends OptionalClass = any> {
 
   /**
    * Get the history of this resource from its Loro OpLog.
-   * Returns an array of Versions, each with materialized property values
-   * at that point in time. Uses Loro's `checkout()` for instant time-travel
-   * — no network round-trips needed.
+   * Returns versions with materialized property values and native containers
+   * at each point in time. Uses Loro time-travel without network round-trips.
    */
   public getLoroHistory(): Version[] {
     const liveDoc = this.getLoroDoc();
@@ -2592,12 +2651,11 @@ export class Resource<C extends OptionalClass = any> {
     // genesis state *after* the latest one. Lamport order is guaranteed to
     // respect happened-before; genuinely concurrent ops tie and get a
     // stable peer-id tiebreak.
-    steps.sort(
-      (a, b) =>
-        a.lamport - b.lamport ||
-        (a.peer < b.peer ? -1 : a.peer > b.peer ? 1 : 0) ||
-        a.counter - b.counter,
-    );
+    const compareSteps = (a: Step, b: Step) =>
+      a.lamport - b.lamport ||
+      (a.peer < b.peer ? -1 : a.peer > b.peer ? 1 : 0) ||
+      a.counter - b.counter;
+    steps.sort(compareSteps);
 
     const lastCommitProp = 'https://atomicdata.dev/properties/lastCommit';
     type GroupedVersion = {
@@ -2608,19 +2666,11 @@ export class Resource<C extends OptionalClass = any> {
     };
     const grouped: GroupedVersion[] = [];
 
-    /** Stable signature of propvals (minus `lastCommit`) plus other top-level
-     *  containers, used to detect versions that represent the same observable
-     *  state arrived at from different peers (e.g. the same snapshot
-     *  reimported during sync). Including containers is what lets body-only
-     *  edits register as distinct versions instead of collapsing into the
-     *  previous propvals-identical bucket.
-     *
-     *  Nested object keys are sorted, because `doc.toJSON()` emits map keys in
-     *  an order that depends on how the doc reached that version: jumping
-     *  straight to a version can yield `{color, path, width}` where arriving
-     *  by replaying every op yields `{width, path, color}`. Same state, and a
-     *  plain `JSON.stringify` would call them different — which made dedup
-     *  depend on the checkout path taken to get there. */
+    /** Stable signature of propvals (minus `lastCommit`), non-body
+     * containers, and the native `doc` tree. The body tree uses LoroText
+     * `toDelta()` values so formatting-only changes remain distinct. */
+    // Map key order depends on how a version was materialized, so signatures
+    // sort plain JSON object keys before serialization.
     const canonicalize = (_key: string, value: JSONValue): JSONValue => {
       if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return value;
@@ -2638,15 +2688,19 @@ export class Resource<C extends OptionalClass = any> {
     const contentSignature = (
       pv: Map<string, JSONValue>,
       ct: Map<string, JSONValue>,
+      bodySignature: string,
     ): string => {
       const propEntries = Array.from(pv.entries())
         .filter(([k]) => k !== lastCommitProp)
         .sort(([a], [b]) => a.localeCompare(b));
-      const containerEntries = Array.from(ct.entries()).sort(([a], [b]) =>
-        a.localeCompare(b),
-      );
+      const containerEntries = Array.from(ct.entries())
+        .filter(([key]) => key !== 'doc')
+        .sort(([a], [b]) => a.localeCompare(b));
 
-      return JSON.stringify([propEntries, containerEntries], canonicalize);
+      return JSON.stringify(
+        [propEntries, containerEntries, bodySignature],
+        canonicalize,
+      );
     };
 
     // Bucket by the Loro Change message. Two token families exist:
@@ -2667,23 +2721,17 @@ export class Resource<C extends OptionalClass = any> {
     // showed only the latest state.)
     //
     // `steps` is in causal order, so the last write per key is the winner.
-    // Bucket order follows first appearance, which is what orders the
-    // resulting versions.
-    const bucketOrder: string[] = [];
+    // Sort those winners by the same causal order before materializing them:
+    // first appearance can precede a later winning step for the same bucket.
     const winners = new Map<string, Step>();
 
     for (const step of steps) {
-      const bucketKey = step.message ?? '';
-
-      if (!winners.has(bucketKey)) {
-        bucketOrder.push(bucketKey);
-      }
-
-      winners.set(bucketKey, step);
+      winners.set(step.message ?? '', step);
     }
 
-    for (const bucketKey of bucketOrder) {
-      const step = winners.get(bucketKey)!;
+    const orderedWinners = Array.from(winners.values()).sort(compareSteps);
+
+    for (const step of orderedWinners) {
       const frontiers = [
         { peer: step.peer as `${number}`, counter: step.counter },
       ];
@@ -2725,7 +2773,11 @@ export class Resource<C extends OptionalClass = any> {
       }
 
       grouped.push({
-        contentKey: contentSignature(propvals, containers),
+        contentKey: contentSignature(
+          propvals,
+          containers,
+          getLoroBodySignature(doc),
+        ),
         step,
         propvals,
         containers,
@@ -2770,32 +2822,51 @@ export class Resource<C extends OptionalClass = any> {
   }
 
   /**
-   * Sets the resource to the specified version and saves it.
-   * @param version The version to set the resource to, you can get this using `resource.getHistory()`
-   *
-   * NOTE: restores **propvals only**. Top-level Loro containers in
-   * `version.containers` (most importantly the `doc` body for Documents) are
-   * not replayed back into the live doc, so restoring a historical version
-   * leaves the body at its current state. A complete restore needs to
-   * either checkout the historical frontiers and re-export, or import a
-   * targeted snapshot of each container — distinct work from this view-side
-   * fix.
+   * Restores a historical version as a new native Loro change and saves it.
+   * @param version The version to restore, from `getLoroHistory()`.
    */
   public async setVersion(version: Version): Promise<void> {
-    // Remove any prop that doesn't exist in this version
-    for (const [prop] of this.getEntries()) {
-      if (!version.propvals.has(prop)) {
-        this.remove(prop);
+    const doc = this.getLoroDoc();
+
+    if (doc && version.frontiers.length > 0) {
+      const immutableProperties = [
+        DRIVE_PROPERTY,
+        GENESIS,
+        core.properties.parent,
+      ];
+      const preserved = new Map<string, string>();
+
+      for (const prop of immutableProperties) {
+        const value = this.get(prop);
+        if (typeof value === 'string') preserved.set(prop, value);
+      }
+
+      doc.revertTo(version.frontiers);
+      this.rebuildCacheFromLoro();
+      this.#cacheDirty = false;
+
+      for (const [prop, value] of preserved) {
+        if (this.get(prop) !== value) {
+          await this.set(prop, value, false);
+        }
+      }
+
+      this.markDirty();
+    } else {
+      // Versions without native frontiers are legacy property-only history.
+      for (const [prop] of this.getEntries()) {
+        if (!SERVER_MANAGED_PROPS.has(prop) && !version.propvals.has(prop)) {
+          this.remove(prop);
+        }
+      }
+
+      for (const [prop, value] of version.propvals) {
+        if (value !== undefined && !SERVER_MANAGED_PROPS.has(prop)) {
+          await this.set(prop, value, false);
+        }
       }
     }
 
-    // Set all properties from the version
-    for (const [key, value] of version.propvals.entries()) {
-      if (value === undefined) continue;
-      await this.set(key, value);
-    }
-
-    // TODO: We should let the user save, this is what we usually do.
     await this.save();
   }
 

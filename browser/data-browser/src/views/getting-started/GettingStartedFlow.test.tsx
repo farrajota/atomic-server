@@ -421,6 +421,20 @@ it('returns a fully qualified same-origin app link after secret sign-in', async 
   );
   expect(state.store.ensurePrivateDrive).not.toHaveBeenCalled();
 });
+it('resolves the workspace after secret sign-in when next returns to welcome', async () => {
+  const destination = new URL(
+    '/app/welcome',
+    window.location.origin,
+  ).toString();
+  await show(`?step=signin&next=${encodeURIComponent(destination)}`);
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText('Agent secret'), {
+      target: { value: 'test-secret' },
+    });
+  });
+
+  expect(state.navigate).toHaveBeenCalledWith('/app/show?subject=did:ad:home');
+});
 
 it('keeps an unreadable foreign workspace on the recovery step', async () => {
   state.hasData = false;

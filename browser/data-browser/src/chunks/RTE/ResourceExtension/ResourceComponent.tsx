@@ -1,13 +1,19 @@
+import { lazy, Suspense } from 'react';
 import { AtomicLink } from '@components/AtomicLink';
 import { getIconForClass } from '@helpers/iconMap';
 import type { ReactNodeViewProps } from '@tiptap/react';
 import { NodeViewWrapper } from '@tiptap/react';
 import { dataBrowser, useResource } from '@tomic/react';
-import ResourceCard from '@views/Card/ResourceCard';
 import { styled } from 'styled-components';
 import { TableRTE } from '../TableRTE';
 import { RTENodeViewWrapper } from './RTENodeViewWrapper';
 import { ErrorBoundary } from '@views/ErrorPage';
+import { Spinner } from '@components/Spinner';
+
+// The node schema is also imported by the historical read-only renderer. The
+// full resource card imports its own rich-text extensions, so load that card
+// only when an embedded resource node is actually rendered.
+const ResourceCard = lazy(() => import('@views/Card/ResourceCard'));
 
 export const ResourceComponent = (
   props: ReactNodeViewProps<HTMLDivElement>,
@@ -24,10 +30,18 @@ export const ResourceComponent = (
   return (
     <RTENodeViewWrapper wide={wide} key={props.node.attrs.subject}>
       <ErrorBoundary>
-        <Component
-          subject={props.node.attrs.subject}
-          highlight={props.selected}
-        />
+        <Suspense
+          fallback={
+            <span role='status' aria-label='Loading embedded resource'>
+              <Spinner size='1.5rem' />
+            </span>
+          }
+        >
+          <Component
+            subject={props.node.attrs.subject}
+            highlight={props.selected}
+          />
+        </Suspense>
       </ErrorBoundary>
     </RTENodeViewWrapper>
   );

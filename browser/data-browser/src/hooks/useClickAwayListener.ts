@@ -28,14 +28,15 @@ const removeListeners = (
  * @param refs List of element refs that will not trigger the listener when clicked.
  * @param onClickAway Callback that will be called when the user clicks outside
  *   of any of the given elements.
- * @param shouldListen When false the callback will not be called.
- * @param eventTypes List of events that will trigger the listener.
+ * @param preventDefault Whether an outside event's default browser action is
+ *   prevented.
  */
 export const useClickAwayListener = (
   refs: RefList,
   onClickAway: () => void,
   shouldListen = true,
   eventTypes: SupportedEvents[] = ['mousedown'],
+  preventDefault = true,
 ): void => {
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
@@ -43,7 +44,10 @@ export const useClickAwayListener = (
         shouldListen &&
         !elementsContainTarget(refs, e.target as HTMLElement)
       ) {
-        e.preventDefault();
+        if (preventDefault) {
+          e.preventDefault();
+        }
+
         onClickAway();
         removeListeners(eventTypes, onClick);
       }
@@ -54,5 +58,5 @@ export const useClickAwayListener = (
     return () => {
       removeListeners(eventTypes, onClick);
     };
-  }, [refs, onClickAway, shouldListen]);
+  }, [refs, onClickAway, shouldListen, eventTypes, preventDefault]);
 };
