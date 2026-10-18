@@ -354,6 +354,6 @@ export const skillTools = {
         message: `Skill "${newSkill.meta.name}" was created and saved.`,
       };
     },
-    strict: true,
+    strict: false,
   }),
 };

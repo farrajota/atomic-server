@@ -4,6 +4,9 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 
 ## UNRELEASED
 
+- AI tools with intentionally optional, defaulted, or open-ended arguments no
+  longer advertise incompatible strict function schemas to OpenAI-compatible
+  providers. All tools and their runtime argument validation remain available.
 - Native document history displays and restores the saved body and formatting,
   including formatting-only changes, with labelled before/after content panels.
 - Table quick filters preserve native focus and row values across repeated

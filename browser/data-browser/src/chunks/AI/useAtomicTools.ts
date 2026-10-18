@@ -574,7 +574,7 @@ export function useAtomicMCPTools({
               textQuery: text_query,
             }),
           ),
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.QUERY]: tool({
         description:
@@ -731,7 +731,7 @@ export function useAtomicMCPTools({
             return `Error finding schema: ${error}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.NAVIGATE_TO_RESOURCE]: tool({
         description: 'Navigates the user to a resource',
@@ -1081,7 +1081,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error configuring view: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.ADD_TABLE_COLUMNS]: tool({
         description:
@@ -1132,7 +1132,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error adding columns: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.CREATE_TABLE_FROM_TEMPLATE]: tool({
         description:
@@ -1201,7 +1201,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error creating table from template: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.CREATE_DASHBOARD]: tool({
         description:
@@ -1235,7 +1235,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error creating dashboard: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.CONFIGURE_BLOCK]: tool({
         description:
@@ -1291,7 +1291,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error configuring block: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       ...websiteWriteTools,
       [TOOL_NAMES.CREATE_APP]: tool({
@@ -1961,7 +1961,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error creating table: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
     },
   };
