@@ -35,9 +35,9 @@ import {
   persistSidebarMessage,
   type TitlePromise,
 } from './persistSidebarMessage';
-import { getOrCreateAiChatsFolder } from '@helpers/standardLocations';
 import { RealAIChat } from './RealAIChat';
 import { useAISettings } from '@components/AI/AISettingsContext';
+import { getOrCreateAiChatsFolder } from '@helpers/standardLocations';
 import { DEFAULT_AICHAT_NAME } from '@components/AI/aiContstants';
 import { usePrivateDrive } from '@hooks/usePrivateDrive';
 import toast from 'react-hot-toast';
@@ -122,18 +122,16 @@ const AISidebar: React.FC = () => {
     const generation = chatGenerationRef.current;
 
     if (!draftChatPromiseRef.current) {
-      // Chats live in the personal drive's "AI Chats" folder (a deterministic
-      // standard location) instead of cluttering the drive root. `about` records which
-      // resource the chat was started on, so the sidebar can re-open it when
-      // the user returns to that resource.
-      const aboutSubject =
-        autoContextSubjectRef.current ?? currentSubjectRef.current;
-      draftChatPromiseRef.current = getOrCreateAiChatsFolder(
-        store,
-        privateDrive,
-      ).then(folder =>
-        store.newResource<Ai.AiChat>({
-          parent: folder,
+      // Chats belong in the signer's stable AI Chats folder under this drive.
+      // `about` records the resource the chat started on so the sidebar can
+      // re-open it when the user returns there.
+      draftChatPromiseRef.current = (async () => {
+        const parent = await getOrCreateAiChatsFolder(store, privateDrive);
+        const aboutSubject =
+          autoContextSubjectRef.current ?? currentSubjectRef.current;
+
+        return store.newResource<Ai.AiChat>({
+          parent,
           isA: ai.classes.aiChat,
           propVals: {
             [core.properties.name]: DEFAULT_AICHAT_NAME,
@@ -141,15 +139,15 @@ const AISidebar: React.FC = () => {
               [dataBrowser.properties.about]: aboutSubject,
             }),
           },
-        }),
-      );
+        });
+      })();
     }
 
     const draftChatPromise = draftChatPromiseRef.current;
 
     // Forget the attempt whether it worked or not. A rejected promise left in
     // the ref is answered from cache for the rest of the session, so one failed
-    // folder or drive read used to mean every later message in this chat failed
+    // drive read used to mean every later message in this chat failed
     // the same way, logging the same error again with nothing asking again.
     const forget = () => {
       if (draftChatPromiseRef.current === draftChatPromise) {

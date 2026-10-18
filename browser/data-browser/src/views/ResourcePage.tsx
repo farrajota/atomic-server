@@ -25,11 +25,13 @@ import { DocumentPage } from './DocumentPage';
 import ErrorPage, { ErrorBoundary } from './ErrorPage';
 import { ClassPage } from './ClassPage';
 import { FilePage } from './File/FilePage';
+import AgentPage from './AgentPage';
 import { ResourcePageDefault } from './ResourcePageDefault';
 import { Spinner } from '../components/Spinner';
 import { ChatRoomPage } from './ChatRoomPage';
 import { ConversationPage } from './Conversation/ConversationPage';
 import { InboxPage } from './InboxPage';
+import { NotificationPage } from './NotificationPage';
 import { MessagePage } from './MessagePage';
 import { ChatLogPage } from './ChatLogPage';
 import { BookmarkPage } from './BookmarkPage/BookmarkPage';
@@ -305,6 +307,8 @@ function selectComponent(klass: string | undefined) {
       return ClassPage;
     case server.classes.file:
       return FilePage;
+    case core.classes.agent:
+      return AgentPage;
     case dataBrowser.classes.chatroom:
       return ChatRoomPage;
     case conversations.classes.conversation:
@@ -341,6 +345,8 @@ function selectComponent(klass: string | undefined) {
       return FormBuilderPage;
     case notifications.classes.inbox:
       return InboxPage;
+    case notifications.classes.notification:
+      return NotificationPage;
     case server.classes.installation:
       return InstallationPage;
     default:

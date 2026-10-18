@@ -69,6 +69,7 @@ import {
 import type { MentionItem } from '@chunks/RTE/AIChatInput/types';
 import { useChat } from '@ai-sdk/react';
 import { useClientOnlyTransport } from './ClientOnlyTransport';
+import { redactProviderError } from './providerModel';
 import { useConversationSummary } from './useConversationSummary';
 import { Popover } from '@components/Popover';
 import { Trigger as PopoverTrigger } from '@radix-ui/react-popover';
@@ -82,6 +83,85 @@ import { useVectorIndexStatus } from '@hooks/useVectorIndexStatus';
 import { useLocalStorage } from '@hooks/useLocalStorage';
 import { Spinner } from '@components/Spinner';
 import { LiveConversation } from './LiveConversation';
+
+type ChatModelOption = {
+  label: string;
+  searchLabel: string;
+  description: string;
+  value: string;
+};
+
+type DirectProviderModelSettings = {
+  isProviderAvailable: (provider: AIProvider) => boolean;
+  openAIModelId: string;
+  anthropicModelId: string;
+  openAICompatibleModelId: string;
+};
+
+const chatModelProviders: Record<string, AIProvider> = {
+  hosted: AIProvider.Hosted,
+  openrouter: AIProvider.OpenRouter,
+  ollama: AIProvider.Ollama,
+  openai: AIProvider.OpenAI,
+  anthropic: AIProvider.Anthropic,
+  'openai-compatible': AIProvider.OpenAICompatible,
+};
+
+export function getDirectProviderModelOptions({
+  isProviderAvailable,
+  openAIModelId,
+  anthropicModelId,
+  openAICompatibleModelId,
+}: DirectProviderModelSettings): ChatModelOption[] {
+  const configuredModels = [
+    {
+      provider: AIProvider.OpenAI,
+      providerName: 'OpenAI',
+      modelId: openAIModelId,
+    },
+    {
+      provider: AIProvider.Anthropic,
+      providerName: 'Anthropic',
+      modelId: anthropicModelId,
+    },
+    {
+      provider: AIProvider.OpenAICompatible,
+      providerName: 'OpenAI-compatible',
+      modelId: openAICompatibleModelId,
+    },
+  ];
+
+  return configuredModels.flatMap(({ provider, providerName, modelId }) =>
+    isProviderAvailable(provider) && modelId.trim()
+      ? [
+          {
+            label: modelId,
+            searchLabel: `${modelId.toLowerCase()} ${providerName.toLowerCase()}`,
+            description: providerName,
+            value: `${provider}:${modelId}`,
+          },
+        ]
+      : [],
+  );
+}
+
+export function parseChatModelSelection(
+  value: string,
+): AIModelIdentifier | undefined {
+  const separator = value.indexOf(':');
+  if (separator <= 0) return undefined;
+
+  const providerId = value.slice(0, separator);
+
+  if (!Object.prototype.hasOwnProperty.call(chatModelProviders, providerId)) {
+    return undefined;
+  }
+
+  const provider = chatModelProviders[providerId];
+  const id = value.slice(separator + 1);
+
+  return id ? { provider, id } : undefined;
+}
 
 const AIChatInput = React.lazy(
   () => import('@chunks/RTE/AIChatInput/AsyncAIChatInput'),
@@ -159,6 +239,13 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
     isProviderAvailable,
     hostedAI,
     enableIncludedAI,
+    openAIApiKey,
+    anthropicApiKey,
+    openAICompatibleApiKey,
+    openAICompatibleBaseURL,
+    openAIModelId,
+    anthropicModelId,
+    openAICompatibleModelId,
   } = useAISettings();
 
   // useChat callbacks need refs to read the latest values.
@@ -274,7 +361,17 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
           },
         ]
       : [];
-    const all = [...hostedOptions, ...openRouterOptions, ...ollamaOptions];
+    const all = [
+      ...hostedOptions,
+      ...openRouterOptions,
+      ...ollamaOptions,
+      ...getDirectProviderModelOptions({
+        isProviderAvailable,
+        openAIModelId,
+        anthropicModelId,
+        openAICompatibleModelId,
+      }),
+    ];
 
     // Surface recently used models at the top. With an empty query the ComboBox
     // shows the options in this order; once the user types, QuickScore re-ranks.
@@ -294,6 +391,10 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
     currencyFormatter,
     recentModelValues,
     hostedAI,
+    isProviderAvailable,
+    openAIModelId,
+    anthropicModelId,
+    openAICompatibleModelId,
   ]);
 
   const modelSelectContainerRef = useRef<HTMLDivElement>(null);
@@ -324,7 +425,17 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
   // Old saved agents can name a BYOK model even though this SaaS account never
   // configured a provider. They should work with the included default too.
   const activeModel =
-    hostedAI?.enabled && !openRouterApiKey && !ollamaUrl
+    hostedAI?.enabled &&
+    !openRouterApiKey &&
+    !ollamaUrl &&
+    !openAIApiKey &&
+    !anthropicApiKey &&
+    !openAICompatibleBaseURL &&
+    ![
+      AIProvider.OpenAI,
+      AIProvider.Anthropic,
+      AIProvider.OpenAICompatible,
+    ].includes(selectedModel.provider)
       ? defaultChatModel
       : selectedModel;
   const modelContextLength = useModelContextLength(activeModel);
@@ -365,7 +476,13 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
         ? `Ollama${ollamaUrl ? ` at ${ollamaUrl}` : ''}`
         : activeModel.provider === AIProvider.OpenRouter
           ? 'OpenRouter'
-          : 'the model provider';
+          : activeModel.provider === AIProvider.OpenAI
+            ? 'OpenAI'
+            : activeModel.provider === AIProvider.Anthropic
+              ? 'Anthropic'
+              : activeModel.provider === AIProvider.OpenAICompatible
+                ? 'OpenAI-compatible provider'
+                : 'the model provider';
 
   // A hosted build includes AI. Telling its users to find an OpenRouter key
   // would be wrong while the account status is merely still loading or failed.
@@ -408,7 +525,7 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
 
   const { tools: atomicTools } = useAtomicMCPTools({
     editModel: activeModel,
-    hosted: liveActive && !openRouterApiKey,
+    hosted: liveActive && activeModel.provider === AIProvider.Hosted,
     onResourceEdited: (originalResource: Resource) => {
       reportAIEdit(originalResource);
     },
@@ -418,6 +535,10 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
     openRouterAPIKey: openRouterApiKey,
     openRouterZdr,
     ollamaURL: ollamaUrl,
+    openAIApiKey,
+    anthropicApiKey,
+    openAICompatibleApiKey,
+    openAICompatibleBaseURL,
     selectedAgent,
     model: activeModel,
     additionalSystemPrompt: selectedAgent.skillsEnabled
@@ -573,7 +694,15 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
     try {
       summaryText = await generateConversationSummary(messagesToCompact);
     } catch (e) {
-      console.error(e);
+      console.error(
+        'Conversation compaction failed',
+        redactProviderError(e, [
+          openRouterApiKey,
+          openAIApiKey,
+          anthropicApiKey,
+          openAICompatibleApiKey,
+        ]),
+      );
       isCompactingRef.current = false;
       setIsCompacting(false);
 
@@ -1235,7 +1364,15 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
                           <ControlLabel>Model</ControlLabel>
                           {hostedAI?.enabled &&
                           !openRouterApiKey &&
-                          !ollamaUrl ? (
+                          !ollamaUrl &&
+                          !isProviderAvailable(AIProvider.OpenAI) &&
+                          !isProviderAvailable(AIProvider.Anthropic) &&
+                          !isProviderAvailable(AIProvider.OpenAICompatible) &&
+                          ![
+                            AIProvider.OpenAI,
+                            AIProvider.Anthropic,
+                            AIProvider.OpenAICompatible,
+                          ].includes(selectedModel.provider) ? (
                             <span>Included AI · model managed by Atomic</span>
                           ) : (
                             <ModelSelectWrapper ref={modelSelectContainerRef}>
@@ -1245,16 +1382,9 @@ const RealAIChatInner: React.FC<React.PropsWithChildren<RealAIChatProps>> = ({
                                 options={combinedModelOptions}
                                 onSelect={value => {
                                   if (!value) return;
-                                  const [providerStr, ...idParts] =
-                                    value.split(':');
-                                  const id = idParts.join(':');
-                                  const provider =
-                                    providerStr === 'hosted'
-                                      ? AIProvider.Hosted
-                                      : providerStr === 'openrouter'
-                                        ? AIProvider.OpenRouter
-                                        : AIProvider.Ollama;
-                                  const newModel = { id, provider };
+                                  const newModel =
+                                    parseChatModelSelection(value);
+                                  if (!newModel) return;
                                   setActiveModel(newModel);
 
                                   // Persist the choice to whichever source the chat reads

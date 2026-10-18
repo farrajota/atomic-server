@@ -26,6 +26,11 @@ import { shortenSubject } from '@tomic/react';
 import { getClassesOnDrive } from '@tomic/react';
 import { createHostedModel } from './hostedModel';
 import { hostedVoiceModel } from './hostedVoiceModel';
+import {
+  createProviderModel,
+  getDirectProviderParameters,
+  redactProviderError,
+} from './providerModel';
 
 export type Modalities = 'text' | 'image';
 
@@ -33,6 +38,10 @@ export interface ClientOnlyTransportOptions {
   openRouterAPIKey?: string;
   openRouterZdr?: boolean;
   ollamaURL?: string;
+  openAIApiKey?: string;
+  anthropicApiKey?: string;
+  openAICompatibleApiKey?: string;
+  openAICompatibleBaseURL?: string;
   selectedAgent: AIAgent;
   model: AIModelIdentifier;
   tools: ToolSet;
@@ -73,16 +82,33 @@ export class ClientOnlyTransport implements ChatTransport<AtomicUIMessage> {
     const prepared = await this.options.addContextToMessages(
       trimToLastSummary(messages),
     );
+    const usesConfiguredProvider =
+      this.options.model.provider === AIProvider.OpenAI ||
+      this.options.model.provider === AIProvider.Anthropic ||
+      this.options.model.provider === AIProvider.OpenAICompatible;
+    const providerCredentials = [
+      this.options.openRouterAPIKey,
+      this.options.openAIApiKey,
+      this.options.anthropicApiKey,
+      this.options.openAICompatibleApiKey,
+    ];
     const result = await generateText({
-      model: this.options.openRouterAPIKey
-        ? this.getModel(this.options.model)
-        : hostedVoiceModel(),
+      model:
+        this.options.openRouterAPIKey || usesConfiguredProvider
+          ? this.getModel(this.options.model)
+          : hostedVoiceModel(),
       messages: await modelMessagesWithToolRecovery(prepared),
       system: `${await this._prepareSystemPrompt(this.options.selectedAgent.systemPrompt)}\nYou are handling a delegated request from a live voice conversation. Use the latest user request and its corrections. Perform only requested actions. Return a brief factual result suitable for speech, including whether actions actually succeeded.`,
       tools: this.options.tools,
       abortSignal,
       maxRetries: 0,
       stopWhen: stepCountIs(8),
+      ...getDirectProviderParameters(
+        this.options.model,
+        this.options.selectedAgent.temperature,
+      ),
+    }).catch(error => {
+      throw new Error(redactProviderError(error, providerCredentials));
     });
 
     return (
@@ -102,31 +128,41 @@ export class ClientOnlyTransport implements ChatTransport<AtomicUIMessage> {
     );
 
     const agent = this.options.selectedAgent;
+    const messages = await modelMessagesWithToolRecovery(transformedMessages);
+    const modelIdentifier = this.options.model;
+    const providerCredentials = [
+      this.options.openRouterAPIKey,
+      this.options.openAIApiKey,
+      this.options.anthropicApiKey,
+      this.options.openAICompatibleApiKey,
+    ];
+    const model = this.getModel(modelIdentifier);
+    const parameters = this.getParameters(agent, modelIdentifier);
 
     const result = streamText({
-      messages: await modelMessagesWithToolRecovery(transformedMessages),
-      model: this.getModel(this.options.model),
+      messages,
+      model,
       system: await this._prepareSystemPrompt(agent.systemPrompt),
       tools: this.options.tools,
       abortSignal,
       stopWhen: stepCountIs(
-        this.options.model.provider === AIProvider.Hosted ? 8 : 1000,
+        modelIdentifier.provider === AIProvider.Hosted ? 8 : 1000,
       ),
-      maxRetries: this.options.model.provider === AIProvider.Hosted ? 0 : 2,
-      ...this.getParameters(agent, this.options.model),
+      maxRetries: modelIdentifier.provider === AIProvider.Hosted ? 0 : 2,
+      onError: ({ error }) => {
+        console.error(
+          'AI chat streaming failed',
+          redactProviderError(error, providerCredentials),
+        );
+      },
+      ...parameters,
     });
 
     const originalStream = result.toUIMessageStream({
       originalMessages: transformedMessages,
       generateMessageId: this.idGenerator,
       messageMetadata: ({ part }) => usageMetadata(part),
-      onError: error => {
-        if (error instanceof Error) return error.message;
-        if (error && typeof error === 'object' && 'message' in error)
-          return String(error.message);
-
-        return 'The model request failed.';
-      },
+      onError: error => redactProviderError(error, providerCredentials),
       sendSources: true,
       sendReasoning: true,
     });
@@ -169,6 +205,14 @@ export class ClientOnlyTransport implements ChatTransport<AtomicUIMessage> {
       return ollama(model.id);
     }
 
+    if (
+      model.provider === AIProvider.OpenAI ||
+      model.provider === AIProvider.Anthropic ||
+      model.provider === AIProvider.OpenAICompatible
+    ) {
+      return createProviderModel(model, this.options);
+    }
+
     throw new Error('Invalid model provider');
   }
 
@@ -201,6 +245,17 @@ export class ClientOnlyTransport implements ChatTransport<AtomicUIMessage> {
           },
         ),
       };
+    }
+
+    if (
+      model.provider === AIProvider.OpenAI ||
+      model.provider === AIProvider.OpenAICompatible
+    ) {
+      return getDirectProviderParameters(model, agent.temperature);
+    }
+
+    if (model.provider === AIProvider.Anthropic) {
+      return { temperature: agent.temperature };
     }
 
     throw new Error('Invalid model provider');

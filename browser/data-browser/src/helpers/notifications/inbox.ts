@@ -19,7 +19,7 @@ import {
   type Resource,
   type Store,
 } from '@tomic/react';
-import { getOrCreateDriveLocation } from '../standardLocations';
+import { getOrCreateDriveLocation } from '@tomic/lib';
 
 export type NotificationKind = 'chat' | 'comment' | 'reply';
 

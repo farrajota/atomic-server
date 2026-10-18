@@ -193,6 +193,32 @@ export type SaveResult = 'persisted' | 'offline' | 'noop';
  * differentiate them.
  */
 export const SYSTEM_COMMIT_ORIGIN = 'origin:system';
+/**
+ * Prefix of the Loro change message on every commit that only replays state
+ * the server already has (seeding a doc from JSON-AD propvals, healing,
+ * applying a response). Unlike the origin, the message is persisted in the
+ * oplog, so readers of the oplog ("last edited" feeds) can tell hydration
+ * from an edit.
+ *
+ * Each hydration commit gets its OWN token (`c-hydration-<ulid>`, see
+ * {@link hydrationCommitMessage}), never a shared constant: the server
+ * (`change_messages_in`, `attribute_history`) credits each message to the
+ * first signed commit that carried it, so a shared message would lump every
+ * hydration under one signer. It keeps the `c-` shape so `getCreatedBy`
+ * ignores it and History buckets it like any other internal commit.
+ */
+export const HYDRATION_COMMIT_PREFIX = 'c-hydration-';
+
+/** A fresh, unique change message for one hydration commit. */
+export function hydrationCommitMessage(): string {
+  return `${HYDRATION_COMMIT_PREFIX}${ulid().toLowerCase()}`;
+}
+
+/** True for a change message written by {@link hydrationCommitMessage}. */
+export function isHydrationCommitMessage(message: string | undefined): boolean {
+  return message !== undefined && message.startsWith(HYDRATION_COMMIT_PREFIX);
+}
+
 /** Pre-rename Loro origin; still excluded from undo. */
 export const LEGACY_SYSTEM_COMMIT_ORIGIN = 'atomic:system';
 
@@ -263,6 +289,20 @@ export function normalizeLoroChangeTimestampMs(timestamp: number): number {
   }
 
   return timestamp >= 1_000_000_000_000 ? timestamp : timestamp * 1000;
+}
+
+/**
+ * Thrown by an explicit save when the commit is only queued in the outbox
+ * (offline or retrying). The queued state is normal and visible through
+ * `Store.getSaveState`; callers that merely schedule saves can ignore it.
+ */
+export class SaveQueuedError extends Error {
+  constructor(
+    message = 'Save is still queued; the server has not acknowledged it.',
+  ) {
+    super(message);
+    this.name = 'SaveQueuedError';
+  }
 }
 
 /**
@@ -571,6 +611,18 @@ export class Resource<C extends OptionalClass = any> {
       this._loroDoc.configDefaultTextStyle({ expand: 'after' });
       // Match the server (`lib/src/loro.rs`): record per-change Unix seconds on commit.
       this._loroDoc.setRecordTimestamp(true);
+      // Loro stamps a change with the moment its transaction BEGAN, i.e. right
+      // after the previous commit. An editor that commits through a plain
+      // `doc.commit()` (loro-prosemirror) therefore stamps the first keystroke
+      // after an idle spell with the time of the last save, so "last edited"
+      // readers (the drive Activity feed) saw typing as minutes old. Re-stamp
+      // auto-stamped (second-resolution) commits with the real time; commits
+      // with an explicit millisecond timestamp (`signAt`) are left alone.
+      this._loroDoc.subscribePreCommit(({ changeMeta, modifier }) => {
+        if (changeMeta.timestamp < 1_000_000_000_000) {
+          modifier.setTimestamp(Math.floor(Date.now() / 1000));
+        }
+      });
       this._loroMap = this._loroDoc.getMap('properties');
 
       // If the resource has a persisted Loro snapshot, import it.
@@ -595,7 +647,10 @@ export class Resource<C extends OptionalClass = any> {
           !this._dirty &&
           this._loroDoc.getPendingTxnLength() > 0
         ) {
-          this._loroDoc.commit({ origin: SYSTEM_COMMIT_ORIGIN });
+          this._loroDoc.commit({
+            origin: SYSTEM_COMMIT_ORIGIN,
+            message: hydrationCommitMessage(),
+          });
         }
       }
 
@@ -634,7 +689,10 @@ export class Resource<C extends OptionalClass = any> {
         // because `setRecordTimestamp(true)` makes even an empty commit
         // write a commit-point op and advance `oplogVersion`.
         if (this._loroDoc.getPendingTxnLength() > 0) {
-          this._loroDoc.commit({ origin: SYSTEM_COMMIT_ORIGIN });
+          this._loroDoc.commit({
+            origin: SYSTEM_COMMIT_ORIGIN,
+            message: hydrationCommitMessage(),
+          });
         }
       }
 
@@ -2471,7 +2529,13 @@ export class Resource<C extends OptionalClass = any> {
 
     const genesis = this.getGenesisChange();
 
-    if (!genesis || genesis.timestamp <= 0) {
+    // The earliest change may be local hydration of a legacy resource, which
+    // is stamped with the import time, not the creation time.
+    if (
+      !genesis ||
+      genesis.timestamp <= 0 ||
+      isHydrationCommitMessage(genesis.message)
+    ) {
       return undefined;
     }
 
@@ -2907,7 +2971,10 @@ export class Resource<C extends OptionalClass = any> {
     // server rejects as unauthorized, forever.
     // Re-read `_loroDoc`: a `loroUpdate: undefined` value above resets it.
     if (this._loroDoc && this._loroDoc.getPendingTxnLength() > 0) {
-      this._loroDoc.commit({ origin: SYSTEM_COMMIT_ORIGIN });
+      this._loroDoc.commit({
+        origin: SYSTEM_COMMIT_ORIGIN,
+        message: hydrationCommitMessage(),
+      });
     }
   }
 
@@ -3852,7 +3919,26 @@ export class Resource<C extends OptionalClass = any> {
   /** Local-only commits retained until their required snapshot is durable. */
   private _pendingLocalOnlyCommits: Commit[] = [];
 
-  public async save(): Promise<SaveResult> {
+  /**
+   * Save now. A direct call is an explicit user action (Create, dialog
+   * submit, then navigate): the server's soft commit pace does not hold it
+   * back, only a BUSY refusal does (then {@link SaveQueuedError}).
+   * Background saves (`ScheduledSave`, debounced hooks) pass `background` and
+   * are spaced to the pace like the outbox's own drains.
+   */
+  public async save(opts: { background?: boolean } = {}): Promise<SaveResult> {
+    const release = opts.background
+      ? undefined
+      : this.store.outbox.holdExplicit(this.subject);
+
+    try {
+      return await this.saveSerialized();
+    } finally {
+      release?.();
+    }
+  }
+
+  private async saveSerialized(): Promise<SaveResult> {
     // Two saves running at once each sign their own commit from the same
     // state. For a draft that is two genesis certificates, so two subjects
     // for one resource: the second rename evicts the first, and every alias
@@ -3861,7 +3947,7 @@ export class Resource<C extends OptionalClass = any> {
     if (this._inflightSave) {
       await this._inflightSave.catch(() => undefined);
 
-      return this.save();
+      return this.saveSerialized();
     }
 
     this._inflightSave = this.saveOnce();
@@ -4049,9 +4135,7 @@ export class Resource<C extends OptionalClass = any> {
           );
 
         if (!acknowledged) {
-          throw new Error(
-            'Save is still queued; the server has not acknowledged it.',
-          );
+          throw new SaveQueuedError();
         }
       }
 

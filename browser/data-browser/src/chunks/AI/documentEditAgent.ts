@@ -14,6 +14,8 @@ import {
   readDocumentV2TiptapJson,
 } from '@chunks/RTE/readDocumentV2TiptapJson';
 import { flushSync } from 'react-dom';
+import { useAISettings } from '@components/AI/AISettingsContext';
+import { redactProviderError } from './providerModel';
 
 const EDIT_PROMPT = `## Role
 You are a JSON Patch Compiler. Your goal is to take a Tiptap JSON document and apply precise modifications based on an "Edit Instruction" and an "XML-based Diff".
@@ -235,6 +237,7 @@ async function runDocumentEdit(
   instruction: string,
   edit: string,
   beforeApply: () => void,
+  sanitizeError: (error: unknown) => string,
 ): Promise<string> {
   const resource = await store.getResource(subject);
 
@@ -284,10 +287,14 @@ async function runDocumentEdit(
       const validated = patchOutputSchema.safeParse(parsed);
 
       if (!validated.success) {
-        previousFailure = `Invalid { patch } JSON: ${validated.error.message}`;
+        previousFailure = sanitizeError(
+          `Invalid { patch } JSON: ${validated.error.message}`,
+        );
 
         if (attempt === MAX_PATCH_ATTEMPTS) {
-          return `Error: Model response was not valid { patch } JSON after ${MAX_PATCH_ATTEMPTS} attempts: ${validated.error.message}`;
+          return sanitizeError(
+            `Error: Model response was not valid { patch } JSON after ${MAX_PATCH_ATTEMPTS} attempts: ${validated.error.message}`,
+          );
         }
 
         continue;
@@ -305,10 +312,14 @@ async function runDocumentEdit(
 
       patch = validated.data.patch as Operation[];
     } catch (e) {
-      previousFailure = `Generating or parsing the model response: ${e}`;
+      previousFailure = sanitizeError(
+        `Generating or parsing the model response: ${e}`,
+      );
 
       if (attempt === MAX_PATCH_ATTEMPTS) {
-        return `Error generating document patch after ${MAX_PATCH_ATTEMPTS} attempts: ${e}`;
+        return sanitizeError(
+          `Error generating document patch after ${MAX_PATCH_ATTEMPTS} attempts: ${e}`,
+        );
       }
 
       continue;
@@ -319,20 +330,26 @@ async function runDocumentEdit(
 
       patched = result.newDocument as JSONContent;
     } catch (e) {
-      previousFailure = `Applying JSON Patch failed: ${e}`;
+      previousFailure = sanitizeError(`Applying JSON Patch failed: ${e}`);
 
       if (attempt === MAX_PATCH_ATTEMPTS) {
-        return `Error applying JSON Patch after ${MAX_PATCH_ATTEMPTS} attempts: ${e}`;
+        return sanitizeError(
+          `Error applying JSON Patch after ${MAX_PATCH_ATTEMPTS} attempts: ${e}`,
+        );
       }
 
       continue;
     }
 
     if (patched.type !== 'doc') {
-      previousFailure = `Patched document must have type "doc", got ${String(patched.type)}.`;
+      previousFailure = sanitizeError(
+        `Patched document must have type "doc", got ${String(patched.type)}.`,
+      );
 
       if (attempt === MAX_PATCH_ATTEMPTS) {
-        return `Error: Patched document must have type "doc" after ${MAX_PATCH_ATTEMPTS} attempts (got ${String(patched.type)}).`;
+        return sanitizeError(
+          `Error: Patched document must have type "doc" after ${MAX_PATCH_ATTEMPTS} attempts (got ${String(patched.type)}).`,
+        );
       }
 
       continue;
@@ -354,7 +371,9 @@ async function runDocumentEdit(
     const freshRead = readDocumentV2TiptapJson(resource, store);
 
     if (!freshRead.ok) {
-      return `Error: Failed to read fresh document content (${freshRead.error}).`;
+      return sanitizeError(
+        `Error: Failed to read fresh document content (${freshRead.error}).`,
+      );
     }
 
     let patchedToApply: JSONContent;
@@ -368,11 +387,15 @@ async function runDocumentEdit(
       );
       patchedToApply = reapply.newDocument as JSONContent;
     } catch (e) {
-      return `Error: The document changed while the edit was generated; try again. (${e})`;
+      return sanitizeError(
+        `Error: The document changed while the edit was generated; try again. (${e})`,
+      );
     }
 
     if (patchedToApply.type !== 'doc') {
-      return `Error: Re-applied patch did not produce a doc root (got ${String(patchedToApply.type)}).`;
+      return sanitizeError(
+        `Error: Re-applied patch did not produce a doc root (got ${String(patchedToApply.type)}).`,
+      );
     }
 
     await applyPatchedJsonToLoroDocCollaborative({
@@ -382,7 +405,7 @@ async function runDocumentEdit(
       patchedJson: patchedToApply,
     });
   } catch (e) {
-    return `Error writing Tiptap content to Loro: ${e}`;
+    return sanitizeError(`Error writing Tiptap content to Loro: ${e}`);
   }
 
   // Intentionally no resource.save(): keep edits local until the user confirms in the UI.
@@ -396,6 +419,20 @@ export function useDocumentEditAgent(
 ) {
   const store = useStore();
   const getModel = useGetModel();
+  const {
+    openRouterApiKey,
+    openAIApiKey,
+    anthropicApiKey,
+    openAICompatibleApiKey,
+  } = useAISettings();
+  const credentials = [
+    openRouterApiKey,
+    openAIApiKey,
+    anthropicApiKey,
+    openAICompatibleApiKey,
+  ];
+  const sanitizeError = (error: unknown) =>
+    redactProviderError(error, credentials);
 
   return async (
     subject: string,
@@ -411,5 +448,6 @@ export function useDocumentEditAgent(
       instruction,
       edit,
       beforeApply,
+      sanitizeError,
     );
 }

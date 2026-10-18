@@ -57,7 +57,7 @@ const CREDITS_ENDPOINT = 'https://openrouter.ai/api/v1/credits';
 const AI_OWN_KEYWORDS = 'ai enable features token usage panel sidebar';
 // Keywords from child sections — makes this section visible, but children still filter
 const AI_CHILD_KEYWORDS =
-  'openrouter ollama mcp server generative model chat provider api key local agents skills default voice microphone speech stt transcription privacy retention zdr generate titles follow up prompts temperature context tools system prompt content references transport headers';
+  'openrouter ollama openai anthropic openai-compatible endpoint cors browser-local storage mcp server generative model chat provider api key local agents skills default voice microphone speech stt transcription privacy retention zdr generate titles follow up prompts temperature context tools system prompt content references transport headers';
 
 const AISettings: React.FC = () => {
   const theme = useTheme();
@@ -76,6 +76,22 @@ const AISettings: React.FC = () => {
     shouldGenerateTitles,
     setShouldGenerateTitles,
     genFeaturesModel,
+    openAIApiKey,
+    setOpenAIApiKey,
+    anthropicApiKey,
+    setAnthropicApiKey,
+    openAICompatibleApiKey,
+    setOpenAICompatibleApiKey,
+    openAICompatibleBaseURL,
+    setOpenAICompatibleBaseURL,
+    openAIModelId,
+    setOpenAIModelId,
+    anthropicModelId,
+    setAnthropicModelId,
+    openAICompatibleModelId,
+    defaultChatModel,
+    setDefaultChatModel,
+    setOpenAICompatibleModelId,
     setGenFeaturesModel,
   } = useAISettings();
 
@@ -225,6 +241,194 @@ const AISettings: React.FC = () => {
                             </Suspense>
                           </Column>
                         )}
+                      </Column>
+                    </SettingsSection>
+                  )}
+                  {matches('openai api key model default') && (
+                    <SettingsSection
+                      label='OpenAI'
+                      childSearchKeywords='openai api key model default'
+                    >
+                      <Column gap='0.5rem'>
+                        <label htmlFor='openai-api-key'>OpenAI API key</label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='openai-api-key'
+                            type='password'
+                            autoComplete='new-password'
+                            value={openAIApiKey || ''}
+                            onChange={event =>
+                              setOpenAIApiKey(event.target.value || undefined)
+                            }
+                          />
+                        </InputWrapper>
+                        <Subtle>
+                          This key stays in this browser's local storage.
+                          Requests are sent directly over HTTPS from this
+                          browser to OpenAI and require provider access and
+                          browser CORS permission.
+                        </Subtle>
+                        <label htmlFor='openai-model-id'>OpenAI model ID</label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='openai-model-id'
+                            value={openAIModelId}
+                            onChange={event => {
+                              const id = event.target.value;
+                              setOpenAIModelId(id);
+
+                              if (
+                                defaultChatModel.provider === AIProvider.OpenAI
+                              ) {
+                                setDefaultChatModel({
+                                  id,
+                                  provider: AIProvider.OpenAI,
+                                });
+                              }
+                            }}
+                          />
+                        </InputWrapper>
+                        <Suspense>
+                          <ProviderModelSettings provider={AIProvider.OpenAI} />
+                        </Suspense>
+                      </Column>
+                    </SettingsSection>
+                  )}
+                  {matches('anthropic api key model default') && (
+                    <SettingsSection
+                      label='Anthropic'
+                      childSearchKeywords='anthropic api key model default'
+                    >
+                      <Column gap='0.5rem'>
+                        <label htmlFor='anthropic-api-key'>
+                          Anthropic API key
+                        </label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='anthropic-api-key'
+                            type='password'
+                            autoComplete='new-password'
+                            value={anthropicApiKey || ''}
+                            onChange={event =>
+                              setAnthropicApiKey(
+                                event.target.value || undefined,
+                              )
+                            }
+                          />
+                        </InputWrapper>
+                        <Subtle>
+                          This key stays in this browser's local storage.
+                          Requests are sent directly over HTTPS from this
+                          browser to Anthropic and require provider access and
+                          browser CORS permission.
+                        </Subtle>
+                        <label htmlFor='anthropic-model-id'>
+                          Anthropic model ID
+                        </label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='anthropic-model-id'
+                            value={anthropicModelId}
+                            onChange={event => {
+                              const id = event.target.value;
+                              setAnthropicModelId(id);
+
+                              if (
+                                defaultChatModel.provider ===
+                                AIProvider.Anthropic
+                              ) {
+                                setDefaultChatModel({
+                                  id,
+                                  provider: AIProvider.Anthropic,
+                                });
+                              }
+                            }}
+                          />
+                        </InputWrapper>
+                        <Suspense>
+                          <ProviderModelSettings
+                            provider={AIProvider.Anthropic}
+                          />
+                        </Suspense>
+                      </Column>
+                    </SettingsSection>
+                  )}
+                  {matches(
+                    'openai-compatible proxy endpoint api key model',
+                  ) && (
+                    <SettingsSection
+                      label='OpenAI-compatible proxy'
+                      childSearchKeywords='openai-compatible proxy endpoint api key model'
+                    >
+                      <Column gap='0.5rem'>
+                        <label htmlFor='openai-compatible-base-url'>
+                          Base URL
+                        </label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='openai-compatible-base-url'
+                            type='url'
+                            value={openAICompatibleBaseURL || ''}
+                            placeholder='https://proxy.example/v1'
+                            onChange={event =>
+                              setOpenAICompatibleBaseURL(
+                                event.target.value || undefined,
+                              )
+                            }
+                          />
+                        </InputWrapper>
+                        <label htmlFor='openai-compatible-api-key'>
+                          API key (optional)
+                        </label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='openai-compatible-api-key'
+                            type='password'
+                            autoComplete='new-password'
+                            value={openAICompatibleApiKey || ''}
+                            onChange={event =>
+                              setOpenAICompatibleApiKey(
+                                event.target.value || undefined,
+                              )
+                            }
+                          />
+                        </InputWrapper>
+                        <label htmlFor='openai-compatible-model-id'>
+                          Model ID
+                        </label>
+                        <InputWrapper>
+                          <InputStyled
+                            id='openai-compatible-model-id'
+                            value={openAICompatibleModelId}
+                            onChange={event => {
+                              const id = event.target.value;
+                              setOpenAICompatibleModelId(id);
+
+                              if (
+                                defaultChatModel.provider ===
+                                AIProvider.OpenAICompatible
+                              ) {
+                                setDefaultChatModel({
+                                  id,
+                                  provider: AIProvider.OpenAICompatible,
+                                });
+                              }
+                            }}
+                          />
+                        </InputWrapper>
+                        <Subtle>
+                          Keys are stored in this browser's local storage.
+                          Requests go directly from this browser to the
+                          configured provider or proxy, which must be reachable
+                          from the browser and allow CORS. Use HTTPS except for
+                          local development endpoints. No endpoint checks are
+                          made until you send a request.
+                        </Subtle>
+                        <Suspense>
+                          <ProviderModelSettings
+                            provider={AIProvider.OpenAICompatible}
+                          />
+                        </Suspense>
                       </Column>
                     </SettingsSection>
                   )}

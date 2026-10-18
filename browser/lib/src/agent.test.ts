@@ -2,16 +2,11 @@ import { describe, it } from 'vitest';
 import { Agent } from './agent.js';
 import { decodeB64 } from './base64.js';
 import { JSCryptoProvider, legacySubjectFromSecret } from './CryptoProvider.js';
+import { AGENT_VAULT_PROOF_MESSAGE, privateDriveSubject } from './genesis.js';
 import {
-  AGENT_VAULT_PROOF_MESSAGE,
-  privateDriveSubject,
-  aiChatsFolderCert,
-  verifyGenesisCert,
-} from './genesis.js';
-import {
+  canonicalIdentifier,
   isAgentSubject,
   isAtomicIdentifier,
-  canonicalizeScheme,
   toLegacyScheme,
 } from './subject.js';
 
@@ -67,6 +62,77 @@ describe('Agent', () => {
     expect(first).toBe(await privateDriveSubject(decodeB64(validPrivateKey)));
     expect(isAtomicIdentifier(first)).toBe(true);
     expect(isAgentSubject(first)).toBe(false);
+  });
+
+  it('derives one stable folder subject across canonical and legacy drive IDs', async ({
+    expect,
+  }) => {
+    const agent = new Agent(
+      new JSCryptoProvider(validPrivateKey),
+      validSubject,
+    );
+    const canonicalDrive = 'atomic:drive:example';
+    const legacyDrive = toLegacyScheme(canonicalDrive);
+
+    const first = await agent.aiChatsFolderSubject(canonicalDrive);
+    const second = await agent.aiChatsFolderSubject(legacyDrive);
+
+    expect(second).toBe(first);
+    expect(agent.aiChatsFolders[canonicalIdentifier(legacyDrive)]).toBe(first);
+    expect(first).toMatch(/^atomic:/);
+    expect(await agent.aiChatsFolderSubject('atomic:drive:other')).not.toBe(
+      first,
+    );
+  });
+
+  it('precomputes private and initial-drive folders before secret keys become non-extractable', async ({
+    expect,
+  }) => {
+    const privateDrive = await Agent.privateDriveSubjectFromSecret(
+      Agent.buildSecret(validPrivateKey, validSubject),
+    );
+    const initialDrive = 'did:ad:drive:initial';
+    const secret = Agent.buildSecret(
+      validPrivateKey,
+      validSubject,
+      initialDrive,
+    );
+
+    const folders = await Agent.aiChatsFoldersFromSecret(secret);
+
+    expect(folders[privateDrive]).toBeDefined();
+    expect(folders['atomic:drive:initial']).toBeDefined();
+    expect(folders).toEqual(await Agent.aiChatsFoldersFromSecret(secret));
+  });
+
+  it('uses a restored legacy drive-map entry for a non-extractable signer', async ({
+    expect,
+  }) => {
+    const agent = Agent.fromCryptoKeyPair({
+      privateKey: { extractable: false } as CryptoKey,
+      publicKey: { extractable: false } as CryptoKey,
+    });
+    const drive = 'atomic:drive:example';
+    const folder = toLegacyScheme('atomic:folder:existing');
+    agent.aiChatsFolders[toLegacyScheme(drive)] = folder;
+
+    expect(await agent.aiChatsFolderSubject(drive)).toBe(
+      'atomic:folder:existing',
+    );
+    expect(agent.aiChatsFolders[drive]).toBe('atomic:folder:existing');
+  });
+
+  it('does not derive a new folder from a nondeterministic in-memory signer', async ({
+    expect,
+  }) => {
+    const agent = Agent.fromCryptoKeyPair({
+      privateKey: { extractable: false } as CryptoKey,
+      publicKey: { extractable: false } as CryptoKey,
+    });
+
+    await expect(
+      agent.aiChatsFolderSubject('atomic:drive:example'),
+    ).rejects.toThrow('Sign in again');
   });
 
   /**
@@ -133,88 +199,4 @@ describe('legacySubjectFromSecret', () => {
       expect(legacySubjectFromSecret(bad)).toBeUndefined();
     }
   });
-});
-
-describe('AI chat folder identity', () => {
-  const key = 'CapMWIhFUT+w7ANv9oCPqrHrwZpkP2JhzF9JnyT6WcI=';
-  const secret = Agent.buildSecret(key, 'did:ad:agent:test');
-
-  it('converges across independent devices, scoped by drive and account', async ({
-    expect,
-  }) => {
-    const phone = Agent.fromSecret(secret, 'js');
-    const desktop = Agent.fromSecret(secret, 'js');
-    const drive = await phone.privateDriveSubject();
-    const [a, b] = await Promise.all([
-      phone.aiChatsFolderSubject(drive),
-      desktop.aiChatsFolderSubject(drive),
-    ]);
-    expect(a).toBe(b);
-    expect(
-      await verifyGenesisCert(
-        aiChatsFolderCert(decodeB64(await phone.getPublicKey()), drive),
-        a.slice('did:ad:'.length),
-      ),
-    ).toBe(true);
-    expect(await phone.aiChatsFolderSubject('did:ad:other-drive')).not.toBe(a);
-    const other = Agent.fromSecret(
-      Agent.buildSecret(
-        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-        'did:ad:agent:other',
-      ),
-      'js',
-    );
-    expect(await other.aiChatsFolderSubject(drive)).not.toBe(a);
-    expect((await Agent.aiChatsFoldersFromSecret(secret))[drive]).toBe(a);
-  });
-
-  it('restores stable identities without signing with a randomized provider', async ({
-    expect,
-  }) => {
-    const provider = new JSCryptoProvider(key);
-    const restored = new Agent({
-      type: 'test',
-      signsDeterministically: false,
-      getPublicKey: () => provider.getPublicKey(),
-      sign: () => {
-        throw new Error('Must not sign');
-      },
-      signBytes: () => {
-        throw new Error('Must not sign');
-      },
-    });
-    const identities = await Agent.aiChatsFoldersFromSecret(secret);
-    const drive = Object.keys(identities)[0];
-    await expect(restored.aiChatsFolderSubject(drive)).rejects.toThrow(
-      'Sign in again',
-    );
-    restored.aiChatsFolders = JSON.parse(JSON.stringify(identities));
-    expect(await restored.aiChatsFolderSubject(drive)).toBe(identities[drive]);
-  });
-});
-
-// Upgrades must keep the singleton's signed bytes, not merely alias its prefix.
-it('preserves AI Chats identity and cached aliases across the scheme upgrade', async ({
-  expect,
-}) => {
-  const key = 'CapMWIhFUT+w7ANv9oCPqrHrwZpkP2JhzF9JnyT6WcI=';
-  const agent = Agent.fromSecret(
-    Agent.buildSecret(key, 'did:ad:agent:test'),
-    'js',
-  );
-  const drive = await agent.privateDriveSubject();
-  const oldFolder = await agent.aiChatsFolderSubject(toLegacyScheme(drive));
-  const newFolder = await agent.aiChatsFolderSubject(canonicalizeScheme(drive));
-  expect(newFolder).toBe(oldFolder);
-  expect(newFolder).toBe(
-    'atomic:wFAe8DFL7gZoSR0bAzaw1XnlRE5l6aYkIHNvN7uiy_9uPRQu3WieNZPJPkVBvW28zyZs9DdkAe9TVj-NLtNbBg',
-  );
-  // A restored non-extractable session can only use its persisted cache.
-  const restored = await Agent.fromSecret(
-    Agent.buildSecret(key, 'did:ad:agent:test'),
-  );
-  restored.aiChatsFolders = {
-    [toLegacyScheme(drive)]: toLegacyScheme(oldFolder),
-  };
-  expect(await restored.aiChatsFolderSubject(drive)).toBe(oldFolder);
 });

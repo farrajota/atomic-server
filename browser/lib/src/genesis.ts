@@ -48,8 +48,7 @@ export function privateDriveCert(signerPubkey: Uint8Array): GenesisCert {
   };
 }
 
-/** Stable storage location for AI chats, scoped to the signer and drive.
- * No content hash: title and other folder metadata remain editable. */
+/** Stable storage location for AI chats, scoped to the signer and drive. */
 export function aiChatsFolderCert(
   signerPubkey: Uint8Array,
   drive: string,
@@ -58,7 +57,7 @@ export function aiChatsFolderCert(
     signerPubkey,
     createdAt: 0,
     nonce: domainSeparatorNonce('atomic-ai-chats-folder-v1'),
-    // This singleton predates atomic:. Keep its original signed bytes forever.
+    // The existing singleton is signed with its original legacy drive bytes.
     parent: toLegacyScheme(drive),
     drive: toLegacyScheme(drive),
   };

@@ -54,8 +54,9 @@ export class Agent implements AgentInterface {
    * session still knows which drive is its home.
    */
   public privateDrive?: string;
-  /** Stable chat-folder subjects computed before storing non-extractable keys. */
+  /** Stable signed AI Chats folder subjects, keyed by canonical drive ID. */
   public aiChatsFolders: Record<string, string> = {};
+
   /**
    * The agent's Cloud Vault proof: its signature over
    * {@link AGENT_VAULT_PROOF_MESSAGE}, base64url. Same story as
@@ -265,6 +266,11 @@ export class Agent implements AgentInterface {
     return subject;
   }
 
+  /**
+   * Stable AI Chats folder subject for this signer and drive. Older stored maps
+   * used `did:ad:` drive keys, so resolve either scheme and normalize the value
+   * without changing the signed certificate's legacy drive bytes.
+   */
   public async aiChatsFolderSubject(drive: string): Promise<string> {
     drive = canonicalIdentifier(drive);
     const cached =
@@ -290,7 +296,7 @@ export class Agent implements AgentInterface {
     return subject;
   }
 
-  /** Precompute canonical and legacy-home folders while the raw key is available. */
+  /** Derive folder identities while the raw secret remains available. */
   public static async aiChatsFoldersFromSecret(
     secret: string,
   ): Promise<Record<string, string>> {

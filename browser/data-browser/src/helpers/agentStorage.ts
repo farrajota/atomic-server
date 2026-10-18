@@ -68,8 +68,8 @@ interface StoredAgentFallback {
   initialDrive?: string;
   /** See {@link StoredAgent}. */
   privateDrive?: string;
-  aiChatsFolders?: Record<string, string>;
   /** See {@link StoredAgent}. */
+  aiChatsFolders?: Record<string, string>;
   vaultProof?: string;
 }
 
@@ -86,10 +86,51 @@ function hasSubtleCrypto(): boolean {
   }
 }
 
+/** What the inline script in index.html read, when it ran (see there). */
+interface PrereadAgent {
+  agent?: StoredAgent;
+  fallback?: StoredAgentFallback;
+}
+
+declare global {
+  interface Window {
+    __atomicAgentRead?: Promise<PrereadAgent | undefined>;
+  }
+}
+
+/**
+ * Take the IndexedDB read that index.html started before the app's JavaScript
+ * had loaded. Consumed once: a later call (after a sign-in or sign-out) must
+ * read the database again. Undefined when the script did not run or its read
+ * failed, and the caller then reads as it always did.
+ */
+async function takePreread(): Promise<PrereadAgent | undefined> {
+  if (typeof window === 'undefined') return undefined;
+
+  const pending = window.__atomicAgentRead;
+  window.__atomicAgentRead = undefined;
+
+  try {
+    return await pending;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function getAgentFromIDB(): Promise<Agent | undefined> {
+  const preread = await takePreread();
+  const readAgent = async () =>
+    (preread ? preread.agent : await get(AGENT_IDB_KEY)) as
+      | StoredAgent
+      | undefined;
+  const readFallback = async () =>
+    (preread ? preread.fallback : await get(AGENT_FALLBACK_KEY)) as
+      | StoredAgentFallback
+      | undefined;
+
   // Try SubtleCrypto first (secure context)
   if (hasSubtleCrypto()) {
-    const storedAgent = (await get(AGENT_IDB_KEY)) as StoredAgent | undefined;
+    const storedAgent = await readAgent();
 
     if (storedAgent) {
       try {
@@ -124,9 +165,7 @@ export async function getAgentFromIDB(): Promise<Agent | undefined> {
   }
 
   // Fallback: load from plaintext private key (insecure context)
-  const fallback = (await get(AGENT_FALLBACK_KEY)) as
-    | StoredAgentFallback
-    | undefined;
+  const fallback = await readFallback();
 
   if (fallback) {
     try {
@@ -136,8 +175,8 @@ export async function getAgentFromIDB(): Promise<Agent | undefined> {
         fallback.initialDrive,
       );
       agent.legacySubject = fallback.legacySubject;
-      agent.privateDrive = fallback.privateDrive;
       agent.aiChatsFolders = fallback.aiChatsFolders ?? {};
+      agent.privateDrive = fallback.privateDrive;
       agent.vaultProof = fallback.vaultProof;
 
       return agent;
@@ -446,9 +485,11 @@ export async function saveAgentToIDB(
       previous?.subject === subject ? previous.initialDrive : undefined,
     privateDrive:
       previous?.subject === subject ? previous.privateDrive : undefined,
-    aiChatsFolders:
-      previous?.subject === subject ? previous.aiChatsFolders : undefined,
     vaultProof: previous?.subject === subject ? previous.vaultProof : undefined,
+    aiChatsFolders:
+      previous?.subject === subject
+        ? (previous.aiChatsFolders ?? {})
+        : undefined,
   } satisfies StoredAgent);
 }
 
@@ -510,14 +551,17 @@ async function storeSecret(
           legacySubject: legacySubjectFromSecret(secret),
           initialDrive: decoded.initialDrive,
           privateDrive,
-          aiChatsFolders,
           vaultProof,
+          aiChatsFolders,
         } satisfies StoredAgent,
         obsoleteKey: AGENT_FALLBACK_KEY,
       };
     }
   }
 
+  // Insecure context (plain-HTTP self-hosted origin): Web Crypto is absent,
+  // so a readable key is the only way to sign at all. The secret is no more
+  // exposed than the unencrypted connection already carrying it.
   if (!identity) {
     throwIfAborted(signal);
     const { privateKey, subject: newSubject } = decodeSecret(secret);
