@@ -3,6 +3,10 @@
 This changelog covers all five packages, as they are (for now) updated as a whole
 
 ## UNRELEASED
+- AI chat setup offers OpenAI, Anthropic and OpenAI-compatible endpoints
+  alongside OpenRouter and Ollama. It uses existing browser-local key and model
+  settings, with an optional compatible API key. Refreshed catalogues keep the
+  new fields labeled in production.
 
 - AI tools with intentionally optional, defaulted, or open-ended arguments no
   longer advertise incompatible strict function schemas to OpenAI-compatible

@@ -3238,9 +3238,6 @@ msgstr "Min must be a less than max"
 msgid "Document body"
 msgstr "Document body"
 
-#~ msgid "(empty)"
-#~ msgstr "(empty)"
-
 #: src/chunks/RTE/SlashMenu/CommandList.tsx
 msgid "Searching..."
 msgstr "Searching..."
@@ -11460,10 +11457,6 @@ msgstr "<0/> Edit"
 msgid "Waiting for others to join…"
 msgstr "Waiting for others to join…"
 
-#: src/chunks/AI/AISetupPanel.tsx
-msgid "Use OpenRouter (cloud models) or Ollama (local models). At least one provider must be connected before you can continue."
-msgstr "Use OpenRouter (cloud models) or Ollama (local models). At least one provider must be connected before you can continue."
-
 #. 0: headerCount; 1: headerCount === 1 ? '' \\: 's'
 #: src/chunks/AI/MCPConfigTab.tsx
 msgid "{0} custom header {1}"
@@ -13260,18 +13253,21 @@ msgstr "Use Anthropic for new chats"
 msgid "Use compatible model for new chats"
 msgstr "Use compatible model for new chats"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/components/AI/AISettings.tsx
 msgid "OpenAI"
 msgstr "OpenAI"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/components/AI/AISettings.tsx
 msgid "Anthropic"
 msgstr "Anthropic"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "OpenAI-compatible"
 msgstr "OpenAI-compatible"
@@ -13285,26 +13281,32 @@ msgstr "OpenAI-compatible provider"
 msgid "The model request failed."
 msgstr "The model request failed."
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "OpenAI API key"
 msgstr "OpenAI API key"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "This key stays in this browser's local storage. Requests are sent directly over HTTPS from this browser to OpenAI and require provider access and browser CORS permission."
 msgstr "This key stays in this browser's local storage. Requests are sent directly over HTTPS from this browser to OpenAI and require provider access and browser CORS permission."
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "OpenAI model ID"
 msgstr "OpenAI model ID"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "Anthropic API key"
 msgstr "Anthropic API key"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "This key stays in this browser's local storage. Requests are sent directly over HTTPS from this browser to Anthropic and require provider access and browser CORS permission."
 msgstr "This key stays in this browser's local storage. Requests are sent directly over HTTPS from this browser to Anthropic and require provider access and browser CORS permission."
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "Anthropic model ID"
 msgstr "Anthropic model ID"
@@ -13337,3 +13339,23 @@ msgstr "Configure a valid HTTP(S) endpoint and model ID in AI Settings. An API k
 #: src/chunks/AI/ModelSelect/ModelSelect.tsx
 msgid "Configure this provider API key and model ID in AI Settings."
 msgstr "Configure this provider API key and model ID in AI Settings."
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "OpenAI-compatible base URL"
+msgstr "OpenAI-compatible base URL"
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "OpenAI-compatible API key (optional)"
+msgstr "OpenAI-compatible API key (optional)"
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "OpenAI-compatible model ID"
+msgstr "OpenAI-compatible model ID"
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "Keys stay in this browser's local storage. Requests go directly from this browser to the configured provider or proxy, which must be reachable from the browser and allow CORS. Use HTTPS except for local development endpoints. No endpoint checks are made until you send a request."
+msgstr "Keys stay in this browser's local storage. Requests go directly from this browser to the configured provider or proxy, which must be reachable from the browser and allow CORS. Use HTTPS except for local development endpoints. No endpoint checks are made until you send a request."
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "Use OpenAI, Anthropic, OpenAI-compatible, OpenRouter (cloud models), or Ollama (local models). At least one provider must be connected before you can continue."
+msgstr "Use OpenAI, Anthropic, OpenAI-compatible, OpenRouter (cloud models), or Ollama (local models). At least one provider must be connected before you can continue."

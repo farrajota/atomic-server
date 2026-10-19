@@ -52,15 +52,15 @@ msgstr "Formato: {0}"
 #. 0: ollamaUrl ? ` at ${ollamaUrl}` \\: ''
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Can't reach Ollama{0}. Make sure it's running, or switch to a cloud model — you can keep typing in the meantime."
-msgstr "No se puede contactar a Ollama{0}. Asegúrate de que esté funcionando, o cambia a un modelo en la nube — puedes seguir escribiendo mientras tanto."
+msgstr "No se puede contactar con Ollama{0}. Asegúrate de que está funcionando o cambia a un modelo en la nube — mientras tanto puedes seguir escribiendo."
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "No OpenRouter API key is set. Add one or switch to a local Ollama model — you can keep typing in the meantime."
-msgstr "No se ha configurado ninguna clave de API de OpenRouter. Añade una o cambia a un modelo local de Ollama — puedes seguir escribiendo mientras tanto."
+msgstr "No se ha configurado ninguna clave API de OpenRouter. Agrega una o cambia a un modelo local de Ollama — mientras tanto puedes seguir escribiendo."
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "No AI model provider is available. Set one up to send — you can keep typing in the meantime."
-msgstr "No hay ningún proveedor de modelo de IA disponible. Configura uno para enviar — puedes seguir escribiendo mientras tanto."
+msgstr "No hay ningún proveedor de modelos de IA disponible. Configura uno para enviar — mientras tanto puedes seguir escribiendo."
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Generating"
@@ -68,7 +68,7 @@ msgstr "Generando"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Stop generating"
-msgstr "Detener la generación"
+msgstr "Detener generación"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Gathering context"
@@ -524,7 +524,7 @@ msgstr "Sin resultados"
 
 #: src/helpers/AppSettings.tsx
 msgid "Agent setting failed: "
-msgstr "La configuración del agente falló:"
+msgstr "Error al configurar el agente: "
 
 #: src/components/AI/ProviderStatus.tsx
 msgid "Not configured"
@@ -1779,7 +1779,7 @@ msgstr "No hay instancias"
 
 #: src/chunks/RTE/AIChatInput/mcpSuggestions.ts
 msgid "Atomic Data"
-msgstr "Atomic Data"
+msgstr "Datos Atómicos"
 
 #: src/components/SkipNav.tsx
 msgid "Skip Navigation?"
@@ -1898,7 +1898,7 @@ msgstr "Confirmar eliminación"
 #. 0: ctx.resource.title
 #: src/components/ResourceContextMenu/index.tsx
 msgid "Open {0} menu"
-msgstr "Abrir el menú de {0}"
+msgstr "Abrir menú de {0}"
 
 #: src/actions/resourceActions.tsx
 msgid "Delete resource"
@@ -3238,9 +3238,6 @@ msgstr "El mínimo debe ser menor que el máximo"
 msgid "Document body"
 msgstr "Cuerpo del documento"
 
-#~ msgid "(empty)"
-#~ msgstr "(vacío)"
-
 #: src/chunks/RTE/SlashMenu/CommandList.tsx
 msgid "Searching..."
 msgstr "Buscando..."
@@ -3675,24 +3672,24 @@ msgstr ""
 #. 0: currencyFormatter.format(model.pricing.prompt * 1000000)
 #: src/chunks/AI/RealAIChat.tsx
 msgid "{0}/M input"
-msgstr ""
+msgstr "{0}/M entrada"
 
 #. 0: formatter.format(Number(model.pricing.completion) * 1000000)
 #. 0: currencyFormatter.format(model.pricing.completion * 1000000)
 #: src/chunks/AI/ModelSelect/OpenRouterModelSelector.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "{0}/M output"
-msgstr ""
+msgstr "{0}/M salida"
 
 #. 0: model.name.toLowerCase()
 #: src/chunks/AI/RealAIChat.tsx
 msgid "{0} openrouter"
-msgstr ""
+msgstr "{0} openrouter"
 
 #. 0: model.name.toLowerCase()
 #: src/chunks/AI/RealAIChat.tsx
 msgid "{0} ollama"
-msgstr ""
+msgstr "{0} ollama"
 
 #: src/chunks/AI/SkillsConfigTab.tsx
 msgid ""
@@ -4114,7 +4111,7 @@ msgstr ""
 #: src/routes/DemoRoute.tsx
 #: src/routes/SyncRoute.tsx
 msgid "Try again"
-msgstr ""
+msgstr "Intentar de nuevo"
 
 #: src/chunks/PluginRuns/ConnectedIntegration.tsx
 #: src/chunks/PluginRuns/PluginPage.tsx
@@ -5057,17 +5054,17 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Unknown error"
-msgstr ""
+msgstr "Error desconocido"
 
 #. 0: providerLabel; 1: requestError
 #: src/chunks/AI/RealAIChat.tsx
 msgid "No answer from {0}: {1}"
-msgstr ""
+msgstr "Sin respuesta de {0}: {1}"
 
 #. 0: ollamaUrl ? ` at ${ollamaUrl}` \\: ''
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Ollama{0}"
-msgstr ""
+msgstr "Ollama{0}"
 
 #: src/chunks/TablePage/TableTotalsFooter.tsx
 msgid "This column holds an action, not a value, so there is nothing to total."
@@ -6028,7 +6025,7 @@ msgstr ""
 
 #: src/components/ResourceContextMenu/index.tsx
 msgid "Are you sure you want to delete"
-msgstr ""
+msgstr "¿Seguro que quieres eliminar?"
 
 #: src/chunks/TablePage/TableExportDialog.tsx
 #: src/views/File/DownloadButton.tsx
@@ -7799,7 +7796,7 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "The response was interrupted."
-msgstr ""
+msgstr "La respuesta fue interrumpida."
 
 #: src/views/File/ConvertToDocumentButton.tsx
 msgid "Could not convert the file."
@@ -7909,12 +7906,12 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Drop files to attach"
-msgstr ""
+msgstr "Arrastra archivos para adjuntar"
 
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Choose a model that supports attachments first."
-msgstr ""
+msgstr "Elige primero un modelo que admita archivos adjuntos."
 
 #. 0: error instanceof Error ? error.message \\: String(error)
 #: src/chunks/Website/WebsitePage.tsx
@@ -8180,31 +8177,31 @@ msgstr ""
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Included AI"
-msgstr ""
+msgstr "IA incluida"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Uses your account credits"
-msgstr ""
+msgstr "Usa los créditos de tu cuenta"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Included AI is unavailable or your credits have run out. Check your account allowance or use your own provider. There are no automatic extra charges."
-msgstr ""
+msgstr "La IA incluida no está disponible o tus créditos se han agotado. Revisa tu límite de cuenta o usa tu propio proveedor. No hay cargos adicionales automáticos."
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Could not start included AI. Please try again."
-msgstr ""
+msgstr "No se pudo iniciar la IA incluida. Inténtalo de nuevo."
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Advanced AI settings"
-msgstr ""
+msgstr "Configuración avanzada de IA"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "By sending, you enable included AI. Your messages and selected document context are sent through Atomic to its AI providers."
-msgstr ""
+msgstr "Al enviar, activas la IA incluida. Tus mensajes y el contexto de documentos seleccionado se envían a través de Atomic a sus proveedores de IA."
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Included AI · model managed by Atomic"
-msgstr ""
+msgstr "IA incluida · modelo gestionado por Atomic"
 
 #. 0: Math.floor(hostedAI.remaining_micros / 1000); 1: Math.floor(hostedAI.allowance_micros / 1000)
 #: src/chunks/AI/AISetupPanel.tsx
@@ -8238,16 +8235,16 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Agent"
-msgstr ""
+msgstr "Agente"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "AI settings"
-msgstr ""
+msgstr "Configuración de IA"
 
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "AI Chat options"
-msgstr ""
+msgstr "Opciones de chat de IA"
 
 #. 0: credits(monthly); 1: credits(status.allowance_micros)
 #: src/chunks/AI/HostedAICredits.tsx
@@ -8275,7 +8272,7 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Could not save the voice transcript."
-msgstr ""
+msgstr "No se pudo guardar la transcripción de voz."
 
 #: src/chunks/AI/LiveConversation.tsx
 msgid "Sign in to your Atomic account to use voice."
@@ -8351,7 +8348,7 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Chat agent"
-msgstr ""
+msgstr "Agente de chat"
 
 #: src/chunks/AI/AIConfigurationSections.tsx
 msgid "Choose the default agent for new chats."
@@ -8456,7 +8453,7 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "AI settings…"
-msgstr ""
+msgstr "Configuración de IA…"
 
 #: src/actions/appActions.ts
 #: src/routes/SettingsAgent.tsx
@@ -8497,7 +8494,7 @@ msgstr ""
 #: src/chunks/AI/ReportAIChatDialog.tsx
 #: src/components/ResourceContextMenu/index.tsx
 msgid "Report AI chat"
-msgstr ""
+msgstr "Reportar chat de IA"
 
 #: src/chunks/AI/ReportAIChatDialog.tsx
 msgid "Sending report"
@@ -8553,12 +8550,12 @@ msgstr ""
 
 #: src/components/ResourceContextMenu/index.tsx
 msgid "Review the chat transcript before sharing it with the Atomic team"
-msgstr ""
+msgstr "Revisa la transcripción del chat antes de compartirla con el equipo de Atomic"
 
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Buy AI credits"
-msgstr ""
+msgstr "Comprar créditos de IA"
 
 #: src/routes/SyncRoute.tsx
 msgid "Starting server sync…"
@@ -8596,7 +8593,7 @@ msgstr ""
 #: src/components/AI/MicrophoneSelect.tsx
 #: src/components/AI/SpeechSettings.tsx
 msgid "Microphone"
-msgstr ""
+msgstr "Micrófono"
 
 #. 0: index + 1
 #: src/components/AI/MicrophoneSelect.tsx
@@ -9904,7 +9901,7 @@ msgstr ""
 #: src/chunks/TablePage/CreateTableFormDialog.tsx
 #: src/components/ResourceContextMenu/index.tsx
 msgid "Create form from this table"
-msgstr ""
+msgstr "Crear formulario a partir de esta tabla"
 
 #: src/chunks/TablePage/CreateTableFormDialog.tsx
 msgid "Form name"
@@ -10960,7 +10957,7 @@ msgstr ""
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Included AI isn't reachable right now. Check your connection and sign-in, then reload to try again."
-msgstr ""
+msgstr "La IA incluida no está accesible en este momento. Revisa tu conexión e inicio de sesión, luego recarga para intentarlo de nuevo."
 
 #: src/components/SideBar/usePanelList.ts
 #: src/views/AgentPage.tsx
@@ -11447,10 +11444,6 @@ msgstr ""
 msgid "Waiting for others to join…"
 msgstr ""
 
-#: src/chunks/AI/AISetupPanel.tsx
-msgid "Use OpenRouter (cloud models) or Ollama (local models). At least one provider must be connected before you can continue."
-msgstr "Usa OpenRouter (modelos en la nube) u Ollama (modelos locales). Al menos un proveedor debe estar conectado antes de poder continuar."
-
 #. 0: headerCount; 1: headerCount === 1 ? '' \\: 's'
 #: src/chunks/AI/MCPConfigTab.tsx
 msgid "{0} custom header {1}"
@@ -11464,7 +11457,7 @@ msgstr ""
 #. 0: ' '; 1: nummberFormatter.format(usage.input); 2: ' '; 3: nummberFormatter.format(usage.output)
 #: src/chunks/AI/RealAIChat.tsx
 msgid "Tokens used:{0} {1} input,{2} {3} output"
-msgstr ""
+msgstr "Tokens usados:{0} {1} entrada,{2} {3} salida"
 
 #: src/chunks/EmojiInput/EmojiInput.tsx
 msgid "<0/> Remove"
@@ -13247,51 +13240,60 @@ msgstr ""
 msgid "Use compatible model for new chats"
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/components/AI/AISettings.tsx
 msgid "OpenAI"
-msgstr ""
+msgstr "OpenAI"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/chunks/AI/RealAIChat.tsx
 #: src/components/AI/AISettings.tsx
 msgid "Anthropic"
-msgstr ""
+msgstr "Anthropic"
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/chunks/AI/RealAIChat.tsx
 msgid "OpenAI-compatible"
-msgstr ""
+msgstr "Compatible con OpenAI"
 
 #: src/chunks/AI/RealAIChat.tsx
 msgid "OpenAI-compatible provider"
-msgstr ""
+msgstr "Proveedor compatible con OpenAI"
 
 #: src/chunks/AI/providerModel.ts
 #: src/chunks/AI/providerModel.ts
 msgid "The model request failed."
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "OpenAI API key"
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "This key stays in this browser's local storage. Requests are sent directly over HTTPS from this browser to OpenAI and require provider access and browser CORS permission."
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "OpenAI model ID"
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "Anthropic API key"
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "This key stays in this browser's local storage. Requests are sent directly over HTTPS from this browser to Anthropic and require provider access and browser CORS permission."
 msgstr ""
 
+#: src/chunks/AI/AISetupPanel.tsx
 #: src/components/AI/AISettings.tsx
 msgid "Anthropic model ID"
 msgstr ""
@@ -13323,4 +13325,24 @@ msgstr ""
 
 #: src/chunks/AI/ModelSelect/ModelSelect.tsx
 msgid "Configure this provider API key and model ID in AI Settings."
+msgstr ""
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "OpenAI-compatible base URL"
+msgstr ""
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "OpenAI-compatible API key (optional)"
+msgstr ""
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "OpenAI-compatible model ID"
+msgstr ""
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "Keys stay in this browser's local storage. Requests go directly from this browser to the configured provider or proxy, which must be reachable from the browser and allow CORS. Use HTTPS except for local development endpoints. No endpoint checks are made until you send a request."
+msgstr ""
+
+#: src/chunks/AI/AISetupPanel.tsx
+msgid "Use OpenAI, Anthropic, OpenAI-compatible, OpenRouter (cloud models), or Ollama (local models). At least one provider must be connected before you can continue."
 msgstr ""

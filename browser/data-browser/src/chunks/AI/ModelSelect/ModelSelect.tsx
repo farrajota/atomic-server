@@ -24,6 +24,27 @@ const PROVIDERS = [
   { label: 'OpenAI-compatible', value: AIProvider.OpenAICompatible },
 ];
 
+const getModelId = (
+  provider: AIProvider,
+  defaultModel: AIModelIdentifier,
+  openAIModelId: string,
+  anthropicModelId: string,
+  openAICompatibleModelId: string,
+) => {
+  const configuredModelId =
+    provider === AIProvider.OpenAI
+      ? openAIModelId
+      : provider === AIProvider.Anthropic
+        ? anthropicModelId
+        : provider === AIProvider.OpenAICompatible
+          ? openAICompatibleModelId
+          : '';
+
+  return defaultModel.provider === provider
+    ? defaultModel.id
+    : configuredModelId;
+};
+
 export const ModelSelect = ({
   onSelect,
   defaultModel,
@@ -52,23 +73,40 @@ export const ModelSelect = ({
         option.value === defaultModel.provider,
     ),
   ];
-  const configuredModelId =
-    provider === AIProvider.OpenAI
-      ? openAIModelId
-      : provider === AIProvider.Anthropic
-        ? anthropicModelId
-        : provider === AIProvider.OpenAICompatible
-          ? openAICompatibleModelId
-          : '';
-  const modelId =
-    defaultModel.provider === provider ? defaultModel.id : configuredModelId;
+  const modelId = getModelId(
+    provider,
+    defaultModel,
+    openAIModelId,
+    anthropicModelId,
+    openAICompatibleModelId,
+  );
 
   return (
     <Column gap='0.75rem'>
       <BasicSelect
         aria-label='Provider'
         value={provider}
-        onChange={event => setProvider(event.target.value as AIProvider)}
+        onChange={event => {
+          const selectedProvider = event.target.value as AIProvider;
+          setProvider(selectedProvider);
+
+          if (
+            selectedProvider === AIProvider.OpenAI ||
+            selectedProvider === AIProvider.Anthropic ||
+            selectedProvider === AIProvider.OpenAICompatible
+          ) {
+            onSelect?.({
+              id: getModelId(
+                selectedProvider,
+                defaultModel,
+                openAIModelId,
+                anthropicModelId,
+                openAICompatibleModelId,
+              ),
+              provider: selectedProvider,
+            });
+          }
+        }}
       >
         {providers.map(option => (
           <option key={option.value} value={option.value}>
