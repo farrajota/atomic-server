@@ -25,6 +25,7 @@ mod metrics;
 mod node_key;
 pub mod plugins;
 mod rate_limit;
+mod recovery_cli;
 mod routes;
 pub mod serve;
 pub mod vector_search;
@@ -35,7 +36,11 @@ mod trace;
 
 #[actix_web::main]
 async fn main() -> () {
-    if let Err(e) = main_wrapped().await {
+    let result = match recovery_cli::run_if_requested().await {
+        Some(result) => result,
+        None => main_wrapped().await,
+    };
+    if let Err(e) = result {
         use colored::Colorize;
         eprintln!("{}: {}", "Error".red(), e.message);
         std::process::exit(1);
@@ -204,6 +209,9 @@ async fn main_wrapped() -> errors::AtomicServerResult<()> {
 
             println!("Successfully created {}", pathstr);
             Ok(())
+        }
+        Some(config::Command::Recovery(_)) => {
+            Err("Recovery must be dispatched before server initialization".into())
         }
         None => serve::serve(config).await,
     }

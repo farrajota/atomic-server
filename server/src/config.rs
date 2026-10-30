@@ -343,6 +343,9 @@ pub enum Command {
     /// Danger! Removes all data from the store.
     #[clap(name = "reset")]
     Reset,
+    /// Restore a sealed native recovery bundle into a new offline target directory.
+    #[clap(subcommand)]
+    Recovery(RecoveryCommand),
     /// Compact the on-disk redb file (rebuilds page layout, truncates
     /// dead-page tail). Slow — typically minutes on a multi-GB store —
     /// but makes future boots dramatically faster because the open-time
@@ -375,6 +378,23 @@ pub struct ImportOpts {
     /// Skip checks, allows for importing things like Commits.
     #[clap(long)]
     pub force: bool,
+}
+
+#[derive(Parser, Clone, Debug)]
+pub enum RecoveryCommand {
+    /// Restore a sealed native bundle into a fresh target directory.
+    #[clap(name = "restore")]
+    Restore(RecoveryRestoreOpts),
+}
+
+#[derive(Parser, Clone, Debug)]
+pub struct RecoveryRestoreOpts {
+    /// Sealed native recovery bundle to validate and restore.
+    #[clap(long)]
+    pub bundle: PathBuf,
+    /// New, exclusively created directory for the offline recovery target.
+    #[clap(long = "target-dir")]
+    pub target_dir: PathBuf,
 }
 
 /// Start atomic-server, oi mate

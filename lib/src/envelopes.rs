@@ -28,7 +28,9 @@
 
 use crate::db::trees::{Method, Operation, Transaction, Tree};
 use crate::errors::AtomicResult;
+use crate::storelike::Storelike;
 use crate::{commit::CommitResponse, Db};
+use sha2::Digest;
 
 /// Which envelopes a node keeps per resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -665,6 +667,1078 @@ fn messages_within(
         }
     }
     messages
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveryHistoryAttribution {
+    pub retention: &'static str,
+    pub attributions: Vec<Attribution>,
+    pub complete: bool,
+}
+
+/// Recovery accepts only the native commit envelope schema before the general parser runs.
+pub(crate) fn check_recovery_envelope_fields(store: &Db, json: &str) -> AtomicResult<()> {
+    let object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(json).map_err(|_| "Invalid recovery envelope JSON")?;
+    for (key, value) in &object {
+        if ![
+            "@id",
+            crate::urls::LOCAL_ID,
+            crate::urls::IS_A,
+            crate::urls::SUBJECT,
+            crate::urls::CREATED_AT,
+            crate::urls::SIGNER,
+            crate::urls::LORO_UPDATE,
+            crate::urls::DESTROY,
+            crate::urls::SIGNATURE,
+            crate::urls::PREVIOUS_COMMIT,
+            crate::urls::IS_GENESIS,
+        ]
+        .contains(&key.as_str())
+        {
+            return Err("Recovery envelope contains an unsupported property".into());
+        }
+        if key != "@id" && key != crate::urls::LOCAL_ID {
+            let subject = crate::Subject::from_raw(key, store.get_base_domain().as_deref());
+            store
+                .get_resource_shallow(&subject)
+                .map_err(|_| "Recovery envelope property definition is not available locally")?;
+        }
+        if value.is_object()
+            || value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| !item.is_string()))
+        {
+            return Err("Recovery envelope contains a nested or invalid property value".into());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn recovery_span_ops(
+    history: &RecoveryHistoryAttribution,
+    envelopes: &[StoredEnvelope],
+) -> AtomicResult<Vec<Operation>> {
+    if !history.complete || history.attributions.len() != envelopes.len() {
+        return Err("Recovery attribution inventory is incomplete".into());
+    }
+    history.attributions.iter().zip(envelopes).map(|(attribution, envelope)| {
+        if !attribution.verified || attribution.signature != envelope.signature {
+            return Err("Recovery attribution does not match its verified envelope".into());
+        }
+        let spans = crate::loro::EnvelopeSpans {
+            client: attribution.spans.clone().ok_or("Recovery signed spans are missing")?,
+            server: attribution.server_spans.clone().ok_or("Recovery server spans are missing")?,
+        };
+        Ok(Operation {
+            tree: Tree::EnvelopeSpans,
+            method: Method::Insert,
+            key: key(&envelope.subject, envelope.created_at, &envelope.signature),
+            val: Some(serde_json::to_vec(&spans)?),
+        })
+    }).collect()
+}
+
+/// Import recovery evidence without the ordinary sync path's retention or omission semantics.
+pub(crate) async fn import_recovery_envelope(
+    store: &Db,
+    expected_subject: &str,
+    json: &str,
+) -> AtomicResult<()> {
+    check_recovery_envelope_fields(store, json)?;
+    let local = crate::recovery::LocalRecoveryStore::new(store);
+    let resource = crate::parse::parse_json_ad_commit_resource(json, &local).await?;
+    let commit = crate::commit::Commit::from_resource(resource)?;
+    if recovery_envelope_id(store, commit.subject.as_str())
+        != recovery_envelope_id(store, expected_subject)
+    {
+        return Err("Recovery envelope is about a different subject".into());
+    }
+    commit.validate_signature(&local).await?;
+    let signature = commit
+        .signature
+        .as_deref()
+        .ok_or("Recovery envelope has no signature")?;
+    store.kv.insert(
+        Tree::Envelopes,
+        &key(
+            &recovery_envelope_id(store, expected_subject),
+            commit.created_at,
+            signature,
+        ),
+        json.as_bytes(),
+    )
+}
+
+struct OperationDigest {
+    hash: sha2::Sha256,
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::io::Write for OperationDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self
+            .bytes
+            .checked_add(bytes.len())
+            .filter(|next| *next <= self.limit)
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "Recovery operation proof exceeds its 1 GiB work limit",
+                )
+            })?;
+        self.hash.update(bytes);
+        self.bytes = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn operation_digest<T: serde::Serialize + ?Sized>(
+    changes: &T,
+    limit: usize,
+) -> AtomicResult<([u8; 32], usize)> {
+    let mut writer = OperationDigest {
+        hash: sha2::Sha256::new(),
+        bytes: 0,
+        limit,
+    };
+    serde_json::to_writer(&mut writer, changes)?;
+    Ok((writer.hash.finalize().into(), writer.bytes))
+}
+
+fn is_genesis_carrier(token: &str, attributions: &[Attribution]) -> bool {
+    let token = crate::identifiers::canonicalize_scheme(token);
+    attributions.iter().any(|entry| {
+        entry.genesis && crate::identifiers::canonicalize_scheme(&entry.signer) == token
+    })
+}
+
+struct RecoveryProofScope<'a> {
+    store: &'a Db,
+    members: &'a std::collections::HashSet<String>,
+}
+
+struct RecoveryOperationProof {
+    changes: Vec<loro::JsonChange>,
+    ranges: Vec<(loro::VersionVector, loro::VersionVector)>,
+    stamps: Vec<(serde_json::Value, serde_json::Value, usize)>,
+    prerequisites: Vec<loro::VersionVector>,
+    bookkeeping_ranges: Vec<(u64, i32, i32)>,
+    compared_bytes: usize,
+    comparisons: usize,
+    document_work: usize,
+}
+
+impl RecoveryOperationProof {
+    fn new(doc: &crate::loro::AtomicLoroDoc, envelopes: usize) -> AtomicResult<Self> {
+        let schema = doc.doc().export_json_updates_without_peer_compression(
+            &loro::VersionVector::default(),
+            &doc.oplog_vv(),
+        );
+        if !schema.start_version.is_empty() {
+            return Err("Recovery snapshot has truncated operation history".into());
+        }
+        let changes = schema.changes;
+        let operations = changes.iter().map(|change| change.ops.len()).sum::<usize>();
+        if operations
+            .checked_mul(envelopes)
+            .is_none_or(|work| work > 16 * 1024 * 1024)
+        {
+            return Err("Recovery operation proof exceeds its 16 million comparison limit".into());
+        }
+        let document_work = changes
+            .iter()
+            .map(|change| change.ops.len() + change.deps.len())
+            .sum();
+        Ok(Self {
+            changes,
+            ranges: Vec::with_capacity(envelopes),
+            stamps: Vec::new(),
+            prerequisites: Vec::with_capacity(envelopes),
+            bookkeeping_ranges: Vec::new(),
+            compared_bytes: 0,
+            comparisons: 0,
+            document_work,
+        })
+    }
+
+    fn charge_work(counter: &mut usize, amount: usize) -> AtomicResult<()> {
+        *counter = counter
+            .checked_add(amount)
+            .filter(|work| *work <= 16 * 1024 * 1024)
+            .ok_or("Recovery operation proof exceeds its 16 million comparison limit")?;
+        Ok(())
+    }
+
+    fn carries(
+        start: &loro::VersionVector,
+        end: &loro::VersionVector,
+        peer: u64,
+        counter: i32,
+    ) -> bool {
+        counter >= start.get(&peer).copied().unwrap_or(0)
+            && counter < end.get(&peer).copied().unwrap_or(0)
+    }
+
+    fn verify_update(
+        &mut self,
+        store: &Db,
+        members: &std::collections::HashSet<String>,
+        stored: &crate::loro::AtomicLoroDoc,
+        commit: &crate::commit::Commit,
+    ) -> AtomicResult<()> {
+        let Some(update) = commit.loro_update.as_deref() else {
+            if !commit.destroy.unwrap_or(false) {
+                return Err("Recovery content envelope has no native update".into());
+            }
+            self.ranges.push((
+                loro::VersionVector::default(),
+                loro::VersionVector::default(),
+            ));
+            self.prerequisites.push(loro::VersionVector::default());
+            return Ok(());
+        };
+        let (start, end) = crate::loro::AtomicLoroDoc::update_range(update)?;
+        let stored_vv = stored.oplog_vv();
+        for (peer, counter) in end.iter() {
+            if *counter > stored_vv.get(peer).copied().unwrap_or(0) {
+                return Err("Recovery signed update is not contained in its snapshot".into());
+            }
+        }
+        let mut predecessors = loro::Frontiers::new();
+        for (peer, counter) in start.iter() {
+            if *counter > 0 {
+                predecessors.push(loro::ID::new(*peer, *counter - 1));
+            }
+        }
+        Self::charge_work(&mut self.comparisons, self.document_work)?;
+        for change in &self.changes {
+            if change
+                .ops
+                .iter()
+                .any(|op| Self::carries(&start, &end, change.id.peer, op.counter))
+            {
+                for dependency in &change.deps {
+                    if !Self::carries(&start, &end, dependency.peer, dependency.counter) {
+                        predecessors.push(*dependency);
+                    }
+                }
+            }
+        }
+        let original = if predecessors.is_empty() {
+            crate::loro::AtomicLoroDoc::new()
+        } else {
+            stored.fork_at(&crate::loro::VersionID::from_frontiers(&predecessors))?
+        };
+        let before = original.oplog_vv();
+        for (peer, counter) in before.iter() {
+            if *counter > start.get(peer).copied().unwrap_or(0)
+                && end.get(peer).copied().unwrap_or(0) > start.get(peer).copied().unwrap_or(0)
+            {
+                return Err("Recovery signed update context contains its own operations".into());
+            }
+        }
+        if original.import_update_status(update)? {
+            return Err("Recovery signed update has missing causal operations".into());
+        }
+        let after = original.oplog_vv();
+        for (peer, counter) in end.iter() {
+            if after.get(peer).copied().unwrap_or(0) < *counter {
+                return Err("Recovery signed update did not materialize its complete range".into());
+            }
+        }
+        let mut signed = original
+            .doc()
+            .export_json_updates_without_peer_compression(&before, &after);
+        let mut supplied = stored
+            .doc()
+            .export_json_updates_without_peer_compression(&before, &after);
+        for changes in [&mut signed.changes, &mut supplied.changes] {
+            changes.sort_by_key(|change| (change.id.peer, change.id.counter));
+            for change in changes.iter_mut() {
+                change.deps.sort_by_key(|id| (id.peer, id.counter));
+            }
+        }
+        let remaining = (crate::recovery::MAX_BUNDLE_BYTES * 64)
+            .checked_sub(self.compared_bytes)
+            .ok_or("Recovery operation proof exceeds its 1 GiB work limit")?;
+        let (signed_hash, signed_bytes) = operation_digest(&signed.changes, remaining)?;
+        let (supplied_hash, supplied_bytes) =
+            operation_digest(&supplied.changes, remaining - signed_bytes)?;
+        self.compared_bytes += signed_bytes + supplied_bytes;
+        if signed_bytes != supplied_bytes || signed_hash != supplied_hash {
+            return Err("Recovery snapshot operations differ from original signed native bytes".into());
+        }
+        self.ranges.push((start, end));
+        let prerequisite = self.prerequisites.len();
+        self.prerequisites.push(after);
+        let mut signed_resource = crate::Resource::new(commit.subject.to_string());
+        signed_resource.apply_state_doc(original)?;
+        crate::recovery::validate_explicit_dependencies(
+            store,
+            &crate::recovery::required_dependencies(store, &signed_resource),
+            members,
+        )?;
+
+        let template = crate::loro::AtomicLoroDoc::new();
+        let signature = commit
+            .signature
+            .as_deref()
+            .ok_or("Recovery envelope has no signature")?;
+        template.set_property(
+            crate::urls::LAST_COMMIT,
+            &crate::Value::AtomicUrl(crate::identifiers::commit_subject(signature).into()),
+        )?;
+        if commit.is_genesis == Some(true) {
+            template.set_property(
+                crate::urls::CREATED_AT,
+                &crate::Value::Timestamp(commit.created_at),
+            )?;
+        }
+        template.commit();
+        for change in template
+            .doc()
+            .export_json_updates_without_peer_compression(
+                &loro::VersionVector::default(),
+                &template.oplog_vv(),
+            )
+            .changes
+        {
+            for op in change.ops {
+                self.stamps.push((
+                    serde_json::to_value(&op.container)?,
+                    serde_json::to_value(&op.content)?,
+                    prerequisite,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn causal_before(
+        stored: &crate::loro::AtomicLoroDoc,
+        change: &loro::JsonChange,
+        counter: i32,
+    ) -> AtomicResult<crate::loro::AtomicLoroDoc> {
+        let mut causal = loro::Frontiers::new();
+        for dependency in &change.deps {
+            causal.push(*dependency);
+        }
+        if counter > 0 {
+            causal.push(loro::ID::new(change.id.peer, counter - 1));
+        }
+        if causal.is_empty() {
+            Ok(crate::loro::AtomicLoroDoc::new())
+        } else {
+            stored.fork_at(&crate::loro::VersionID::from_frontiers(&causal))
+        }
+    }
+
+    fn includes(have: &loro::VersionVector, required: &loro::VersionVector) -> bool {
+        required
+            .iter()
+            .all(|(peer, end)| have.get(peer).copied().unwrap_or(0) >= *end)
+    }
+
+    fn prove_bookkeeping(
+        &mut self,
+        scope: &RecoveryProofScope<'_>,
+        stored: &crate::loro::AtomicLoroDoc,
+        property_root: &serde_json::Value,
+        receipts: &std::collections::HashMap<String, usize>,
+        attributions: &[Attribution],
+        subject: &str,
+    ) -> AtomicResult<()> {
+        let store = scope.store;
+        let members = scope.members;
+        for change_index in 0..self.changes.len() {
+            let change = &self.changes[change_index];
+            if change.msg.is_some() {
+                continue;
+            }
+            let mut needs_native_proof = false;
+            for op in &change.ops {
+                Self::charge_work(&mut self.comparisons, self.ranges.len() + self.stamps.len())?;
+                let container = serde_json::to_value(&op.container)?;
+                let content = serde_json::to_value(&op.content)?;
+                if !self
+                    .stamps
+                    .iter()
+                    .any(|(root, stamp, _)| *root == container && *stamp == content)
+                {
+                    needs_native_proof = true;
+                    break;
+                }
+            }
+            if !needs_native_proof {
+                continue;
+            }
+            let mut receipt = None;
+            for op in &change.ops {
+                if let loro::JsonOpContent::Map(loro::JsonMapOp::Insert {
+                    key,
+                    value: loro::LoroValue::String(value),
+                }) = &op.content
+                {
+                    if key == crate::urls::LAST_COMMIT
+                        && serde_json::to_value(&op.container)? == *property_root
+                    {
+                        if receipt.is_some() {
+                            receipt = None;
+                            break;
+                        }
+                        let index = *receipts
+                            .get(&crate::identifiers::canonicalize_scheme(value.as_ref()))
+                            .ok_or("Recovery retained history is missing a referenced commit envelope")?;
+                        receipt = Some((index, value.to_string()));
+                    }
+                }
+            }
+            let Some((index, receipt_value)) = receipt else {
+                continue;
+            };
+            if attributions[index].destroy {
+                continue;
+            }
+            Self::charge_work(&mut self.comparisons, self.document_work)?;
+            let causal = Self::causal_before(stored, change, change.id.counter)?;
+            let before = causal.oplog_vv();
+            if !Self::includes(&before, &self.prerequisites[index]) {
+                continue;
+            }
+
+            let mut previous_receipts = loro::Frontiers::new();
+            for previous_change in &self.changes {
+                for op in &previous_change.ops {
+                    if before
+                        .get(&previous_change.id.peer)
+                        .copied()
+                        .unwrap_or(0)
+                        <= op.counter
+                    {
+                        continue;
+                    }
+                    if let loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, .. }) = &op.content {
+                        if key == crate::urls::LAST_COMMIT
+                            && serde_json::to_value(&op.container)? == *property_root
+                        {
+                            previous_receipts.push(loro::ID::new(
+                                previous_change.id.peer,
+                                op.counter,
+                            ));
+                        }
+                    }
+                }
+            }
+            let is_new = previous_receipts.is_empty();
+            let mut old = crate::Resource::new(subject.to_string());
+            if !is_new {
+                old.apply_state_doc(stored.fork_at(
+                    &crate::loro::VersionID::from_frontiers(&previous_receipts),
+                )?)?;
+            }
+            let mut resource = crate::Resource::new(subject.to_string());
+            resource.apply_state_doc(causal)?;
+            let parent = resource.get(crate::urls::PARENT).ok().map(|value| value.to_string());
+            let parent_changed = old
+                .get(crate::urls::PARENT)
+                .ok()
+                .map(|value| value.to_string())
+                != parent;
+
+            let mut writers = None;
+            if is_new
+                && attributions[index].genesis
+                && resource.get_subject().is_did()
+                && !resource.has_class(crate::urls::AGENT)
+            {
+                let mut grants = resource
+                    .get(crate::urls::WRITE)
+                    .ok()
+                    .and_then(|value| value.to_subjects(None).ok())
+                    .unwrap_or_default();
+                if !grants.contains(&attributions[index].signer) {
+                    grants.push(attributions[index].signer.clone());
+                    writers = Some(crate::Value::from(grants));
+                }
+            }
+            let drive = if is_new || parent_changed {
+                match parent {
+                    Some(parent) => {
+                        let stamped = change.ops.iter().find_map(|op| match &op.content {
+                            loro::JsonOpContent::Map(loro::JsonMapOp::Insert {
+                                key,
+                                value: loro::LoroValue::String(value),
+                            }) if key == crate::urls::DRIVE_PROP
+                                && serde_json::to_value(&op.container).ok().as_ref()
+                                    == Some(property_root) => Some(value.to_string()),
+                            _ => None,
+                        }).or_else(|| resource.get(crate::urls::DRIVE_PROP).ok().map(|value| value.to_string()));
+                        recovery_derived_drive(
+                            store,
+                            &resource,
+                            &parent,
+                            stamped.as_deref(),
+                            property_root,
+                            members,
+                            &mut self.comparisons,
+                        )?
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            for created_at in [false, true] {
+                if created_at && (!is_new || !attributions[index].genesis) {
+                    continue;
+                }
+                Self::charge_work(&mut self.comparisons, self.document_work)?;
+                let template = resource.build_state_doc()?;
+                template.set_peer_id(change.id.peer)?;
+                if created_at {
+                    template.set_property(
+                        crate::urls::CREATED_AT,
+                        &crate::Value::Timestamp(attributions[index].created_at),
+                    )?;
+                }
+                if let Some(writers) = &writers {
+                    template.set_property(crate::urls::WRITE, writers)?;
+                }
+                if let Some(drive) = &drive {
+                    template.set_property(
+                        crate::urls::DRIVE_PROP,
+                        &crate::Value::AtomicUrl(drive.as_str().into()),
+                    )?;
+                }
+                template.set_property(
+                    crate::urls::LAST_COMMIT,
+                    &crate::Value::AtomicUrl(receipt_value.as_str().into()),
+                )?;
+                template.commit();
+                let after = template.oplog_vv();
+                let generated = template
+                    .doc()
+                    .export_json_updates_without_peer_compression(&before, &after);
+                let operations: Vec<_> = generated.changes.iter().flat_map(|c| &c.ops).collect();
+                let remaining = (crate::recovery::MAX_BUNDLE_BYTES * 64)
+                    .checked_sub(self.compared_bytes)
+                    .ok_or("Recovery operation proof exceeds its 1 GiB work limit")?;
+                let (expected_hash, expected_bytes) = operation_digest(&operations, remaining)?;
+                let (actual_hash, actual_bytes) =
+                    operation_digest(&change.ops, remaining - expected_bytes)?;
+                self.compared_bytes += expected_bytes + actual_bytes;
+                if expected_bytes == actual_bytes && expected_hash == actual_hash {
+                    self.bookkeeping_ranges.push((
+                        change.id.peer,
+                        change.id.counter,
+                        after.get(&change.id.peer).copied().unwrap_or(0),
+                    ));
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        store: &Db,
+        members: &std::collections::HashSet<String>,
+        subject: &str,
+        stored: &crate::loro::AtomicLoroDoc,
+        attributions: &mut [Attribution],
+    ) -> AtomicResult<()> {
+        let receipts: std::collections::HashMap<String, usize> = attributions
+            .iter()
+            .enumerate()
+            .map(|(index, attribution)| {
+                (
+                    crate::identifiers::canonicalize_scheme(
+                        &crate::identifiers::commit_subject(&attribution.signature),
+                    ),
+                    index,
+                )
+            })
+            .collect();
+        let mut receipt_order = vec![u64::MAX; attributions.len()];
+        let root_template = crate::loro::AtomicLoroDoc::new();
+        root_template.set_property(
+            crate::urls::LAST_COMMIT,
+            &crate::Value::AtomicUrl("atomic:commit:template".into()),
+        )?;
+        root_template.commit();
+        let roots = root_template
+            .doc()
+            .export_json_updates_without_peer_compression(
+                &loro::VersionVector::default(),
+                &root_template.oplog_vv(),
+            );
+        let property_root = roots
+            .changes
+            .iter()
+            .flat_map(|change| &change.ops)
+            .find_map(|op| match &op.content {
+                loro::JsonOpContent::Map(loro::JsonMapOp::Insert {
+                    key,
+                    value: loro::LoroValue::String(value),
+                }) if key == crate::urls::LAST_COMMIT && value.as_ref() == "atomic:commit:template" => {
+                    Some(serde_json::to_value(&op.container))
+                }
+                _ => None,
+            })
+            .ok_or("Recovery receipt template is missing its property map")??;
+        for attribution in attributions.iter_mut() {
+            attribution.tokens.clear();
+        }
+        for change in &self.changes {
+            for op in &change.ops {
+                if let loro::JsonOpContent::Map(loro::JsonMapOp::Insert {
+                    key,
+                    value: loro::LoroValue::String(value),
+                }) = &op.content
+                {
+                    if key == crate::urls::LAST_COMMIT
+                        && serde_json::to_value(&op.container)? == property_root
+                    {
+                        let index = receipts
+                            .get(&crate::identifiers::canonicalize_scheme(value.as_ref()))
+                            .ok_or("Recovery retained history is missing a referenced commit envelope")?;
+                        Self::charge_work(&mut self.comparisons, self.document_work)?;
+                        let causal = Self::causal_before(stored, change, op.counter)?.oplog_vv();
+                        if !Self::includes(&causal, &self.prerequisites[*index]) {
+                            return Err("Recovery apply receipt precedes its signed native update".into());
+                        }
+                        let order = (change.lamport as u64)
+                            .checked_add((op.counter - change.id.counter) as u64)
+                            .ok_or("Recovery receipt causal order overflow")?;
+                        receipt_order[*index] = receipt_order[*index].min(order);
+                    }
+                }
+            }
+        }
+        for (index, attribution) in attributions.iter().enumerate() {
+            if !attribution.destroy && receipt_order[index] == u64::MAX {
+                return Err("Recovery envelope has no original apply receipt in the snapshot".into());
+            }
+        }
+        self.prove_bookkeeping(
+            &RecoveryProofScope { store, members },
+            stored,
+            &property_root,
+            &receipts,
+            attributions,
+            subject,
+        )?;
+        for change in &self.changes {
+            if let Some(token) = &change.msg {
+                Self::charge_work(&mut self.comparisons, self.ranges.len())?;
+                let owner = self
+                    .ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, (start, end))| {
+                        (!is_genesis_carrier(token, attributions) || attributions[*index].genesis)
+                            && Self::carries(start, end, change.id.peer, change.id.counter)
+                    })
+                    .min_by_key(|(index, _)| receipt_order[*index])
+                    .map(|(index, _)| index);
+                if let Some(owner) = owner {
+                    if !attributions[owner].tokens.contains(token) {
+                        attributions[owner].tokens.push(token.clone());
+                    }
+                }
+            }
+        }
+        for change in &self.changes {
+            let mut causal_vv: Option<loro::VersionVector> = None;
+            for op in &change.ops {
+                let op_end = op
+                    .counter
+                    .checked_add(
+                        i32::try_from(op.content.op_len())
+                            .map_err(|_| "Recovery operation length overflow")?,
+                    )
+                    .ok_or("Recovery operation length overflow")?;
+                let mut covered_until = op.counter;
+                while covered_until < op_end {
+                    Self::charge_work(&mut self.comparisons, self.ranges.len())?;
+                    let next_signed = self
+                        .ranges
+                        .iter()
+                        .filter(|(start, end)| {
+                            Self::carries(start, end, change.id.peer, covered_until)
+                        })
+                        .map(|(_, end)| end.get(&change.id.peer).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(covered_until);
+                    let next_bookkeeping = self
+                        .bookkeeping_ranges
+                        .iter()
+                        .filter(|(peer, start, end)| {
+                            *peer == change.id.peer && covered_until >= *start && covered_until < *end
+                        })
+                        .map(|(_, _, end)| *end)
+                        .max()
+                        .unwrap_or(covered_until);
+                    let next = next_signed.max(next_bookkeeping);
+                    if next == covered_until {
+                        break;
+                    }
+                    covered_until = next;
+                }
+                if covered_until < op_end || change.msg.is_none() {
+                    if causal_vv.is_none() {
+                        let mut causal = loro::Frontiers::new();
+                        for dependency in &change.deps {
+                            causal.push(*dependency);
+                        }
+                        if op.counter > change.id.counter {
+                            causal.push(loro::ID::new(change.id.peer, op.counter - 1));
+                        }
+                        causal_vv = Some(if causal.is_empty() {
+                            loro::VersionVector::default()
+                        } else {
+                            stored
+                                .fork_at(&crate::loro::VersionID::from_frontiers(&causal))?
+                                .oplog_vv()
+                        });
+                    }
+                    let container = serde_json::to_value(&op.container)?;
+                    let content = serde_json::to_value(&op.content)?;
+                    Self::charge_work(&mut self.comparisons, self.stamps.len())?;
+                    let allowed = change.msg.is_none()
+                        && self.stamps.iter().any(|(root, stamp, prerequisite)| {
+                            *root == container
+                                && *stamp == content
+                                && self.prerequisites[*prerequisite].iter().all(|(peer, end)| {
+                                    let causal_end = causal_vv
+                                        .as_ref()
+                                        .unwrap()
+                                        .get(peer)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    let causal_end = if *peer == change.id.peer {
+                                        causal_end.max(op.counter)
+                                    } else {
+                                        causal_end
+                                    };
+                                    causal_end >= *end
+                                })
+                        });
+                    if allowed {
+                        self.bookkeeping_ranges.push((change.id.peer, op.counter, op_end));
+                    } else if covered_until < op_end {
+                        return Err(
+                            "Unproved unsigned recovery operation in snapshot content or container"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        for attribution in attributions.iter_mut() {
+            attribution.spans = Some(Vec::new());
+            attribution.server_spans = Some(Vec::new());
+        }
+        for change in stored.changes() {
+            let length = u32::try_from(change.len).map_err(|_| "Recovery change length overflow")?;
+            let end = change.counter.checked_add(
+                i32::try_from(length).map_err(|_| "Recovery change length overflow")?,
+            ).ok_or("Recovery change length overflow")?;
+            Self::charge_work(&mut self.comparisons, self.bookkeeping_ranges.len() + self.ranges.len())?;
+            let mut cursor = change.counter;
+            while cursor < end {
+                Self::charge_work(&mut self.comparisons, self.bookkeeping_ranges.len())?;
+                let next = self.bookkeeping_ranges.iter()
+                    .filter(|(peer, start, stop)| *peer == change.peer && *start <= cursor && cursor < *stop)
+                    .map(|(_, _, stop)| *stop)
+                    .max().unwrap_or(cursor);
+                if next == cursor { break; }
+                cursor = next;
+            }
+            let span = crate::loro::ChangeSpan { peer: change.peer, counter: change.counter, length };
+            if cursor >= end {
+                attributions[0].server_spans.as_mut().unwrap().push(span);
+                continue;
+            }
+            if self.bookkeeping_ranges.iter().any(|(peer, start, stop)| {
+                *peer == change.peer && *start < end && *stop > change.counter
+            }) {
+                return Err("Recovery change mixes signed and server operations".into());
+            }
+            let owner = self.ranges.iter().enumerate()
+                .filter(|(_, (start, stop))| {
+                    Self::carries(start, stop, change.peer, change.counter)
+                        && stop.get(&change.peer).copied().unwrap_or(0) >= end
+                })
+                .min_by_key(|(index, _)| receipt_order[*index])
+                .map(|(index, _)| index)
+                .ok_or("Recovery change has no single verified signed owner")?;
+            attributions[owner].spans.as_mut().unwrap().push(span);
+        }
+        Ok(())
+    }
+}
+
+fn recovery_derived_drive(
+    store: &Db,
+    resource: &crate::Resource,
+    parent: &str,
+    candidate: Option<&str>,
+    property_root: &serde_json::Value,
+    members: &std::collections::HashSet<String>,
+    work: &mut usize,
+) -> AtomicResult<Option<String>> {
+    let identity = |value: &str| {
+        store
+            .normalize_subject(&crate::Subject::from_raw(
+                value,
+                store.get_base_domain().as_deref(),
+            ))
+            .pure_id()
+    };
+    let mut pending = vec![(parent.to_string(), 0usize)];
+    let mut scheduled = std::collections::HashMap::from([(identity(parent), 0usize)]);
+    while let Some((current, depth)) = pending.pop() {
+        let id = identity(&current);
+        crate::recovery::validate_explicit_dependencies(
+            store,
+            std::slice::from_ref(&current),
+            members,
+        )?;
+        if depth >= 32 || scheduled.get(&id).is_some_and(|best| *best < depth) {
+            continue;
+        }
+        RecoveryOperationProof::charge_work(work, 1)?;
+        let doc = match store.kv.get(Tree::LoroSnapshots, id.as_bytes())? {
+            Some(snapshot) => crate::recovery::strict_snapshot_doc(&snapshot)?,
+            None if !members.contains(&id) => {
+                let subject = crate::Subject::from_raw(&current, store.get_base_domain().as_deref());
+                store
+                    .get_resource_shallow(&store.normalize_subject(&subject))?
+                    .build_state_doc()?
+            }
+            None => return Err("Recovery native bookkeeping parent snapshot is missing".into()),
+        };
+        let mut ancestor = crate::Resource::new(current.clone());
+        ancestor.apply_state_doc(doc.fork_at(&doc.current_version())?)?;
+        let schema = doc.doc().export_json_updates_without_peer_compression(
+            &loro::VersionVector::default(),
+            &doc.oplog_vv(),
+        );
+        RecoveryOperationProof::charge_work(
+            work,
+            schema
+                .changes
+                .iter()
+                .map(|change| change.ops.len() + change.deps.len())
+                .sum(),
+        )?;
+        let mut versions = Vec::new();
+        for change in &schema.changes {
+            for op in &change.ops {
+                if let loro::JsonOpContent::Map(loro::JsonMapOp::Insert { key, .. }) = &op.content {
+                    if key == crate::urls::LAST_COMMIT
+                        && serde_json::to_value(&op.container)? == *property_root
+                    {
+                        versions.push(loro::ID::new(change.id.peer, op.counter));
+                    }
+                }
+            }
+        }
+        let version_work = schema
+            .changes
+            .iter()
+            .map(|change| change.ops.len() + change.deps.len())
+            .sum();
+        for version in std::iter::once(None).chain(versions.into_iter().map(Some)) {
+            RecoveryOperationProof::charge_work(work, version_work)?;
+            let historical;
+            let state = if let Some(version) = version {
+                let mut state = crate::Resource::new(current.clone());
+                state.apply_state_doc(doc.fork_at(
+                    &crate::loro::VersionID::from_frontiers(&loro::Frontiers::from_id(version)),
+                )?)?;
+                historical = state;
+                &historical
+            } else {
+                &ancestor
+            };
+            let derived = if let Ok(drive) = state.get(crate::urls::DRIVE_PROP) {
+                Some(drive.to_string())
+            } else if state.has_class(crate::urls::DRIVE) {
+                Some(current.clone())
+            } else if let Ok(parent) = state.get(crate::urls::PARENT) {
+                let parent = parent.to_string();
+                let parent_id = identity(&parent);
+                let next_depth = depth + 1;
+                if next_depth < 32
+                    && scheduled.get(&parent_id).is_none_or(|best| next_depth < *best)
+                {
+                    scheduled.insert(parent_id, next_depth);
+                    pending.push((parent, next_depth));
+                }
+                None
+            } else {
+                resource
+                    .get(crate::urls::DRIVE_PROP)
+                    .is_ok()
+                    .then(|| current.clone())
+            };
+            if let Some(derived) = derived {
+                if candidate.is_none_or(|value| identity(value) == identity(&derived)) {
+                    crate::recovery::validate_explicit_dependencies(
+                        store,
+                        std::slice::from_ref(&derived),
+                        members,
+                    )?;
+                    return Ok(Some(candidate.unwrap_or(&derived).to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn recovery_envelope_id(store: &Db, subject: &str) -> String {
+    store
+        .normalize_subject(&crate::Subject::from_raw(
+            subject,
+            store.get_base_domain().as_deref(),
+        ))
+        .pure_id()
+}
+
+pub(crate) async fn recovery_history_from_view(
+    store: &Db,
+    view: &dyn crate::db::kv_store::KvReadView,
+    subject: &str,
+    snapshot: &[u8],
+    envelope_limit: usize,
+    envelope_byte_limit: usize,
+    members: &std::collections::HashSet<String>,
+) -> AtomicResult<(RecoveryHistoryAttribution, Vec<StoredEnvelope>)> {
+    if store.envelope_retention() != EnvelopeRetention::All {
+        return Err("Recovery requires `all` envelope retention".into());
+    }
+
+    let pure = recovery_envelope_id(store, subject);
+    let stored_doc = crate::recovery::strict_snapshot_doc(snapshot)
+        .map_err(|error| format!("Recovery snapshot is invalid for {pure}: {error}"))?;
+    let envelopes = recovery_envelopes_from_view(
+        store,
+        view,
+        subject,
+        envelope_limit,
+        envelope_byte_limit,
+    )?;
+    if envelopes.is_empty() {
+        return Err(format!("Recovery history is missing for {pure}").into());
+    }
+
+    let mut attributions = Vec::with_capacity(envelopes.len());
+    let mut operation_proof = RecoveryOperationProof::new(&stored_doc, envelopes.len())?;
+    for envelope in &envelopes {
+        let local = crate::recovery::LocalRecoveryStore::new(store);
+        if envelope.subject != pure {
+            return Err("Recovery envelope subject does not match its key".into());
+        }
+        check_recovery_envelope_fields(store, &envelope.json)?;
+        let resource = crate::parse::parse_json_ad_commit_resource(&envelope.json, &local).await?;
+        let commit = crate::commit::Commit::from_resource(resource)?;
+        if recovery_envelope_id(store, commit.subject.as_str()) != pure
+            || commit.signature.as_deref() != Some(envelope.signature.as_str())
+            || commit.created_at != envelope.created_at
+        {
+            return Err("Recovery envelope metadata does not match its signed commit".into());
+        }
+        let signer = store.normalize_subject(&commit.signer);
+        if !commit.signer.is_agent_did()
+            && crate::agents::legacy_agent_pubkey(commit.signer.as_str()).is_none()
+            && signer.is_local()
+        {
+            store
+                .get_resource_shallow(&signer)
+                .map_err(|_| "Recovery signer profile is missing from the immutable view")?;
+        }
+        commit.validate_signature(&local).await?;
+        let is_genesis = commit.is_genesis == Some(true);
+        operation_proof.verify_update(store, members, &stored_doc, &commit)?;
+        attributions.push(Attribution {
+            signer: commit.signer.to_string(),
+            created_at: commit.created_at,
+            signature: envelope.signature.clone(),
+            commit_id: envelope.commit_id(),
+            verified: true,
+            tokens: Vec::new(),
+            destroy: commit.destroy.unwrap_or(false),
+            genesis: is_genesis,
+            spans: None,
+            server_spans: None,
+        });
+    }
+
+    if genesis_signature(&pure).is_none() || !attributions.iter().any(|entry| entry.genesis) {
+        return Err(format!("Recovery genesis history is incomplete for {pure}").into());
+    }
+    operation_proof.finish(store, members, subject, &stored_doc, &mut attributions)?;
+    let stored_tokens: Vec<String> = stored_doc
+        .get_history()
+        .into_iter()
+        .filter_map(|change| change.message)
+        .collect();
+    let complete = !attributions.is_empty()
+        && stored_tokens
+            .iter()
+            .filter(|token| !is_genesis_carrier(token, &attributions))
+            .all(|token| {
+                attributions
+                    .iter()
+                    .any(|entry| entry.verified && entry.tokens.contains(token))
+            });
+    if !complete {
+        return Err(format!("Recovery retained history is incomplete for {pure}").into());
+    }
+    Ok((
+        RecoveryHistoryAttribution {
+            retention: EnvelopeRetention::All.as_str(),
+            attributions,
+            complete,
+        },
+        envelopes,
+    ))
+}
+
+fn recovery_envelopes_from_view(
+    store: &Db,
+    view: &dyn crate::db::kv_store::KvReadView,
+    subject: &str,
+    limit: usize,
+    max_bytes: usize,
+) -> AtomicResult<Vec<StoredEnvelope>> {
+    let wanted = recovery_envelope_id(store, subject);
+    let rows = view.scan_prefix_bounded(Tree::Envelopes, &prefix(&wanted), limit, max_bytes)?;
+    let mut envelopes = Vec::with_capacity(rows.len().max(1));
+    for (key, value) in rows {
+        let envelope = decode(&key, value)
+            .ok_or_else(|| format!("Malformed retained recovery envelope for {wanted}"))?;
+        if envelope.subject != wanted {
+            return Err("Recovery envelope prefix and key subject disagree".into());
+        }
+        envelopes.push(envelope);
+    }
+    if envelopes.is_empty() {
+        if let Some(genesis) = genesis_envelope_from_row(store, subject) {
+            envelopes.push(genesis);
+        }
+    }
+    Ok(envelopes)
 }
 
 #[cfg(test)]

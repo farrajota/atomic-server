@@ -31,6 +31,8 @@ pub mod serve;
 pub mod vector_search;
 // #[cfg(feature = "search")]
 #[cfg(test)]
+pub mod recovery_cli;
+#[cfg(test)]
 mod tests;
 mod trace;
 // Force rebuild for blake3

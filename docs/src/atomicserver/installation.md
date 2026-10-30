@@ -427,6 +427,33 @@ floor has a lot to reclaim.
 
 Neither applies to the browser (OPFS) store or to a legacy sled store.
 
+
+## Native recovery
+
+Native recovery exports an explicit, revision-fenced selection with its original snapshots and retained signed history, then restores it into a separate offline database. It does not replace the JSON-AD `export` / `import` commands or ordinary sync.
+
+Before exporting, configure the source server with `--envelope-retention all`; the default `latest` policy does not retain enough history for native recovery. Send an authenticated signed-agent `POST /recovery/export` request with an explicit selection, for example:
+
+```json
+{
+  "version": 1,
+  "resources": [
+    { "subject": "did:ad:drive:…", "expected_last_commit": "did:ad:commit:…" },
+    { "subject": "did:ad:resource:…", "expected_last_commit": "did:ad:commit:…" }
+  ],
+  "allowed_drives": ["did:ad:drive:…"]
+}
+```
+
+The request is limited to 128 KiB and 256 selected resources. Every allowed Drive must itself be selected. Include required schema, property, class, signer, and parent/Drive support resources explicitly; recovery never fetches missing dependencies. The endpoint returns a sealed native bundle (maximum 16 MiB), not a JSON-AD import file. Selected File/blob payloads and incomplete history are refused. A resource's `expected_last_commit` must match the current revision.
+
+Restore only into a new disposable directory, using the server executable without starting the configured server store:
+
+```sh
+atomic-server recovery restore --bundle ./recovery.bundle --target-dir ./recovered-data
+```
+
+The bundle is validated before the target is created. The target must not already exist or be a symlink and must be outside configured data, config, and cache paths and existing active database directories. The command initializes a separate Redb store, preserves the original snapshots and signed envelopes without re-signing, then verifies the restored history before reporting success. A failure after target creation leaves that isolated directory in place for inspection; it never reports a partial restore as successful.
 ## AtomicServer CLI options / ENV vars
 
 (run `atomic-server --help` to see the latest options)

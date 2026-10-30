@@ -511,6 +511,10 @@ pub fn config_routes(app: &mut actix_web::web::ServiceConfig) {
             .to(handlers::vector_search::vector_search_query),
     );
     app.service(
+        web::resource("/recovery/export")
+            .route(web::post().to(handlers::recovery::handle_recovery_export)),
+    );
+    app.service(
         web::resource(ANY)
             .guard(guard::Method(Method::POST))
             .to(handlers::post_resource::handle_post_resource),

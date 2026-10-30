@@ -88,6 +88,8 @@ pub mod document_markdown;
 pub mod endpoints;
 #[cfg(feature = "db")]
 pub mod envelopes;
+#[cfg(feature = "db")]
+pub mod recovery;
 pub mod errors;
 pub mod expression;
 pub mod genesis;
@@ -148,3 +150,4 @@ pub use store::Store;
 pub use storelike::Storelike;
 pub use subject::{DidKind, Subject};
 pub use values::Value;
+
