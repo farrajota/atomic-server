@@ -65,12 +65,11 @@ jobs:
         working-directory: browser
         run: pnpm install --frozen-lockfile
 
-      # Match Dagger's real wasm-pack invocation and wasm_js target flags;
-      # wasm32-unknown-unknown output is copied into the production browser.
+      # Native tool bootstrap uses host flags; wasm/.cargo/config.toml supplies
+      # wasm_js flags only for the wasm32-unknown-unknown browser artifact.
       - name: Build locked browser WASM artifact
         working-directory: wasm
         run: |
-          export CARGO_ENCODED_RUSTFLAGS="$(printf '%s\037%s' '--cfg' 'getrandom_backend="wasm_js"')"
           cargo run --locked --quiet --package cargo-bin -- wasm-pack build --target web --out-dir pkg
           mkdir -p ../browser/data-browser/public/wasm
           cp pkg/atomic_wasm.js pkg/atomic_wasm_bg.wasm ../browser/data-browser/public/wasm/
