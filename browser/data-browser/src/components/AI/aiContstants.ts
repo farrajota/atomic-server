@@ -4,4 +4,7 @@ export enum AIProvider {
   Hosted = 'hosted',
   OpenRouter = 'openrouter',
   Ollama = 'ollama',
+  OpenAI = 'openai',
+  Anthropic = 'anthropic',
+  OpenAICompatible = 'openai-compatible',
 }

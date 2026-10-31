@@ -45,9 +45,15 @@ impl CompressedReadView {
             .map_err(|e| format!("Could not decompress a stored snapshot: {e:?}"))?;
         let commit_key = genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
         let row = self.inner.get(Tree::Resources, &commit_key)?
-            .ok_or_else(|| format!("The genesis commit a snapshot is stored against is missing for {}", String::from_utf8_lossy(key)))?;
+            .ok_or_else(|| {
+        format!(
+            "The genesis commit a snapshot is stored against is missing for {}",
+            String::from_utf8_lossy(key)
+        )
+    })?;
         let base = base_from_row(&row)
-            .ok_or_else(|| format!("Could not decode the genesis commit for {}", String::from_utf8_lossy(key)))?;
+            .ok_or_else(|| { format!("Could not decode the genesis commit for {}", String::from_utf8_lossy(key))
+        })?;
         rebuild_snapshot(&base, &delta)
     }
 
@@ -74,7 +80,12 @@ impl CompressedReadView {
             .map_err(|e| format!("Could not decompress bounded snapshot delta: {e:?}"))?;
         let commit_key = genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
         let row = self.inner.get_bounded(Tree::Resources, &commit_key, max_bytes)?
-            .ok_or_else(|| format!("The genesis commit a snapshot is stored against is missing for {}", String::from_utf8_lossy(key)))?;
+            .ok_or_else(|| {
+        format!(
+            "The genesis commit a snapshot is stored against is missing for {}",
+            String::from_utf8_lossy(key)
+        )
+    })?;
         let base = base_from_row_bounded(&row, max_bytes)?;
         let snapshot = rebuild_snapshot(&base, &delta)?;
         if snapshot.len() > max_bytes {
@@ -189,8 +200,9 @@ fn decode_bounded(value: Vec<u8>, max_bytes: usize) -> AtomicResult<Vec<u8>> {
     match value.get(1) {
         Some(&CODEC_RAW) if value.len().saturating_sub(2) <= max_bytes => Ok(value[2..].to_vec()),
         Some(&CODEC_RAW) => Err(format!("Read-view value exceeded byte limit {max_bytes}").into()),
-        Some(&CODEC_DEFLATE) => miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
-            .map_err(|e| format!("Could not decompress bounded value: {e:?}").into()),
+        Some(&CODEC_DEFLATE) => { miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
+            .map_err(|e| format!("Could not decompress bounded value: {e:?}").into())
+        }
         Some(&CODEC_SNAPSHOT_DELTA) => Err("A snapshot delta can only be read with its key".into()),
         other => Err(format!("Unknown storage codec {other:?}").into()),
     }
@@ -223,8 +235,10 @@ fn base_from_row_bounded(row: &[u8], max_bytes: usize) -> AtomicResult<Vec<u8>> 
     let row = decode_bounded(row.to_vec(), max_bytes)?;
     let mut propvals = super::encoding::decode_propvals(&row)?;
     match propvals.remove(crate::urls::LORO_UPDATE) {
-        Some(crate::Value::LoroDoc(bytes)) if !bytes.is_empty() && bytes.len() <= max_bytes => Ok(bytes),
-        Some(crate::Value::LoroDoc(_)) => Err(format!("Read-view genesis snapshot exceeded byte limit {max_bytes}").into()),
+        Some(crate::Value::LoroDoc(bytes)) if !bytes.is_empty() && bytes.len() <= max_bytes => { Ok(bytes)
+        }
+        Some(crate::Value::LoroDoc(_)) => { Err(format!("Read-view genesis snapshot exceeded byte limit {max_bytes}").into())
+        }
         _ => Err("The genesis commit has no stored Loro snapshot".into()),
     }
 }
@@ -408,6 +422,24 @@ impl KvStore for CompressedKv {
         } else {
             Ok(page)
         }
+    }
+
+    fn range_value_sizes(
+        &self,
+        tree: Tree,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: usize,
+    ) -> AtomicResult<Vec<(Vec<u8>, u64)>> {
+        if is_compressed_tree(tree) {
+            // Stored length is not the logical length: decode.
+            return Ok(self
+                .range_page(tree, start, end, limit)?
+                .into_iter()
+                .map(|(key, value)| (key, value.len() as u64))
+                .collect());
+        }
+        self.inner.range_value_sizes(tree, start, end, limit)
     }
 
     fn iter_tree(&self, tree: Tree) -> KvIter {

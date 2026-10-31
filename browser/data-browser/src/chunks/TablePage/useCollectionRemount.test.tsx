@@ -2,8 +2,13 @@
 // @wc-ignore-file
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
-import { afterEach, expect, it, vi } from 'vitest';
 import { Collection, Store } from '@tomic/lib';
+import type {
+  ClientDbQueryOpts,
+  ClientDbQueryResult,
+  ClientDbWorker,
+} from '@tomic/lib';
+import { afterEach, expect, it, vi } from 'vitest';
 // The hook under test comes from source, not from the package's built `dist`:
 // a `dist` built before this change (a cached build, a stale link) would make
 // the test fail for a reason that is not in the code it names.
@@ -41,6 +46,177 @@ const wait = (ms: number) =>
   act(async () => {
     await new Promise(r => setTimeout(r, ms));
   });
+
+function scopedClientDb(
+  membersByDrive: Record<string, string>,
+  calls: ClientDbQueryOpts[],
+): ClientDbWorker {
+  return {
+    isReady: true,
+    waitForReady: async () => true,
+    query: async (options: ClientDbQueryOpts): Promise<ClientDbQueryResult> => {
+      calls.push(options);
+      const subject = options.drive ? membersByDrive[options.drive] : undefined;
+
+      return subject
+        ? {
+            subjects: [subject],
+            resources: [
+              JSON.stringify({
+                '@id': subject,
+                ...(options.property === undefined
+                  ? {}
+                  : { [options.property]: options.value }),
+                [options.filters?.[0]?.property ?? 'https://x.test/type']:
+                  options.filters?.[0]?.value,
+              }),
+            ],
+            count: 1,
+          }
+        : { subjects: [], resources: [], count: 0 };
+    },
+  } as unknown as ClientDbWorker;
+}
+
+const memberFor = async (collection: Collection) => collection.getAllMembers();
+
+it('rebuilds for explicit drive changes and returns that drive’s member', async () => {
+  const store = newStore();
+  const calls: ClientDbQueryOpts[] = [];
+  store.setClientDb(
+    scopedClientDb(
+      {
+        'did:ad:drive:first': 'atomic:row:first',
+        'did:ad:drive:second': 'atomic:row:second',
+      },
+      calls,
+    ),
+  );
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(StoreContext.Provider, { value: store }, children);
+
+  const result = renderHook(
+    ({ drive }: { drive?: string }) =>
+      useCollection({
+        ...filter,
+        filters: [
+          { property: 'https://x.test/type', value: 'atomic:class:row' },
+        ],
+        drive,
+      }),
+    { initialProps: { drive: 'did:ad:drive:first' }, wrapper },
+  );
+  await waitFor(async () =>
+    expect(await memberFor(result.result.current.collection)).toEqual([
+      'atomic:row:first',
+    ]),
+  );
+
+  result.rerender({ drive: 'did:ad:drive:second' });
+  await waitFor(async () =>
+    expect(await memberFor(result.result.current.collection)).toEqual([
+      'atomic:row:second',
+    ]),
+  );
+  expect(calls.map(call => call.drive)).toContain('did:ad:drive:second');
+});
+
+it('does not reuse a remembered member across explicit drives', async () => {
+  const store = newStore();
+  const calls: ClientDbQueryOpts[] = [];
+  store.setClientDb(
+    scopedClientDb(
+      {
+        'did:ad:drive:first': 'atomic:row:first',
+        'did:ad:drive:second': 'atomic:row:second',
+      },
+      calls,
+    ),
+  );
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(StoreContext.Provider, { value: store }, children);
+
+  const first = renderHook(
+    () =>
+      useCollection({
+        ...filter,
+        filters: [
+          { property: 'https://x.test/type', value: 'atomic:class:row' },
+        ],
+        drive: 'did:ad:drive:first',
+      }),
+    { wrapper },
+  );
+  await waitFor(async () =>
+    expect(await memberFor(first.result.current.collection)).toEqual([
+      'atomic:row:first',
+    ]),
+  );
+  first.unmount();
+
+  const second = renderHook(
+    () =>
+      useCollection({
+        ...filter,
+        filters: [
+          { property: 'https://x.test/type', value: 'atomic:class:row' },
+        ],
+        drive: 'did:ad:drive:second',
+      }),
+    { wrapper },
+  );
+  // The second drive must not paint the first drive's remembered rows while reloading.
+  expect(second.result.current.collection.totalMembers).toBe(0);
+  await waitFor(async () =>
+    expect(await memberFor(second.result.current.collection)).toEqual([
+      'atomic:row:second',
+    ]),
+  );
+  expect(second.result.current.collection.totalMembers).toBe(1);
+  expect(calls.map(call => call.drive)).toContain('did:ad:drive:second');
+});
+
+it('rebuilds when an initially missing drive stamp becomes known', async () => {
+  const store = newStore();
+  store.setDrive('did:ad:drive:first');
+  const calls: ClientDbQueryOpts[] = [];
+  store.setClientDb(
+    scopedClientDb(
+      {
+        'did:ad:drive:first': 'atomic:row:first',
+        'did:ad:drive:second': 'atomic:row:second',
+      },
+      calls,
+    ),
+  );
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(StoreContext.Provider, { value: store }, children);
+  const initialProps: { drive: string | undefined } = { drive: undefined };
+  const result = renderHook(
+    ({ drive }: { drive?: string }) =>
+      useCollection({
+        ...filter,
+        filters: [
+          { property: 'https://x.test/type', value: 'atomic:class:row' },
+        ],
+        drive,
+      }),
+    { initialProps, wrapper },
+  );
+  await waitFor(async () =>
+    expect(await memberFor(result.result.current.collection)).toEqual([
+      'atomic:row:first',
+    ]),
+  );
+
+  result.rerender({ drive: 'did:ad:drive:second' });
+  await waitFor(async () =>
+    expect(await memberFor(result.result.current.collection)).toEqual([
+      'atomic:row:second',
+    ]),
+  );
+  expect(calls.map(call => call.drive)).toContain('did:ad:drive:second');
+});
 
 it('shows the last loaded rows at once when the same query remounts', async () => {
   const store = newStore();

@@ -88,8 +88,6 @@ pub mod document_markdown;
 pub mod endpoints;
 #[cfg(feature = "db")]
 pub mod envelopes;
-#[cfg(feature = "db")]
-pub mod recovery;
 pub mod errors;
 pub mod expression;
 pub mod genesis;
@@ -103,6 +101,8 @@ pub mod metrics;
 pub mod parse;
 #[cfg(feature = "db")]
 pub mod plugins;
+#[cfg(feature = "db")]
+pub mod recovery;
 pub mod website;
 
 pub mod lens;
@@ -124,6 +124,8 @@ pub mod subject;
 pub(crate) mod subject_lock;
 pub mod sync;
 pub mod test_utils;
+#[cfg(feature = "db")]
+pub mod trash;
 pub mod urls;
 pub mod utils;
 pub mod validate;
@@ -150,4 +152,3 @@ pub use store::Store;
 pub use storelike::Storelike;
 pub use subject::{DidKind, Subject};
 pub use values::Value;
-

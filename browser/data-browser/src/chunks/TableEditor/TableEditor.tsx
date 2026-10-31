@@ -228,7 +228,16 @@ function FancyTableInner<T>({
     setCursorMode(CursorMode.Visual);
   }, [disabledKeyboardInteractions, setCursorMode]);
 
-  useClickAwayListener([tableRef], handleClickOutside, true);
+  // Let the outside target receive native focus; exiting Edit mode still
+  // happens in the click-away callback, before the browser's default focus.
+  // Re-arm the one-shot listener for each edit or selection session.
+  useClickAwayListener(
+    [tableRef],
+    handleClickOutside,
+    cursorMode !== CursorMode.Visual,
+    ['mousedown'],
+    false,
+  );
 
   useAvailableHeight(tableRef, headerRef);
 
@@ -258,8 +267,8 @@ function FancyTableInner<T>({
   // fires before any input can `stopPropagation` or a native `popover=auto`
   // can run its own Escape dismiss. `preventDefault` cancels that native
   // dismiss so focus handling stays ours. Switching to Visual unmounts the
-  // editor; the `Edit -> Visual` layout effect above then focuses the table,
-  // after the unmount, so there's no focus race to fight.
+  // editor; the `Edit -> Visual` layout effect below returns focus if the grid
+  // still owns it or the unmount left focus on the document.
   const handleEscapeCapture = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
       if (
@@ -316,7 +325,18 @@ function FancyTableInner<T>({
       selectedRow !== undefined &&
       selectedColumn !== undefined
     ) {
-      tableRef.current?.focus({ preventScroll: true });
+      // A native outside click may focus its target before this edit-exit
+      // commit. Only return focus that still belongs to the grid or was lost
+      // when its editor unmounted; never take it from another focused widget.
+      const activeElement = document.activeElement;
+      const gridOwnsFocus = tableRef.current?.contains(activeElement) ?? false;
+      const focusWasLost =
+        activeElement === document.body ||
+        activeElement === document.documentElement;
+
+      if (gridOwnsFocus || focusWasLost) {
+        tableRef.current?.focus({ preventScroll: true });
+      }
     }
 
     previousCursorMode.current = cursorMode;
@@ -399,6 +419,7 @@ function FancyTableInner<T>({
             rowIndex={index}
             columnIndex={0}
             onExpand={onRowExpand}
+            isDraftRow={!readOnly && index === itemCount - 1}
             Extra={RowHeaderExtra}
             onContextMenu={e => onRowContextMenu?.(index, e)}
             RowHeaderAddonComponent={RowHeaderAddonComponent}
@@ -409,6 +430,7 @@ function FancyTableInner<T>({
           <Cell
             rowIndex={Infinity}
             columnIndex={Infinity}
+            ariaColumnIndex={columns.length + 2}
             disabled
             onContextMenu={e => onRowContextMenu?.(index, e)}
           />
@@ -417,7 +439,10 @@ function FancyTableInner<T>({
     },
     [
       children,
+      columns.length,
       onRowExpand,
+      itemCount,
+      readOnly,
       RowHeaderExtra,
       onRowContextMenu,
       RowHeaderAddonComponent,
@@ -563,6 +588,13 @@ const Table = styled.div.attrs<TableProps>(p => ({
   --table-height: 80vh;
   --table-row-height: ${p => p.rowHeight}px;
   --table-inner-padding: 0.5rem;
+  --table-index-width: 6.75rem;
+
+  /* No hover on touch, and a phone has no width to spare: the gutter shrinks
+     to the tick, the comment bubble and the number (see IndexCell). */
+  @media (hover: none) {
+    --table-index-width: 7rem;
+  }
   --table-content-height: ${p => p.totalContentHeight}px;
   background: ${p => p.theme.colors.bg};
   border-radius: ${p => p.theme.radius};

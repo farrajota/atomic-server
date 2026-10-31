@@ -5,6 +5,7 @@ import {
   commits,
   diffFork,
   forks,
+  getLoroBodySignature,
   unknownSubject,
   useResource,
   useValue,
@@ -68,6 +69,9 @@ export function ForkBar({ resource }: ForkBarProps): React.JSX.Element | null {
       oldResource: originalResource,
       newResource: resource,
       changedProps: changes.map(c => c.property),
+      bodyChanged:
+        getLoroBodySignature(originalResource.getLoroDoc()) !==
+        getLoroBodySignature(resource.getLoroDoc()),
     }),
     [originalResource, resource, changes],
   );

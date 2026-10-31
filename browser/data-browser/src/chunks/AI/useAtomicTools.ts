@@ -188,15 +188,16 @@ const derivedColumnSchema = z.object({
     .describe(
       "The heading of the computed column, e.g. 'Duration' or 'Days since'.",
     ),
-  kind: z
-    .enum(['difference', 'elapsed', 'daysSince', 'product', 'offset'])
+  formula: z
+    .string()
     .describe(
-      "The generator: 'difference' (to − from, a finished duration), 'elapsed' (until − from, ticking live while `until` is empty), 'daysSince' (whole days between a date and now), 'product' (a × b), 'offset' (a date plus a number of days, e.g. a next-due date).",
+      "A formula over this table's columns, each written as the lowercase slug of its name ('Last watered' is last_watered), e.g. `coalesce(end, now()) - start`, `quantity * price`, `days(now() - last_contact)`, `addDays(last_done, every_days)`, `daysUntilAnniversary(birthday) <= 14`. Functions: now(), coalesce(a, b), days(ms), addDays(ms, n), daysUntilAnniversary(date), min, max, if(test, a, b), math::floor. Dates are milliseconds; a row missing a column used in the formula has an empty cell. Integer arithmetic stays integer, so write 1.0/2, not 1/2. Read the table-formulas skill for more.",
     ),
-  args: z
-    .record(z.string(), z.union([z.string(), z.number()]))
+  valueKind: z
+    .enum(['duration', 'days', 'number', 'date', 'boolean'])
+    .optional()
     .describe(
-      "The generator's arguments, each naming a column of this table (or a literal number where a number makes sense, like a rate). 'difference': { from, to }. 'elapsed': { from, until }. 'daysSince': { from }. 'product': { a, b }. 'offset': { from, days }.",
+      "How the result is shown: 'duration' (milliseconds as a clock), 'days' (whole days since, '3d ago'), 'date' (a date in ms), 'boolean' (a comparison, shown as a check mark). A plain number when omitted.",
     ),
 });
 
@@ -573,7 +574,7 @@ export function useAtomicMCPTools({
               textQuery: text_query,
             }),
           ),
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.QUERY]: tool({
         description:
@@ -730,7 +731,7 @@ export function useAtomicMCPTools({
             return `Error finding schema: ${error}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.NAVIGATE_TO_RESOURCE]: tool({
         description: 'Navigates the user to a resource',
@@ -1080,7 +1081,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error configuring view: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.ADD_TABLE_COLUMNS]: tool({
         description:
@@ -1131,7 +1132,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error adding columns: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.CREATE_TABLE_FROM_TEMPLATE]: tool({
         description:
@@ -1200,7 +1201,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error creating table from template: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.CREATE_DASHBOARD]: tool({
         description:
@@ -1234,7 +1235,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error creating dashboard: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       [TOOL_NAMES.CONFIGURE_BLOCK]: tool({
         description:
@@ -1290,7 +1291,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error configuring block: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
       ...websiteWriteTools,
       [TOOL_NAMES.CREATE_APP]: tool({
@@ -1960,7 +1961,7 @@ NEVER omit spans of pre-existing text without using the \`<unchanged-text>\` ele
             return `Error creating table: ${err}`;
           }
         },
-        strict: true,
+        strict: false,
       }),
     },
   };

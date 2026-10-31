@@ -156,6 +156,7 @@ export function useCollection(
     String(!!queryFilterMemo.sort_desc),
     aggregationKey(queryFilterMemo.aggregation),
     expressionFiltersKey(queryFilterMemo.expression_filters),
+    queryFilterMemo.drive ?? '',
     String(pageSize),
     server ?? '',
     String(includeNested),
@@ -166,6 +167,7 @@ export function useCollection(
   // is state. They differ only while a remembered result is shown during the
   // background reload.
   const collectionRef = useRef<Collection | null>(null);
+  const collectionDriveRef = useRef(queryFilterMemo.drive);
   const [remembered] = useState(() =>
     lastReadyCollections.get(store)?.get(queryIdentity),
   );
@@ -218,6 +220,7 @@ export function useCollection(
 
     if (
       !col ||
+      collectionDriveRef.current !== queryFilterMemo.drive ||
       col.property !== queryFilterMemo.property ||
       col.value !== queryFilterMemo.value ||
       filtersKey(col.filters) !== filtersKey(queryFilterMemo.filters) ||
@@ -240,6 +243,7 @@ export function useCollection(
       );
       col = built.__internalObject;
       collectionRef.current = col;
+      collectionDriveRef.current = queryFilterMemo.drive;
     }
 
     let cancelled = false;

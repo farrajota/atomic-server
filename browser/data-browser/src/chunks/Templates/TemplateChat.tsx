@@ -8,6 +8,7 @@ import { ErrorBlock } from '../../components/ErrorLook';
 import { useAISettings } from '../../components/AI/AISettingsContext';
 import { useGetModel } from '../AI/useModel';
 import { selectGenerativeFeaturesModel } from '../AI/useGenerativeData';
+import { redactProviderError } from '../AI/providerModel';
 import { TEMPLATE_CATALOG } from './catalog';
 import type { TemplateDefinition } from './model';
 const ChatInput = lazy(() => import('../RTE/AIChatInput/AsyncAIChatInput'));
@@ -48,6 +49,12 @@ export default function TemplateChat({
 
   async function send() {
     if (request.current || !input.trim()) return;
+    const providerCredentials = [
+      settings.openRouterApiKey,
+      settings.openAIApiKey,
+      settings.anthropicApiKey,
+      settings.openAICompatibleApiKey,
+    ];
     const model = identifier ? getModel(identifier) : undefined;
 
     if (!model) {
@@ -87,7 +94,7 @@ export default function TemplateChat({
       setInput('');
       setComposer(value => value + 1);
     } catch (e) {
-      setError(e instanceof Error ? e : new Error(String(e)));
+      setError(new Error(redactProviderError(e, providerCredentials)));
     } finally {
       clearTimeout(timeout);
       request.current = undefined;

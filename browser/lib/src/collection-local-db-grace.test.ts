@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { Collection } from './collection.js';
 import { CollectionBuilder } from './collectionBuilder.js';
 import { Store } from './store.js';
 import { core } from './ontologies/core.js';
@@ -99,6 +100,37 @@ describe('a collection query and a local database that is not ready yet', () => 
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('queries server-authorized membership before WebSocket auth or local indexes are ready', async () => {
+    const query = vi.fn(async () => ({ subjects: [], count: 0 }));
+    const { store, requests } = setup({
+      isReady: false,
+      waitForReady: () => new Promise<boolean>(() => undefined),
+      query,
+    });
+    store.setServerConnected(false);
+
+    const drives = new Collection(
+      store,
+      HOME,
+      {
+        property: core.properties.isA,
+        value: 'https://atomicdata.dev/classes/Drive',
+        page_size: '100',
+        include_nested: false,
+      },
+      false,
+      { preferServer: true, serverOnly: true },
+    );
+
+    expect(await drives.getAllMembers()).toEqual([ROW]);
+    expect(query).not.toHaveBeenCalled();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].searchParams.get('property')).toBe(core.properties.isA);
+    expect(requests[0].searchParams.get('value')).toBe(
+      'https://atomicdata.dev/classes/Drive',
+    );
   });
 
   it('still uses the local database when it becomes ready inside the grace', async () => {

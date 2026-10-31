@@ -13,13 +13,14 @@ import {
   genesisSignerDid,
   privateDriveCert,
   privateDriveSubject,
+  aiChatsFolderCert,
   domainSeparatorNonce,
   PERSONAL_DRIVE_PURPOSE,
   GENESIS_VERSION_V1,
   GENESIS_VERSION_V2,
   type GenesisCert,
 } from './genesis.js';
-import { isAtomicIdentifier } from './subject.js';
+import { isAtomicIdentifier, toLegacyScheme } from './subject.js';
 
 const hex = (bytes: Uint8Array): string =>
   Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
@@ -175,6 +176,32 @@ describe('GenesisCert', () => {
 
     const other = await privateDriveSubject(new Uint8Array(32).fill(10));
     expect(other).not.toBe(first);
+  });
+});
+
+describe('AI Chats folder genesis certificate', () => {
+  it('keeps the signed AI Chats certificate bound to the original legacy drive bytes', async ({
+    expect,
+  }) => {
+    const seed = new Uint8Array(32).fill(7);
+    const drive = 'atomic:drive:folder-test';
+    const cert = aiChatsFolderCert(await getPublicKey(seed), drive);
+
+    expect(cert.createdAt).toBe(0);
+    expect(hex(cert.nonce)).toBe(
+      hex(domainSeparatorNonce('atomic-ai-chats-folder-v1')),
+    );
+    expect(cert.parent).toBe(toLegacyScheme(drive));
+    expect(cert.drive).toBe(toLegacyScheme(drive));
+    const bytes = encodeGenesisCert(cert);
+    const signature = await signGenesisCert(cert, seed);
+    expect(decodeGenesisCert(bytes)).toMatchObject({
+      createdAt: 0,
+      parent: toLegacyScheme(drive),
+      drive: toLegacyScheme(drive),
+    });
+    expect(subjectForSignature(signature)).toMatch(/^atomic:/);
+    expect(await verifyGenesisCert(cert, signature)).toBe(true);
   });
 });
 

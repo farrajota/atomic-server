@@ -213,8 +213,10 @@ export async function connectHostedDrive(
   },
   drive: string,
   persistServer: (url: string) => void,
+  isCurrent: () => boolean,
   lookupTimeoutMs = 8_000,
 ): Promise<boolean> {
+  if (!isCurrent()) return false;
   // Only race the read: a late lookup must never switch an already restored session.
   const origin = await withDeadline(
     resolveHostedDriveOrigin(drive),
@@ -222,7 +224,7 @@ export async function connectHostedDrive(
     undefined,
   );
 
-  if (!origin) return false;
+  if (!origin || !isCurrent()) return false;
 
   store.unregisterLocalOnlyDrive(drive);
   store.setServerUrl(origin);

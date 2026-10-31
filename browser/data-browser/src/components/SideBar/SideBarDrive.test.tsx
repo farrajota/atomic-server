@@ -35,6 +35,14 @@ vi.mock('@tomic/react', async importOriginal => ({
 vi.mock('../../helpers/AppSettings', () => ({
   useSettings: () => state.settings,
 }));
+vi.mock('../../hooks/useVisibleDriveChildren', () => ({
+  useVisibleDriveChildren: () => ({
+    subjects: [],
+    allSubjects: [],
+    loading: false,
+    total: 0,
+  }),
+}));
 vi.mock('../../helpers/useCurrentSubject', () => ({
   useCurrentSubject: () => [''],
 }));

@@ -75,7 +75,13 @@ async fn run_from_args(args: &[OsString]) -> AtomicServerResult<()> {
         .map_err(|error| format!("Invalid recovery command: {error}"))?;
     match cli.command {
         RecoveryCliCommand::Recovery(crate::config::RecoveryCommand::Restore(options)) => {
-            restore(&options.bundle, &options.target_dir, &protected).await
+            restore(
+                &options.bundle,
+                &options.target_dir,
+                &options.trusted_source_agent,
+                &protected,
+            )
+            .await
         }
     }
 }
@@ -110,7 +116,8 @@ fn protected_paths(args: &[OsString]) -> AtomicServerResult<Vec<PathBuf>> {
     let mut protected = Vec::new();
     let data_dir = directory_override(args, "--data-dir")
         .or_else(|| std::env::var_os("ATOMIC_DATA_DIR").map(PathBuf::from))
-        .or_else(|| project_dirs.as_ref().map(|dirs| dirs.data_dir().to_path_buf()))
+        .or_else(|| { project_dirs.as_ref().map(|dirs| dirs.data_dir().to_path_buf())
+        })
         .unwrap_or_else(|| PathBuf::from("atomic-data/data"));
     protected.push(data_dir);
     if let Some(config_dir) = directory_override(args, "--config-dir")
@@ -122,7 +129,8 @@ fn protected_paths(args: &[OsString]) -> AtomicServerResult<Vec<PathBuf>> {
     }
     if let Some(cache_dir) = directory_override(args, "--cache-dir")
         .or_else(|| std::env::var_os("ATOMIC_CACHE_DIR").map(PathBuf::from))
-        .or_else(|| project_dirs.as_ref().map(|dirs| dirs.cache_dir().to_path_buf()))
+        .or_else(|| { project_dirs.as_ref().map(|dirs| dirs.cache_dir().to_path_buf())
+        })
     {
         protected.push(cache_dir);
     }
@@ -148,10 +156,11 @@ fn directory_override(args: &[OsString], name: &str) -> Option<PathBuf> {
 pub async fn restore(
     bundle_path: &Path,
     requested_target: &Path,
+    trusted_source_agent: &str,
     protected: &[PathBuf],
 ) -> AtomicServerResult<()> {
     let bytes = read_bundle(bundle_path)?;
-    let bundle = atomic_lib::recovery::decode_bundle(&bytes)?;
+    let bundle = atomic_lib::recovery::decode_bundle(&bytes, trusted_source_agent)?;
     let target = create_fresh_target(requested_target, protected)?;
     let uploads = target.join("uploads");
     if let Err(error) = fs::create_dir(&uploads) {
@@ -193,7 +202,8 @@ pub async fn restore(
 
 fn read_bundle(path: &Path) -> AtomicServerResult<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("Could not inspect recovery bundle {}: {error}", path.display()))?;
+        .map_err(|error| { format!("Could not inspect recovery bundle {}: {error}", path.display())
+    })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("Recovery bundle input must be a regular non-symlink file".into());
     }
@@ -454,13 +464,43 @@ mod tests {
         let bundle = atomic_lib::recovery::export_bundle(
             &store,
             &request,
-            &ForAgent::AgentSubject(owner.subject),
+            &ForAgent::AgentSubject(owner.subject.clone()),
         )
         .await
         .unwrap();
         let bundle_path = temp.path().join("recovery.bundle");
         let target = temp.path().join("fresh-target");
         fs::write(&bundle_path, bundle).unwrap();
+        let missing_pin_target = temp.path().join("missing-source-pin-target");
+        let missing_pin_args = vec![
+            OsString::from("atomic-server"),
+            OsString::from("recovery"),
+            OsString::from("restore"),
+            OsString::from("--bundle"),
+            bundle_path.clone().into_os_string(),
+            OsString::from("--target-dir"),
+            missing_pin_target.clone().into_os_string(),
+        ];
+        let error = run_from_args(&missing_pin_args).await.unwrap_err();
+        assert!(error.to_string().contains("trusted-source-agent"), "{error}");
+        assert!(!missing_pin_target.exists());
+        let attacker = atomic_lib::agents::Agent::new(Some("Wrong recovery source pin")).unwrap();
+        let rejected_target = temp.path().join("wrong-source-target");
+        let rejected_args = vec![
+            OsString::from("atomic-server"),
+            OsString::from("recovery"),
+            OsString::from("restore"),
+            OsString::from("--bundle"),
+            bundle_path.clone().into_os_string(),
+            OsString::from("--target-dir"),
+            rejected_target.clone().into_os_string(),
+            OsString::from("--trusted-source-agent"),
+            OsString::from(attacker.subject.to_string()),
+        ];
+        let error = run_from_args(&rejected_args).await.unwrap_err();
+        assert!(error.to_string().contains("trusted source-agent pin"), "{error}");
+        assert!(!rejected_target.exists());
+
         let args = vec![
             OsString::from("atomic-server"),
             OsString::from("recovery"),
@@ -469,6 +509,8 @@ mod tests {
             bundle_path.into_os_string(),
             OsString::from("--target-dir"),
             target.clone().into_os_string(),
+            OsString::from("--trusted-source-agent"),
+            OsString::from(owner.subject.to_string()),
         ];
         run_from_args(&args).await.unwrap();
 

@@ -11,6 +11,10 @@ import {
 import { serializeDeterministically as serializePeerCommit } from './commit.js';
 import { taskSchema } from './task-schema.js';
 import {
+  sharedVocabularyOntologies,
+  sharedVocabularyProperties,
+} from './shared-vocabularies.js';
+import {
   mergeHistoryAttributions,
   parseHistoryAttribution,
   type HistoryAttribution,
@@ -43,12 +47,14 @@ import {
   isTransportError,
   LOCAL_ONLY_NOT_FOUND_MESSAGE,
   NOT_AVAILABLE_LOCALLY_MESSAGE,
+  NOT_AVAILABLE_SERVER_UNREACHABLE_MESSAGE,
 } from './error.js';
 import { EventManager } from './EventManager.js';
 import { hasBrowserAPI } from './hasBrowserAPI.js';
 import { collections } from './ontologies/collections.js';
 import { commits } from './ontologies/commits.js';
 import { core } from './ontologies/core.js';
+import * as trashOps from './trash.js';
 import { server, type Server } from './ontologies/server.js';
 import { notifications } from './ontologies/notifications.js';
 import { conversations } from './ontologies/conversations.js';
@@ -555,13 +561,15 @@ function isProxyWorthyError(error?: Error): boolean {
 export function isEmbeddedVocabulary(subject: string): boolean {
   return (
     embeddedVocabulary.has(subject) ||
-    subject === 'https://atomicdata.dev/task/v1'
+    subject === 'https://atomicdata.dev/task/v1' ||
+    (sharedVocabularyOntologies as readonly string[]).includes(subject)
   );
 }
 
 const embeddedVocabulary = new Set<string>([
   ...Object.values(taskSchema.properties),
   ...Object.values(taskSchema.tags),
+  ...sharedVocabularyProperties,
   // These classes ship in lib/defaults/plugins.json on every host. Their
   // public atomicdata.dev URLs are not published on the catalog yet.
   server.classes.plugin,
@@ -676,6 +684,9 @@ async function readDriveVersionVectors(
 
   return all;
 }
+
+/** How long a refused-drive lookup that found nothing is trusted. */
+const REFUSED_DRIVE_RETRY_MS = 30_000;
 
 export class Store {
   /** A list of all functions that need to be called when a certain resource is updated */
@@ -861,6 +872,12 @@ export class Store {
    * Driven by WebSocket open/close events. When false, commits are stored
    * locally and synced when the connection is restored.
    */
+  /** Pages of unsynced drives' collections the server has answered. Its
+   * members were written to the local DB as they loaded and live updates keep
+   * it current while connected, so the local answer is whole from then on.
+   * Cleared on reconnect, as what happened during a drop never arrived. Lives
+   * here so `collection.ts` needs no runtime import of the store. */
+  readonly collectionPagesAnsweredByServer = new Set<string>();
   private _serverConnected = false;
   private _serverConnectionError: string | undefined;
   private _driveSyncInProgress = false;
@@ -890,6 +907,13 @@ export class Store {
    *  local index populated for THIS drive" once more than one is in play —
    *  see `hasCompletedDriveSyncFor`. */
   private _syncedDrives = new Set<string>();
+  /** The last finished sync of each drive, by normalized subject. A member
+   *  device syncs several drives (its own plus the shared ones); a single
+   *  "last" slot would let any other drive's sync hide this one's. */
+  private _driveSyncs = new Map<
+    string,
+    { drive: string; count: number; timestamp: number }
+  >();
   private _commitLog: CommitLogEntry[] = [];
   /**
    * Commit-log entry id → that commit's `loroUpdate`, kept only while the
@@ -1000,6 +1024,7 @@ export class Store {
     }
 
     this.client = new Client(this.injectedFetch);
+    this.client.paceListener = ms => this.reportServerPace(ms);
 
     // Rehydrate the commit log from the outbox so the Sync page
     // shows what's queued instead of "No activity recorded" after
@@ -1202,6 +1227,11 @@ export class Store {
     this.localOnlyDrives.add(normalized);
   }
 
+  /** The drive a subject belongs to, for naming it to the person. */
+  public driveOfSubject(subject: string): string {
+    return this.driveOf(this.normalizeSubject(subject));
+  }
+
   /**
    * Whether the server in use refuses `drive` outright because it does not
    * host it: either a managed node's enrollment refusal or owner-mode refusal
@@ -1247,7 +1277,7 @@ export class Store {
     const normalized = this.normalizeSubject(drive);
     const agent = this.getAgent();
 
-    if (!agent) throw new Error('Sign in before disconnecting this workspace.');
+    if (!agent) throw new Error('Sign in before disconnecting this drive.');
 
     // The local database attaches a few hundred ms after boot and again after
     // every agent change, so a click inside that window found no database at
@@ -1306,7 +1336,7 @@ export class Store {
 
     if (!ws)
       throw new AtomicError(
-        'Connect to a server before disconnecting this workspace.',
+        'Connect to a server before disconnecting this drive.',
         ErrorType.Server,
       );
 
@@ -1411,7 +1441,7 @@ export class Store {
 
     if (!this._serverConnected) {
       throw new AtomicError(
-        'Connect to a server before syncing this workspace.',
+        'Connect to a server before syncing this drive.',
         ErrorType.Server,
       );
     }
@@ -1449,7 +1479,7 @@ export class Store {
 
     if (!ws || !db) {
       throw new AtomicError(
-        'Connect to a server before syncing this workspace.',
+        'Connect to a server before syncing this drive.',
         ErrorType.Server,
       );
     }
@@ -1458,7 +1488,7 @@ export class Store {
     this.subscribeWebSocket(normalized);
 
     const deadline = Date.now() + timeoutMs;
-    let lastProblem = 'The server has not received this workspace yet.';
+    let lastProblem = 'The server has not received this drive yet.';
 
     while (Date.now() < deadline) {
       await ws.resyncDrive(normalized);
@@ -1474,7 +1504,7 @@ export class Store {
         const remoteBySubject = new Map(remote.map(i => [i.subject, i.vv]));
 
         if (!remoteBySubject.has(drive)) {
-          lastProblem = 'The server is still missing this workspace root.';
+          lastProblem = 'The server is still missing this drive root.';
         } else {
           const missing = Object.entries(local).filter(([subject, vv]) => {
             const have = remoteBySubject.get(subject);
@@ -1499,7 +1529,7 @@ export class Store {
     }
 
     throw new AtomicError(
-      `Cloud Server did not finish receiving this workspace. ${lastProblem}`,
+      `Cloud Server did not finish receiving this drive. ${lastProblem}`,
       ErrorType.Server,
     );
   }
@@ -2643,6 +2673,33 @@ export class Store {
   /** Resolve a (possibly aliased) subject to its cached Resource. */
   private getResolved(subject: string): Resource | undefined {
     return this.resources.get(this.resolveSubject(subject));
+  }
+
+  /**
+   * One HTTP GET for a subject whose socket is down. `answered`: the server
+   * replied (with the resource or a real error such as 404/401, which stays on
+   * the resource). `unreachable`: the request failed in transport. `skipped`:
+   * it was cancelled or threw, so nothing is known about the server.
+   */
+  private async fetchOverHttpOnce(
+    subject: string,
+    opts: FetchOpts,
+  ): Promise<'answered' | 'unreachable' | 'skipped'> {
+    try {
+      await this.fetchResourceFromServer(subject, {
+        ...opts,
+        noWebSocket: true,
+      });
+    } catch (e) {
+      return isTransportError(e) ? 'unreachable' : 'skipped';
+    }
+
+    const got = this.getResolved(subject);
+
+    if (!got || got.loading) return 'skipped';
+    if (!got.error) return 'answered';
+
+    return isTransportError(got.error) ? 'unreachable' : 'answered';
   }
 
   /** Mark a resource as errored + not-loading + notify. No-op if
@@ -4025,6 +4082,7 @@ export class Store {
                 limit,
                 parents: parentScope,
                 filters: opts.filters,
+                includeTrashed: opts.includeTrashed,
               }),
             )
             .then(hits => {
@@ -4731,13 +4789,28 @@ export class Store {
             if (hasLocalData) return;
 
             if (!alreadyResolved) {
-              this.failResource(
-                subject,
-                new AtomicError(
-                  NOT_AVAILABLE_LOCALLY_MESSAGE,
-                  ErrorType.Transport,
-                ),
-              );
+              // The socket is down, the server may not be: ask once over
+              // plain HTTP before giving up. A hard failure of that request
+              // is the only thing that may be reported as "unreachable".
+              // Not when the origin is known to run no node: it would answer
+              // with its index.html, logged as an unparseable resource.
+              const reason =
+                isAtomicIdentifier(subject) &&
+                this.serverUrlWithoutSocket === this.serverUrl
+                  ? 'skipped'
+                  : await this.fetchOverHttpOnce(subject, opts);
+
+              if (reason !== 'answered') {
+                this.failResource(
+                  subject,
+                  new AtomicError(
+                    reason === 'unreachable'
+                      ? NOT_AVAILABLE_SERVER_UNREACHABLE_MESSAGE
+                      : NOT_AVAILABLE_LOCALLY_MESSAGE,
+                    ErrorType.Transport,
+                  ),
+                );
+              }
             }
           }
         }
@@ -5730,9 +5803,15 @@ export class Store {
 
   private refusedDriveHandler: RefusedDriveHandler | undefined;
 
-  /** One attempt per drive per session, so a failing drive is not looked up
-   *  again by every entry that fails for it. */
-  private _refusedDriveAttempts = new Map<string, Promise<boolean>>();
+  /** One attempt per drive, so a failing drive is not looked up again by
+   *  every entry that fails for it. A `true` result and an attempt in flight
+   *  stay for the session; a `false` ("could not find out", often because the
+   *  portal session or drive is not ready yet) expires after
+   *  {@link REFUSED_DRIVE_RETRY_MS}, so a later refusal asks again. */
+  private _refusedDriveAttempts = new Map<
+    string,
+    { promise: Promise<boolean>; resolvedFalseAt?: number }
+  >();
 
   /**
    * Register how the app resolves a drive the server refuses as "not
@@ -5767,21 +5846,34 @@ export class Store {
     const key = this.normalizeSubject(drive);
     const existing = this._refusedDriveAttempts.get(key);
 
-    if (existing) return existing;
+    if (
+      existing &&
+      (existing.resolvedFalseAt === undefined ||
+        Date.now() - existing.resolvedFalseAt < REFUSED_DRIVE_RETRY_MS)
+    ) {
+      return existing.promise;
+    }
 
     const handler = this.refusedDriveHandler;
-    const attempt = (async () => {
+    const entry: { promise: Promise<boolean>; resolvedFalseAt?: number } = {
+      promise: Promise.resolve(false),
+    };
+    entry.promise = (async () => {
+      let healed = false;
+
       try {
-        return !!(await handler?.(drive, message));
+        healed = !!(await handler?.(drive, message));
       } catch (e) {
         console.warn('[Store] refused drive handler failed:', e);
-
-        return false;
       }
-    })();
-    this._refusedDriveAttempts.set(key, attempt);
 
-    return attempt;
+      if (!healed) entry.resolvedFalseAt = Date.now();
+
+      return healed;
+    })();
+    this._refusedDriveAttempts.set(key, entry);
+
+    return entry.promise;
   }
 
   /**
@@ -5800,7 +5892,17 @@ export class Store {
       const drive =
         named ?? this.driveOf(this.normalizeSubject(subject)) ?? subject;
 
-      if (this._notifiedRefusedDrives.has(drive)) return;
+      if (this._notifiedRefusedDrives.has(drive)) {
+        // Already reported, but a lookup that found nothing may be retried
+        // (healRefusedDrive decides); a drive it resolves stops refusing.
+        if (named && this.refusedDriveHandler) {
+          void this.healRefusedDrive(named, message).catch(e =>
+            console.warn('[Store] could not retry refused drive:', e),
+          );
+        }
+
+        return;
+      }
 
       this._notifiedRefusedDrives.add(drive);
       const ownerModeRefusal = message.includes(
@@ -5810,9 +5912,11 @@ export class Store {
       if (ownerModeRefusal) {
         this.notifyError(
           new Error(
-            `This server does not host this workspace (${message.trim()}) ` +
+            `This server does not host this drive (${message.trim()}) ` +
               `Your changes are kept on this device and are not being sent. ` +
-              `Sign in with an existing identity to use a workspace hosted here.`,
+              `Sign in with an existing identity to use a workspace hosted here. ` +
+              `Otherwise ask the server's operator to enrol the drive, or turn ` +
+              `on browser-only sync for it in the sync settings.`,
           ),
         );
 
@@ -5855,8 +5959,8 @@ export class Store {
       this.notifyError(
         new Error(
           `Some changes could not be sent: the server does not have the ` +
-            `workspace they belong to (${drive.slice(0, 40)}…). They are ` +
-            `kept on this device and are not being retried. Once the workspace ` +
+            `drive they belong to (${drive.slice(0, 40)}…). They are ` +
+            `kept on this device and are not being retried. Once the drive ` +
             `is back on the server, syncing it sends them; if it is gone, ` +
             `discard them on the Sync page.`,
         ),
@@ -5907,6 +6011,10 @@ export class Store {
 
     this._serverConnected = connected;
     this._serverConnectionError = nextError;
+
+    if (connected) {
+      this.collectionPagesAnsweredByServer.clear();
+    }
 
     if (!connected) {
       this._driveSyncInProgress = false;
@@ -6067,6 +6175,11 @@ export class Store {
 
     if (drive) {
       this._syncedDrives.add(drive);
+      this._driveSyncs.set(this.normalizeSubject(drive), {
+        drive,
+        count,
+        timestamp,
+      });
 
       if (this._lastDriveSyncError?.drive === drive) {
         this._lastDriveSyncError = undefined;
@@ -6185,10 +6298,35 @@ export class Store {
     this._driveSyncPulling = true;
   }
 
+  /** The finished sync of the open drive when there is one, else the most
+   *  recent finished sync of any drive. */
+  private currentDriveSyncRecord() {
+    const own = this.drive
+      ? this._driveSyncs.get(this.normalizeSubject(this.drive))
+      : undefined;
+
+    return own ? { ...own, drive: this.drive! } : this._lastDriveSync;
+  }
+
   public hasCompletedDriveSyncFor(drive: string | undefined): boolean {
     if (!drive) return false;
 
     return this._syncedDrives.has(drive);
+  }
+
+  /**
+   * Calls `callback` once, when a sync of `drive` finishes. Returns a function
+   * that cancels the wait. Does not fire for a sync that has already finished.
+   */
+  public onceDriveSynced(drive: string, callback: () => void): () => void {
+    const off = this.on(StoreEvents.SyncStatusChanged, () => {
+      if (!this.hasCompletedDriveSyncFor(drive)) return;
+
+      off();
+      callback();
+    });
+
+    return off;
   }
 
   public getSyncStatus(): StoreSyncStatus {
@@ -6226,9 +6364,44 @@ export class Store {
       clientDbReady: this.clientDb?.isReady ?? false,
       clientDbAttached: !!this.clientDb,
       clientDbError: this.clientDb?.initError?.message,
-      lastDriveSync: this._lastDriveSync,
+      lastDriveSync: this.currentDriveSyncRecord(),
       lastDriveSyncError: this._lastDriveSyncError,
     };
+  }
+
+  /** The drive's Trash folder if the store already knows it. Never fetches. */
+  public peekTrashFolder(drive: string | undefined): string | undefined {
+    return trashOps.peekTrashFolder(this, drive);
+  }
+
+  /** The drive's Trash folder, created on first use. */
+  public getOrCreateTrashFolder(drive: string): Promise<string> {
+    return trashOps.getOrCreateTrashFolder(this, drive);
+  }
+
+  /**
+   * Parks a resource in the drive's Trash and remembers its old parent.
+   * Throws for content-addressed properties; false when nothing was done.
+   */
+  public trash(subject: string, drive: string): Promise<boolean> {
+    return trashOps.moveToTrash(this, subject, drive);
+  }
+
+  /** Moves a trashed resource back to where it came from (or the drive root). */
+  public restore(subject: string, drive: string): Promise<void> {
+    return trashOps.restoreFromTrash(this, subject, drive);
+  }
+
+  /**
+   * Whether a resource is in the drive's Trash: directly, or with `deep` also
+   * under a trashed ancestor (only already-loaded ancestors are read).
+   */
+  public isTrashed(
+    subjectOrResource: string | Resource,
+    drive: string | undefined,
+    opts?: trashOps.IsTrashedOptions,
+  ): boolean {
+    return trashOps.isTrashed(this, subjectOrResource, drive, opts);
   }
 
   public async notifyResourceSaved(resource: Resource): Promise<void> {
@@ -7971,6 +8144,16 @@ export class Store {
     return createdSubjects;
   }
 
+  /**
+   * @Internal
+   * The server's write-load hint (`pace_ms` of a `COMMIT_OK`, or the
+   * `X-Atomic-Pace-Ms` header): the outbox spaces the commits of one
+   * resource at least that far apart, so each carries more edits.
+   */
+  public reportServerPace(paceMs: number): void {
+    this.outbox.setServerPace(paceMs);
+  }
+
   /** Posts a Commit to some endpoint. Returns the Commit created by the server. */
   public async postCommit(commit: Commit, endpoint: string): Promise<Commit> {
     const close = perfSpan('store.postCommit', {
@@ -7979,6 +8162,7 @@ export class Store {
 
     try {
       const created = await this.sendCommit(commit, endpoint);
+      this.outbox.noteCommitted(commit.subject);
       close('ok');
       this.pushCommitLog(
         this.buildCommitLogEntry(commit, 'outgoing', 'sent', {
@@ -8029,6 +8213,12 @@ export class Store {
           isUnrecoverableCommitError(message, code) ||
           isTerminalCommitError(message, code)
         ) {
+          throw e;
+        }
+
+        // "Busy, come back later" is an answer too. HTTP would hit the same
+        // overloaded node, so the outbox waits instead.
+        if (e instanceof AtomicError && e.retryAfterMs !== undefined) {
           throw e;
         }
 

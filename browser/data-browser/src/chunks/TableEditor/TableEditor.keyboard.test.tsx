@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 // @wc-ignore-file
 import { useMemo, useState, type JSX } from 'react';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ThemeProvider, type DefaultTheme } from 'styled-components';
 import { FancyTable } from './TableEditor';
 import { Cell } from './Cell';
@@ -13,7 +14,13 @@ import { useCellOptions } from './hooks/useCellOptions';
 vi.mock('./DndWrapper', () => ({
   DndWrapper: ({ children }: { children: React.ReactNode }) => children,
 }));
-vi.mock('./TableHeader', () => ({ TableHeader: () => <div role='row' /> }));
+vi.mock('./TableHeader', () => ({
+  TableHeader: ({ columns }: { columns: string[] }) => (
+    <div role='row'>
+      <div role='columnheader' aria-colindex={columns.length + 2} />
+    </div>
+  ),
+}));
 // jsdom has no layout, so the grid's height probe would hand react-window a
 // zero-height viewport and no row would render.
 vi.mock('react-virtualized-auto-sizer', () => ({
@@ -51,6 +58,7 @@ function TestCell({
   ownsEscape,
   dropsFocusOnClose,
 }: TestCellProps): JSX.Element {
+  const [value, setValue] = useState(`row ${rowIndex}`);
   const { cursorMode, selectedRow, selectedColumn } = useTableEditorContext();
   const isEditing =
     cursorMode === CursorMode.Edit &&
@@ -66,10 +74,15 @@ function TestCell({
             dropsFocusOnClose={!!dropsFocusOnClose}
           />
         ) : (
-          <input aria-label={`edit row ${rowIndex}`} autoFocus />
+          <input
+            aria-label={`edit row ${rowIndex}`}
+            autoFocus
+            value={value}
+            onChange={event => setValue(event.currentTarget.value)}
+          />
         )
       ) : (
-        `row ${rowIndex}`
+        value
       )}
     </Cell>
   );
@@ -129,23 +142,29 @@ function SurfaceEditor({
   );
 }
 
-function renderGrid(cellProps: Omit<TestCellProps, 'rowIndex'> = {}) {
+function renderGrid(
+  cellProps: Omit<TestCellProps, 'rowIndex'> = {},
+  outside?: JSX.Element,
+) {
   const onSelectedCellChange = vi.fn();
 
   render(
-    <ThemeProvider theme={theme}>
-      <FancyTable
-        columns={['name']}
-        itemCount={ROW_COUNT}
-        columnToKey={String}
-        labelledBy='table-title'
-        onSelectedCellChange={onSelectedCellChange}
-        HeadingComponent={() => <></>}
-        NewColumnButtonComponent={() => null}
-      >
-        {({ index }) => <TestCell rowIndex={index} {...cellProps} />}
-      </FancyTable>
-    </ThemeProvider>,
+    <>
+      {outside}
+      <ThemeProvider theme={theme}>
+        <FancyTable
+          columns={['name']}
+          itemCount={ROW_COUNT}
+          columnToKey={String}
+          labelledBy='table-title'
+          onSelectedCellChange={onSelectedCellChange}
+          HeadingComponent={() => <></>}
+          NewColumnButtonComponent={() => null}
+        >
+          {({ index }) => <TestCell rowIndex={index} {...cellProps} />}
+        </FancyTable>
+      </ThemeProvider>
+    </>,
   );
 
   return { onSelectedCellChange };
@@ -192,6 +211,77 @@ beforeAll(() => {
 });
 
 afterEach(cleanup);
+it('exposes finite in-range column indices for every gridcell and aligns the trailing filler with the last header', () => {
+  renderGrid();
+
+  const grid = screen.getByRole('grid');
+  const columnCount = Number(grid.getAttribute('aria-colcount'));
+  const gridcells = Array.from(grid.querySelectorAll('[role="gridcell"]'));
+  const lastHeader = grid.querySelector('[role="columnheader"]');
+  const trailingFiller = grid.querySelector(
+    '[role="rowgroup"] [role="row"] > [role="gridcell"]:last-child',
+  );
+
+  expect(gridcells.length).toBeGreaterThan(0);
+
+  for (const gridcell of gridcells) {
+    const columnIndex = Number(gridcell.getAttribute('aria-colindex'));
+    expect(Number.isFinite(columnIndex)).toBe(true);
+    expect(columnIndex).toBeGreaterThan(0);
+    expect(columnIndex).toBeLessThanOrEqual(columnCount);
+  }
+
+  expect(lastHeader).not.toBeNull();
+  expect(trailingFiller).not.toBeNull();
+  expect(trailingFiller?.getAttribute('aria-colindex')).toBe(
+    lastHeader?.getAttribute('aria-colindex'),
+  );
+});
+
+it('focuses an outside search input on the first click after entering edit mode', async () => {
+  const user = userEvent.setup();
+  renderGrid({}, <input aria-label='Find rows' />);
+  const search = screen.getByLabelText('Find rows') as HTMLInputElement;
+
+  const cell = getCell(0);
+  fireEvent.mouseDown(cell);
+  fireEvent.click(cell);
+  fireEvent.keyDown(cell, { key: 'Enter' });
+  expect(screen.getByLabelText('edit row 0')).toBeTruthy();
+
+  await user.click(search);
+  await user.keyboard('needle');
+
+  expect(document.activeElement).toBe(search);
+  expect(search.value).toBe('needle');
+  expect(cell.textContent).toBe('row 0');
+});
+
+it('continues exiting edit mode on repeated outside clicks', async () => {
+  const user = userEvent.setup();
+  renderGrid(
+    {},
+    <>
+      <button aria-label='first outside target' />
+      <button aria-label='second outside target' />
+    </>,
+  );
+  const cell = getCell(0);
+
+  const enterEditMode = () => {
+    fireEvent.mouseDown(cell);
+    fireEvent.click(cell);
+    fireEvent.keyDown(cell, { key: 'Enter' });
+  };
+
+  enterEditMode();
+  await user.click(screen.getByLabelText('first outside target'));
+  expect(screen.queryByLabelText('edit row 0')).toBeNull();
+
+  enterEditMode();
+  await user.click(screen.getByLabelText('second outside target'));
+  expect(screen.queryByLabelText('edit row 0')).toBeNull();
+});
 
 describe('keyboard navigation after leaving edit mode', () => {
   it('moves the cursor after Escape from a plain cell editor', () => {

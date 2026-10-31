@@ -5,6 +5,7 @@ import { AIProvider } from '@components/AI/aiContstants';
 import { useAISettings } from '@components/AI/AISettingsContext';
 import type { LanguageModel } from 'ai';
 import { createHostedModel } from './hostedModel';
+import { createProviderModel } from './providerModel';
 
 const createOpenRouterProvider = (openRouterApiKey: string, zdr: boolean) => {
   return createOpenRouter({
@@ -26,16 +27,39 @@ const createOllamaProvider = (ollamaUrl: string) => {
 export function useGetModel(): (
   identifier: AIModelIdentifier,
 ) => LanguageModel | undefined {
-  const { openRouterApiKey, ollamaUrl, isProviderAvailable, openRouterZdr } =
-    useAISettings();
+  const {
+    openRouterApiKey,
+    ollamaUrl,
+    isProviderAvailable,
+    openRouterZdr,
+    openAIApiKey,
+    anthropicApiKey,
+    openAICompatibleApiKey,
+    openAICompatibleBaseURL,
+  } = useAISettings();
 
   return (identifier: AIModelIdentifier): LanguageModel | undefined => {
-    if (!isProviderAvailable(identifier.provider)) {
+    const directProvider =
+      identifier.provider === AIProvider.OpenAI ||
+      identifier.provider === AIProvider.Anthropic ||
+      identifier.provider === AIProvider.OpenAICompatible;
+
+    if (!directProvider && !isProviderAvailable(identifier.provider)) {
       return undefined;
     }
 
-    if (identifier.provider === AIProvider.Hosted)
+    if (directProvider) {
+      return createProviderModel(identifier, {
+        openAIApiKey,
+        anthropicApiKey,
+        openAICompatibleApiKey,
+        openAICompatibleBaseURL,
+      });
+    }
+
+    if (identifier.provider === AIProvider.Hosted) {
       return createHostedModel(identifier.id);
+    }
 
     if (identifier.provider === AIProvider.OpenRouter) {
       if (!openRouterApiKey) {

@@ -1,9 +1,9 @@
+import { useEffect, useState } from 'react';
 import { driveDisplayName } from '../../helpers/driveDisplayName';
 import { canonicalizeScheme } from '@tomic/lib';
 import styled from 'styled-components';
-import { useAccountDriveCatalog } from '../../hooks/useAccountDriveCatalog';
-import { useDriveHostingStates } from '../../hooks/useDriveHostingStates';
-import { Resource, core, server, useResources } from '@tomic/react';
+import { Resource, core, server, useResources, useStore } from '@tomic/react';
+import { findAccessibleDrives } from '../../helpers/driveData';
 import {
   FaCaretDown,
   FaGear,
@@ -13,11 +13,15 @@ import {
   FaRegCircle,
   FaCloud,
 } from 'react-icons/fa6';
+import { LuChevronsUpDown } from 'react-icons/lu';
 import { useSettings } from '../../helpers/AppSettings';
 import { constructOpenURL } from '../../helpers/navigation';
 import { useDriveHistory } from '../../hooks/useDriveHistory';
+import { useDriveVisits } from '../../hooks/useDriveVisits';
 import { useSavedDrives } from '../../hooks/useSavedDrives';
 import { usePrivateDrive } from '../../hooks/usePrivateDrive';
+import { useDriveHostingStates } from '../../hooks/useDriveHostingStates';
+import { useAccountDriveCatalog } from '../../hooks/useAccountDriveCatalog';
 import { paths } from '../../routes/paths';
 import { type DropdownItem, DIVIDER, DropdownMenu } from '../Dropdown';
 import { buildDefaultTrigger } from '../Dropdown/DefaultTrigger';
@@ -25,7 +29,15 @@ import type { DropdownTriggerComponent } from '../Dropdown/DropdownTrigger';
 import { useNewResourceUI } from '../forms/NewForm/useNewResourceUI';
 import { useNavigateWithTransition } from '../../hooks/useNavigateWithTransition';
 
+const MAX_SHOWN_DRIVES = 10;
+
 const DefaultTrigger = buildDefaultTrigger(<FaCaretDown />, 'Switch Drive');
+
+/** Up/down chevron trigger, for placing the switcher next to a drive title. */
+export const DriveSwitcherChevronTrigger = buildDefaultTrigger(
+  <LuChevronsUpDown />,
+  'Switch Drive',
+);
 
 function getTitle(resource: Resource): string {
   return driveDisplayName(
@@ -35,8 +47,8 @@ function getTitle(resource: Resource): string {
 }
 
 /**
- * Quick-switch between the user's drives: private drive, My drives,
- * recently visited. Managing the lists lives on the User Settings page.
+ * Quick-switch between the user's drives: private drive plus the 10 most recently
+ * visited drives. The full lists live on the User Settings page.
  */
 export function DriveSwitcher({
   Trigger = DefaultTrigger,
@@ -52,6 +64,46 @@ export function DriveSwitcher({
   const { privateDrive } = usePrivateDrive();
   const [savedDrives] = useSavedDrives();
   const [history, addToHistory] = useDriveHistory(savedDrives, 5);
+  const store = useStore();
+  const [accessibleDriveSnapshot, setAccessibleDriveSnapshot] = useState<{
+    agent: string;
+    subjects: string[];
+  } | null>(null);
+  const accessibleDrives =
+    accessibleDriveSnapshot !== null &&
+    accessibleDriveSnapshot.agent === agent?.subject &&
+    store.getAgent()?.subject === agent?.subject
+      ? accessibleDriveSnapshot.subjects
+      : [];
+  useEffect(() => {
+    let cancelled = false;
+    const subject = agent?.subject;
+
+    if (!subject || store.getAgent()?.subject !== subject) {
+      setAccessibleDriveSnapshot(null);
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void findAccessibleDrives(store)
+      .then(subjects => {
+        if (!cancelled && store.getAgent()?.subject === subject) {
+          setAccessibleDriveSnapshot({ agent: subject, subjects });
+        }
+      })
+      .catch(error => {
+        if (!cancelled && store.getAgent()?.subject === subject) {
+          console.warn('Could not discover accessible Drives:', error);
+          setAccessibleDriveSnapshot({ agent: subject, subjects: [] });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [store, agent?.subject]);
 
   // The private drive leads the menu; keep it out of the lists below.
   const catalog = useAccountDriveCatalog(
@@ -70,13 +122,44 @@ export function DriveSwitcher({
       !catalog.removed.some(removed => same(subject, removed)) &&
       !myDrives.some(mine => same(subject, mine)),
   );
+  const otherAccessibleDrives = accessibleDrives.filter(
+    subject =>
+      !same(subject, privateDrive) &&
+      !savedDrives.some(saved => same(subject, saved)) &&
+      !recentDrives.some(recent => same(subject, recent)) &&
+      !catalog.removed.some(removed => same(subject, removed)),
+  );
 
-  const myDrivesMap = useResources(savedDrives);
-  const recentDrivesMap = useResources(recentDrives);
+  const accessibleDriveMap = useResources(otherAccessibleDrives);
+
+  const [driveVisits, recordVisit] = useDriveVisits();
+
+  // Record a visit whenever the active drive changes (also via links).
+  useEffect(() => {
+    if (drive) recordVisit(drive);
+  }, [drive, recordVisit]);
+
+  // One list: saved + recent drives, deduped, most recently visited first,
+  // never visited ones after in their original order.
+  const merged: string[] = [];
+
+  for (const subject of [...myDrives, ...recentDrives]) {
+    if (!merged.some(m => same(subject, m))) merged.push(subject);
+  }
+
+  const visitTime = (subject: string) =>
+    driveVisits[canonicalizeScheme(subject)] ?? 0;
+  // Array.prototype.sort is stable, so ties keep their original order.
+  const shownDrives = merged
+    .sort((a, b) => visitTime(b) - visitTime(a))
+    .slice(0, MAX_SHOWN_DRIVES);
+
+  const shownDrivesMap = useResources(shownDrives);
 
   const switchTo = (subject: string) => {
     setDrive(subject);
     addToHistory(subject);
+    recordVisit(subject);
     navigate(constructOpenURL(subject));
   };
 
@@ -97,8 +180,8 @@ export function DriveSwitcher({
           },
         ]
       : []),
-    ...myDrives.map(subject => {
-      const resource = myDrivesMap.get(subject);
+    ...shownDrives.map(subject => {
+      const resource = shownDrivesMap.get(subject);
       const label =
         resource && !resource.error
           ? getTitle(resource)
@@ -115,6 +198,29 @@ export function DriveSwitcher({
         icon: subject === drive ? <FaSquareCheck /> : <FaRegCircle />,
       };
     }),
+    ...(otherAccessibleDrives.length > 0
+      ? [
+          DIVIDER,
+          ...otherAccessibleDrives.map(subject => {
+            const resource = accessibleDriveMap.get(subject);
+            const label =
+              resource && !resource.error
+                ? getTitle(resource)
+                : driveDisplayName(undefined, subject);
+
+            return {
+              id: subject,
+              suffix: badge(subject),
+              label,
+              helper: `Switch to ${label}`,
+              disabled: false,
+              onClick: (): void => switchTo(subject),
+              icon: subject === drive ? <FaSquareCheck /> : <FaRegCircle />,
+            };
+          }),
+        ]
+      : []),
+    ...(otherAccessibleDrives.length === 0 ? [DIVIDER] : []),
     {
       id: 'new-drive',
       label: 'New Drive',
@@ -124,17 +230,15 @@ export function DriveSwitcher({
         createNewResource(server.classes.drive, agent?.subject ?? ''),
       disabled: !agent,
     },
-    DIVIDER,
-    ...Array.from(recentDrivesMap.entries()).map(([subject, resource]) => ({
-      label: getTitle(resource),
-      id: subject,
-      suffix: badge(subject),
-      helper: `Switch to ${getTitle(resource)}`,
-      icon: subject === drive ? <FaSquareCheck /> : <FaRegCircle />,
-      onClick: (): void => switchTo(subject),
-      disabled: false,
-    })),
-    DIVIDER,
+    {
+      id: 'manage-drives',
+      label: 'View all drives',
+      icon: <FaGear />,
+      helper: 'View and organize all your drives.',
+      onClick: (): void => {
+        void navigate(paths.agentSettings);
+      },
+    },
     {
       id: 'drive-hosting',
       label: 'Storage and hosting',
@@ -143,15 +247,6 @@ export function DriveSwitcher({
         'Local stays on your devices. Vault is encrypted backup. Server hosts a readable copy. Remote is another connected server.',
       onClick: () =>
         navigate(`/app/sync?drive=${encodeURIComponent(drive ?? '')}`),
-    },
-    {
-      id: 'manage-drives',
-      label: 'Manage drives',
-      icon: <FaGear />,
-      helper: 'View and organize all your drives.',
-      onClick: (): void => {
-        void navigate(paths.agentSettings);
-      },
     },
   ];
 

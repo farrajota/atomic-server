@@ -12,7 +12,7 @@
 const SPLASH_ID = 'boot-splash';
 const LEAVING = 'boot-splash-leaving';
 const REVEALING = 'boot-revealing';
-const LEAVE_MS = 420;
+const LEAVE_MS = 200;
 
 let revealWaiters: (() => void)[] = [];
 let leaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -70,6 +70,53 @@ export function hideBootSplash({ reveal = false } = {}): void {
     root?.classList.remove(REVEALING);
     flushRevealWaiters();
   }, LEAVE_MS);
+}
+
+let holds = 0;
+let lastBusyAt = 0;
+let settleTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Keep the splash up while something in the app shows its own loader (a
+ * pane-level `<Spinner centered />`). Returns the release.
+ */
+export function holdBootSplash(): () => void {
+  holds += 1;
+  lastBusyAt = Date.now();
+  let released = false;
+
+  return () => {
+    if (released) return;
+    released = true;
+    holds -= 1;
+    lastBusyAt = Date.now();
+  };
+}
+
+/**
+ * Hide the splash once the app has shown no loader of its own for `quietMs`,
+ * or after `maxMs` whatever happens. The splash is the one loader from the
+ * first paint to the first real content, so nothing moves in between; the
+ * quiet gap bridges one loader replacing another.
+ */
+export function hideBootSplashWhenSettled({
+  quietMs = 100,
+  maxMs = 8_000,
+} = {}): void {
+  if (settleTimer) return;
+  const startedAt = Date.now();
+  lastBusyAt = Math.max(lastBusyAt, startedAt);
+
+  settleTimer = setInterval(() => {
+    const now = Date.now();
+    const settled = holds === 0 && now - lastBusyAt >= quietMs;
+
+    if (!settled && now - startedAt < maxMs && isBootSplashVisible()) return;
+
+    clearInterval(settleTimer);
+    settleTimer = undefined;
+    hideBootSplash();
+  }, 25);
 }
 
 /** Resolves once the app is on screen with no splash in front of it. */

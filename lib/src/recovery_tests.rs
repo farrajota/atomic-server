@@ -81,8 +81,79 @@ fn request_for(store: &Db, drive: &str, subject: &str) -> RecoveryRequest {
     }
 }
 
+fn decode_for_owner(bytes: &[u8], owner: &Agent) -> AtomicResult<RecoveryBundle> {
+    decode_bundle(bytes, owner.subject.as_str())
+}
+
+fn reseal_as_source(bundle: &mut RecoveryBundle, source: &Agent) -> AtomicResult<Vec<u8>> {
+    let payload = encode_native_payload(&bundle.resources)?;
+    bundle.manifest.payload_bytes = payload.len();
+    bundle.manifest.payload_sha256 = sha256(&payload);
+    sign_source_manifest(&mut bundle.manifest, source)?;
+    seal_bundle(&bundle.manifest, &payload)
+}
+
+fn reseal_transport_only(bundle: &mut RecoveryBundle) -> AtomicResult<Vec<u8>> {
+    let payload = encode_native_payload(&bundle.resources)?;
+    bundle.manifest.payload_bytes = payload.len();
+    bundle.manifest.payload_sha256 = sha256(&payload);
+    seal_bundle(&bundle.manifest, &payload)
+}
+
+fn reseal_modified_envelope(
+    bundle: &mut RecoveryBundle,
+    resource_index: usize,
+    envelope_index: usize,
+    source: &Agent,
+) -> AtomicResult<Vec<u8>> {
+    let envelope = &mut bundle.resources[resource_index].envelopes[envelope_index];
+    let old_signature = envelope.signature.clone();
+    let json: serde_json::Value = serde_json::from_str(&envelope.json)?;
+    let signature = json
+        .get(urls::SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Mutated recovery envelope has no signature")?
+        .to_string();
+    let created_at = json
+        .get(urls::CREATED_AT)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or("Mutated recovery envelope has no timestamp")?;
+    envelope.signature = signature.clone();
+    envelope.created_at = created_at;
+
+    let manifest = &mut bundle.manifest.resources[resource_index];
+    let metadata = &mut manifest.envelopes[envelope_index];
+    metadata.signature = signature.clone();
+    metadata.created_at = created_at;
+    metadata.length = envelope.json.len();
+    metadata.sha256 = sha256(envelope.json.as_bytes());
+    let attribution = manifest
+        .history
+        .attributions
+        .iter_mut()
+        .find(|attribution| attribution.signature == old_signature)
+        .ok_or("Mutated recovery envelope has no attribution")?;
+    attribution.signature = signature;
+    reseal_as_source(bundle, source)
+}
+
 fn owner_actor(owner: &Agent) -> ForAgent {
     ForAgent::AgentSubject(owner.subject.clone())
+}
+
+fn assert_change_attribution_matches(
+    source: &crate::envelopes::HistoryAttribution,
+    restored: &crate::envelopes::HistoryAttribution,
+) {
+    assert_eq!(source.changes.len(), restored.changes.len());
+    for (source, restored) in source.changes.iter().zip(&restored.changes) {
+        assert_eq!(source.peer, restored.peer);
+        assert_eq!(source.counter, restored.counter);
+        assert_eq!(source.length, restored.length);
+        assert_eq!(source.origin, restored.origin);
+        assert_eq!(source.attribution, restored.attribution);
+        assert_eq!(source.signer, restored.signer);
+    }
 }
 
 fn rights_validating_opts() -> crate::commit::CommitOpts {
@@ -134,22 +205,32 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         .unwrap()
         .unwrap();
     let doc = strict_snapshot_doc(&original_snapshot).unwrap();
-    assert_eq!(
-        doc.get_all_datatypes()
-            .get(urls::LAST_COMMIT)
-            .map(String::as_str),
-        Some("atomicUrl")
-    );
-    match doc.get_all_properties().get(urls::LAST_COMMIT).unwrap() {
-        loro::LoroValue::String(value) => {
-            assert_eq!(value.as_ref(), revision(&fixture.store, &fixture.subject))
-        }
-        value => panic!("unexpected native lastCommit: {value:?}"),
-    }
+    assert!(doc.get_all_datatypes().get(urls::LAST_COMMIT).is_none());
+    assert!(doc.get_all_properties().get(urls::LAST_COMMIT).is_none());
+    let source_history = crate::envelopes::attribute_history(&fixture.store, &fixture.subject)
+        .await
+        .unwrap();
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let bundle = decode_bundle(&bytes).unwrap();
+    let bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
+    assert_eq!(bundle.manifest.version, 2);
+    assert_eq!(
+        bundle.manifest.source_agent,
+        canonical_source_agent(&fixture.owner.subject.to_string()).unwrap()
+    );
+    let source_entry = bundle
+        .manifest
+        .resources
+        .iter()
+        .find(|entry| entry.subject == canonical_id(&fixture.store, &fixture.subject))
+        .unwrap();
+    assert_eq!(source_entry.last_commit, revision(&fixture.store, &fixture.subject));
+    assert_eq!(source_entry.history.attributions.len(), source_history.attributions.len());
+    for (wire, native) in source_entry.history.attributions.iter().zip(&source_history.attributions) {
+        assert_eq!(wire.spans, native.spans.clone().unwrap());
+        assert_eq!(wire.server_spans, native.server_spans.clone().unwrap());
+    }
     assert_eq!(bundle.manifest.resources.len(), 2);
     assert!(bundle
         .manifest
@@ -189,9 +270,15 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         .await
         .unwrap();
     assert!(history.complete);
+    assert_eq!(revision(&target, &fixture.subject), source_entry.last_commit);
+    assert_eq!(history.attributions.len(), source_entry.history.attributions.len());
+    for (wire, native) in source_entry.history.attributions.iter().zip(&history.attributions) {
+        assert_eq!(wire.spans, native.spans.clone().unwrap());
+        assert_eq!(wire.server_spans, native.server_spans.clone().unwrap());
+    }
     assert!(history.attributions.iter().all(|attribution| attribution.verified));
     assert!(history.changes.iter().any(|change| change.origin == crate::envelopes::ChangeOrigin::Signed));
-    assert!(history.changes.iter().any(|change| change.origin == crate::envelopes::ChangeOrigin::Server));
+    assert_change_attribution_matches(&source_history, &history);
     assert!(history
         .attributions
         .iter()
@@ -208,7 +295,7 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
 }
 
 #[tokio::test]
-async fn restores_signed_incremental_updates_with_unsigned_causal_bookkeeping() {
+async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
     let fixture = fixture("signed_deltas", EnvelopeRetention::All).await;
     let mut original_signatures = Vec::new();
     for token in ["first-native-delta", "second-native-delta"] {
@@ -253,6 +340,7 @@ async fn restores_signed_incremental_updates_with_unsigned_causal_bookkeeping() 
         .sign(&fixture.owner, &fixture.store, &resource)
         .await
         .unwrap();
+    later.previous_commit = None;
     later.created_at = 1;
     let json = later
         .serialize_deterministically_json_ad(&fixture.store)
@@ -266,16 +354,20 @@ async fn restores_signed_incremental_updates_with_unsigned_causal_bookkeeping() 
         )
         .unwrap(),
     );
+    let latest_signature = later.signature.clone().unwrap();
     fixture
         .store
         .apply_commit(later, &rights_validating_opts())
+        .await
+        .unwrap();
+    let source_history = crate::envelopes::attribute_history(&fixture.store, &fixture.subject)
         .await
         .unwrap();
     let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let bundle = decode_bundle(&bytes).unwrap();
+    let bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let entry = bundle
         .manifest
         .resources
@@ -283,6 +375,25 @@ async fn restores_signed_incremental_updates_with_unsigned_causal_bookkeeping() 
         .find(|entry| entry.subject == canonical_id(&fixture.store, &fixture.subject))
         .unwrap();
     assert_eq!(entry.envelopes[0].created_at, 1);
+    assert_eq!(entry.last_commit, revision(&fixture.store, &fixture.subject));
+    assert_eq!(
+        entry.last_commit,
+        crate::identifiers::commit_subject(&latest_signature)
+    );
+    let resource = bundle
+        .resources
+        .iter()
+        .find(|resource| resource.subject == entry.subject)
+        .unwrap();
+    let snapshot_doc = strict_snapshot_doc(&resource.snapshot).unwrap();
+    assert!(snapshot_doc.get_all_properties().get(urls::LAST_COMMIT).is_none());
+    let latest_envelope = resource
+        .envelopes
+        .iter()
+        .find(|envelope| envelope.signature == latest_signature)
+        .unwrap();
+    let latest_json: serde_json::Value = serde_json::from_str(&latest_envelope.json).unwrap();
+    assert!(latest_json.get(urls::PREVIOUS_COMMIT).map_or(true, serde_json::Value::is_null));
     for (token, signature) in &original_signatures {
         let attribution = entry
             .history
@@ -295,15 +406,23 @@ async fn restores_signed_incremental_updates_with_unsigned_causal_bookkeeping() 
     }
     let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
     restore_bundle(&target, &bundle).await.unwrap();
-    let history = crate::envelopes::attribute_history(&target, &fixture.subject).await.unwrap();
+    let history = crate::envelopes::attribute_history(&target, &fixture.subject)
+        .await
+        .unwrap();
     assert!(history.complete);
+    assert_eq!(revision(&target, &fixture.subject), entry.last_commit);
+    assert_eq!(history.attributions.len(), entry.history.attributions.len());
+    for (wire, native) in entry.history.attributions.iter().zip(&history.attributions) {
+        assert_eq!(wire.spans, native.spans.clone().unwrap());
+        assert_eq!(wire.server_spans, native.server_spans.clone().unwrap());
+    }
     for (token, signature) in &original_signatures {
         let change = history.changes.iter().find(|change| change.message.as_deref() == Some(token.as_str())).unwrap();
         assert_eq!(change.origin, crate::envelopes::ChangeOrigin::Signed);
         assert_eq!(change.signer.as_deref(), Some(fixture.owner.subject.as_str()));
         assert_eq!(&history.attributions[change.attribution.unwrap()].signature, signature);
     }
-    assert!(history.changes.iter().any(|change| change.origin == crate::envelopes::ChangeOrigin::Server));
+    assert_change_attribution_matches(&source_history, &history);
     let restored = target
         .get_resource(&Subject::from(fixture.subject.as_str()))
         .await
@@ -392,6 +511,13 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
                 .get_resource(&Subject::from(subject.as_str()))
                 .await
                 .unwrap();
+            let source_history = crate::envelopes::attribute_history(&fixture.store, &subject)
+                .await
+                .unwrap();
+            assert!(source_history
+                .changes
+                .iter()
+                .any(|change| change.origin == crate::envelopes::ChangeOrigin::Server));
             assert_eq!(
                 resource
                     .get(urls::WRITE)
@@ -416,13 +542,22 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
             let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
                 .await
                 .unwrap();
-            let bundle = decode_bundle(&bytes).unwrap();
+            let bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
             let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
             restore_bundle(&target, &bundle).await.unwrap();
             let restored = target
                 .get_resource(&Subject::from(subject.as_str()))
                 .await
                 .unwrap();
+            let restored_history = crate::envelopes::attribute_history(&target, &subject)
+                .await
+                .unwrap();
+            assert!(restored_history.complete);
+            assert!(restored_history
+                .changes
+                .iter()
+                .any(|change| change.origin == crate::envelopes::ChangeOrigin::Server));
+            assert_change_attribution_matches(&source_history, &restored_history);
             assert_eq!(
                 restored
                     .get(urls::DESCRIPTION)
@@ -554,7 +689,7 @@ async fn native_drive_bookkeeping_uses_original_parent_receipts_after_parent_mov
         .await
         .unwrap();
     let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
-    restore_bundle(&target, &decode_bundle(&bytes).unwrap())
+    restore_bundle(&target, &decode_for_owner(&bytes, &fixture.owner).unwrap())
         .await
         .unwrap();
     let restored = target
@@ -627,6 +762,102 @@ async fn refuses_unauthorized_export_and_wrong_revision() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("Recovery revision mismatch"));
+}
+
+#[tokio::test]
+async fn export_source_proof_uses_the_store_default_agent_and_fails_without_its_key() {
+    let fixture = fixture("source_signer", EnvelopeRetention::All).await;
+    let requester = owner_actor(&fixture.owner);
+    let source_signer = Agent::new(Some("Recovery source signer")).unwrap();
+    fixture.store.set_default_agent(source_signer.clone());
+    let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
+    let bytes = export_bundle(&fixture.store, &request, &requester).await.unwrap();
+    let bundle = decode_for_owner(&bytes, &source_signer).unwrap();
+    assert_eq!(
+        bundle.manifest.source_agent,
+        canonical_source_agent(&source_signer.subject.to_string()).unwrap()
+    );
+    assert!(decode_for_owner(&bytes, &fixture.owner).is_err());
+
+    let mut missing_key = source_signer;
+    missing_key.private_key = None;
+    fixture.store.set_default_agent(missing_key);
+    let error = export_bundle(&fixture.store, &request, &requester)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("private signing key"), "{error}");
+}
+
+#[tokio::test]
+async fn source_proof_requires_independent_pin_and_binds_manifest_inventory_spans_revision_and_payload() {
+    let fixture = fixture("source_proof", EnvelopeRetention::All).await;
+    let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
+    let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
+        .await
+        .unwrap();
+    let original = decode_for_owner(&bytes, &fixture.owner).unwrap();
+    let attacker = Agent::new(Some("Recovery attacker")).unwrap();
+
+    assert!(decode_bundle(&bytes, "").is_err());
+    assert!(decode_bundle(&bytes, "not-a-native-agent").is_err());
+    assert!(decode_bundle(&bytes, "atomic:agent:not-base64").is_err());
+    assert!(decode_bundle(&bytes, attacker.subject.as_str()).is_err());
+    let mut old_format = bytes.clone();
+    old_format[..8].copy_from_slice(b"ATRECOV1");
+    assert!(decode_bundle(&old_format, fixture.owner.subject.as_str()).is_err());
+
+    for mutation in ["scope", "inventory", "spans", "revision"] {
+        let mut altered = original.clone();
+        match mutation {
+            "scope" => altered.manifest.allowed_drives[0] = "atomic:drive:changed".into(),
+            "inventory" =>
+                altered.manifest.resources[0].envelopes[0].sha256 = "f".repeat(64),
+            "spans" => altered.manifest.resources[0].history.attributions[0]
+                .spans
+                .push(crate::loro::ChangeSpan {
+                    peer: 0,
+                    counter: 0,
+                    length: 1,
+                }),
+            "revision" => { altered.manifest.resources[0].last_commit =
+                "atomic:commit:source-proof-substitution".into()
+            }
+            _ => unreachable!(),
+        }
+        let altered_bytes = reseal_transport_only(&mut altered).unwrap();
+        assert!(
+            decode_bundle(&altered_bytes, fixture.owner.subject.as_str()).is_err(),
+            "source proof accepted a changed {mutation}"
+        );
+    }
+
+    let mut changed_payload = original.clone();
+    changed_payload.resources[0].snapshot[0] ^= 1;
+    let changed_payload_bytes = reseal_transport_only(&mut changed_payload).unwrap();
+    assert!(decode_bundle(&changed_payload_bytes, fixture.owner.subject.as_str()).is_err());
+
+    let mut attacker_signed = original.clone();
+    let proof = source_proof_message(&attacker_signed.manifest).unwrap();
+    attacker_signed.manifest.source_signature = crate::agents::sign_message(
+        &proof,
+        attacker.private_key.as_deref().unwrap(),
+    )
+    .unwrap();
+    let attacker_signed_bytes = seal_bundle(
+        &attacker_signed.manifest,
+        &encode_native_payload(&attacker_signed.resources).unwrap(),
+    )
+    .unwrap();
+    assert!(decode_bundle(&attacker_signed_bytes, fixture.owner.subject.as_str()).is_err());
+
+    let mut substituted_identity = original;
+    sign_source_manifest(&mut substituted_identity.manifest, &attacker).unwrap();
+    let substituted_bytes = seal_bundle(
+        &substituted_identity.manifest,
+        &encode_native_payload(&substituted_identity.resources).unwrap(),
+    )
+    .unwrap();
+    assert!(decode_bundle(&substituted_bytes, fixture.owner.subject.as_str()).is_err());
 }
 
 #[tokio::test]
@@ -824,13 +1055,13 @@ async fn rejects_tampered_and_truncated_native_payloads() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    assert!(decode_bundle(&bytes[..bytes.len() - 1]).is_err());
+    assert!(decode_bundle(&bytes[..bytes.len() - 1], fixture.owner.subject.as_str()).is_err());
     let mut tampered_payload = bytes.clone();
     *tampered_payload.last_mut().unwrap() ^= 1;
-    assert!(decode_bundle(&tampered_payload).is_err());
+    assert!(decode_bundle(&tampered_payload, fixture.owner.subject.as_str()).is_err());
     let mut tampered_manifest = bytes;
     tampered_manifest[BUNDLE_HEADER_BYTES - 1] ^= 1;
-    assert!(decode_bundle(&tampered_manifest).is_err());
+    assert!(decode_bundle(&tampered_manifest, fixture.owner.subject.as_str()).is_err());
 }
 
 #[tokio::test]
@@ -840,7 +1071,7 @@ async fn rejects_resealed_snapshot_with_unmaterialized_causal_operations() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let mut bundle = decode_bundle(&bytes).unwrap();
+    let mut bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let author = crate::loro::AtomicLoroDoc::new();
     author
         .set_property(urls::NAME, &Value::String("missing predecessor".into()))
@@ -864,7 +1095,8 @@ async fn rejects_resealed_snapshot_with_unmaterialized_causal_operations() {
     let payload = encode_native_payload(&bundle.resources).unwrap();
     bundle.manifest.payload_bytes = payload.len();
     bundle.manifest.payload_sha256 = sha256(&payload);
-    let error = decode_bundle(&seal_bundle(&bundle.manifest, &payload).unwrap()).unwrap_err();
+    let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
+    let error = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap_err();
     assert!(error.to_string().contains("pending causal operations"), "{error}");
 }
 
@@ -875,7 +1107,7 @@ async fn refuses_resealed_unsigned_content_and_container_operations() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let original = decode_bundle(&bytes).unwrap();
+    let original = decode_for_owner(&bytes, &fixture.owner).unwrap();
     for container_mutation in [false, true] {
         let mut bundle = original.clone();
         let index = bundle
@@ -902,13 +1134,16 @@ async fn refuses_resealed_unsigned_content_and_container_operations() {
         manifest.version_vector = version_vector(&snapshot).unwrap();
         manifest.description_sha256 = description_hash(&resource);
         bundle.resources[index].snapshot = snapshot;
-        let payload = encode_native_payload(&bundle.resources).unwrap();
-        bundle.manifest.payload_bytes = payload.len();
-        bundle.manifest.payload_sha256 = sha256(&payload);
-        let forged = decode_bundle(&seal_bundle(&bundle.manifest, &payload).unwrap()).unwrap();
+        let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
+        let forged = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
         let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
         let error = restore_bundle(&target, &forged).await.unwrap_err();
-        assert!(error.to_string().contains("unsigned recovery operation"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Recovery snapshot operation is not covered by original spans"),
+            "{error}"
+        );
     }
 }
 
@@ -925,7 +1160,7 @@ async fn refuses_resealed_unsigned_acl_drive_and_late_signer_grants() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let original = decode_bundle(&bytes).unwrap();
+    let original = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let outsider = Agent::new(Some("Unsigned grantee")).unwrap();
     for mutation in ["acl", "late-signer-grant", "drive"] {
         let mut bundle = original.clone();
@@ -959,85 +1194,41 @@ async fn refuses_resealed_unsigned_acl_drive_and_late_signer_grants() {
                 .unwrap(),
             _ => unreachable!(),
         }
-        let receipt = crate::identifiers::commit_subject(
-            &bundle.resources[index].envelopes[0].signature,
-        );
-        doc.set_property(urls::LAST_COMMIT, &Value::AtomicUrl(receipt.into()))
-            .unwrap();
         let snapshot = doc.export_snapshot();
-        let resource = resource_from_snapshot(&bundle.resources[index].subject, &snapshot).unwrap();
         let manifest = &mut bundle.manifest.resources[index];
-        manifest.last_commit = resource.get(urls::LAST_COMMIT).unwrap().to_string();
         manifest.snapshot_length = snapshot.len();
         manifest.snapshot_sha256 = sha256(&snapshot);
         manifest.version_vector = version_vector(&snapshot).unwrap();
         bundle.resources[index].snapshot = snapshot;
-        let payload = encode_native_payload(&bundle.resources).unwrap();
-        bundle.manifest.payload_bytes = payload.len();
-        bundle.manifest.payload_sha256 = sha256(&payload);
-        let forged = decode_bundle(&seal_bundle(&bundle.manifest, &payload).unwrap()).unwrap();
+        let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
+        let forged = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
         let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
         let error = restore_bundle(&target, &forged).await.unwrap_err();
-        assert!(error.to_string().contains("unsigned recovery operation"), "{mutation}: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Recovery snapshot operation is not covered by original spans"), "{mutation}: {error}"
+        );
     }
 }
 
 #[tokio::test]
-async fn refuses_a_resealed_receipt_without_its_signed_causal_predecessors() {
-    let fixture = fixture("receipt_causality", EnvelopeRetention::All).await;
-    let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
-    let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
-        .await
-        .unwrap();
-    let mut bundle = decode_bundle(&bytes).unwrap();
-    let index = bundle
-        .resources
-        .iter()
-        .position(|resource| resource.subject == canonical_id(&fixture.store, &fixture.subject))
-        .unwrap();
-    let forged = crate::loro::AtomicLoroDoc::new();
-    forged
-        .set_property(
-            urls::LAST_COMMIT,
-            &Value::AtomicUrl(bundle.manifest.resources[index].last_commit.as_str().into()),
-        )
-        .unwrap();
-    let doc = strict_snapshot_doc(&bundle.resources[index].snapshot).unwrap();
-    doc.import_update(&forged.export_snapshot()).unwrap();
-    let snapshot = doc.export_snapshot();
-    let resource = resource_from_snapshot(&bundle.resources[index].subject, &snapshot).unwrap();
-    let manifest = &mut bundle.manifest.resources[index];
-    manifest.last_commit = resource.get(urls::LAST_COMMIT).unwrap().to_string();
-    manifest.snapshot_length = snapshot.len();
-    manifest.snapshot_sha256 = sha256(&snapshot);
-    manifest.version_vector = version_vector(&snapshot).unwrap();
-    bundle.resources[index].snapshot = snapshot;
-    let payload = encode_native_payload(&bundle.resources).unwrap();
-    bundle.manifest.payload_bytes = payload.len();
-    bundle.manifest.payload_sha256 = sha256(&payload);
-    let forged = decode_bundle(&seal_bundle(&bundle.manifest, &payload).unwrap()).unwrap();
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
-    let error = restore_bundle(&target, &forged).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("apply receipt precedes its signed native update"), "{error}");
-}
-
-#[tokio::test]
-async fn refuses_a_partial_restore_and_never_returns_success() {
+async fn source_authenticated_invalid_native_signature_is_rejected() {
     let fixture = fixture("partial", EnvelopeRetention::All).await;
     let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let mut bundle = decode_bundle(&bytes).unwrap();
+    let mut bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let envelope = &mut bundle.resources[0].envelopes[0].json;
     let mut json: serde_json::Value = serde_json::from_str(envelope).unwrap();
     json[urls::SIGNATURE] = serde_json::Value::String("AA==".into());
     *envelope = serde_json::to_string(&json).unwrap();
+    let malformed_bytes = reseal_modified_envelope(&mut bundle, 0, 0, &fixture.owner).unwrap();
+    let authenticated = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
 
     let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
-    let error = restore_bundle(&target, &bundle).await.unwrap_err();
+    let error = restore_bundle(&target, &authenticated).await.unwrap_err();
     assert!(error.to_string().contains("signature must be 64 bytes"), "{error}");
     assert!(target
         .get_resource(&Subject::from(fixture.drive.as_str()))
@@ -1052,7 +1243,7 @@ async fn rejects_unknown_envelope_properties_without_contacting_loopback() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let mut bundle = decode_bundle(&bytes).unwrap();
+    let mut bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let trap = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     trap.set_nonblocking(true).unwrap();
     let property = format!("http://{}/unknown-property", trap.local_addr().unwrap());
@@ -1061,8 +1252,10 @@ async fn rejects_unknown_envelope_properties_without_contacting_loopback() {
     json[property] = serde_json::Value::String("untrusted".into());
     json[urls::SIGNATURE] = serde_json::Value::String("invalid".into());
     *envelope = serde_json::to_string(&json).unwrap();
+    let malformed_bytes = reseal_modified_envelope(&mut bundle, 0, 0, &fixture.owner).unwrap();
+    let authenticated = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
     let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
-    let error = restore_bundle(&target, &bundle).await.unwrap_err();
+    let error = restore_bundle(&target, &authenticated).await.unwrap_err();
     assert!(error.to_string().contains("unsupported property"));
     assert_eq!(
         trap.accept().unwrap_err().kind(),
@@ -1184,7 +1377,7 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
         .await
         .unwrap();
     let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
-    restore_bundle(&target, &decode_bundle(&bytes).unwrap())
+    restore_bundle(&target, &decode_for_owner(&bytes, &fixture.owner).unwrap())
         .await
         .unwrap();
     let restored = target
@@ -1221,7 +1414,7 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
             "missing {missing_kind}: {error}"
         );
 
-        let mut incomplete_bundle = decode_bundle(&bytes).unwrap();
+        let mut incomplete_bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
         let omitted = canonical_id(&fixture.store, missing);
         let removed_envelopes = incomplete_bundle
             .resources
@@ -1238,13 +1431,8 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
             .resources
             .retain(|resource| resource.subject != omitted);
         incomplete_bundle.manifest.envelope_count -= removed_envelopes;
-        let payload = encode_native_payload(&incomplete_bundle.resources).unwrap();
-        incomplete_bundle.manifest.payload_bytes = payload.len();
-        incomplete_bundle.manifest.payload_sha256 = sha256(&payload);
-        let resealed = decode_bundle(
-            &seal_bundle(&incomplete_bundle.manifest, &payload).unwrap(),
-        )
-        .unwrap();
+        let malformed_bytes = reseal_as_source(&mut incomplete_bundle, &fixture.owner).unwrap();
+        let resealed = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
         let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
         let error = restore_bundle(&target, &resealed).await.unwrap_err();
         assert!(
@@ -1311,7 +1499,7 @@ async fn later_signed_snapshot_cannot_replace_missing_original_envelope() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let mut bundle = decode_bundle(&bytes).unwrap();
+    let mut bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let index = bundle
         .resources
         .iter()
@@ -1327,31 +1515,65 @@ async fn later_signed_snapshot_cannot_replace_missing_original_envelope() {
         .attributions
         .retain(|attribution| attribution.signature != missing.signature);
     bundle.manifest.envelope_count -= 1;
-    let payload = encode_native_payload(&bundle.resources).unwrap();
-    bundle.manifest.payload_bytes = payload.len();
-    bundle.manifest.payload_sha256 = sha256(&payload);
-    let resealed = decode_bundle(&seal_bundle(&bundle.manifest, &payload).unwrap()).unwrap();
+    let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
+    let resealed = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
     let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
     let error = restore_bundle(&target, &resealed).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("missing a referenced commit envelope"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Recovery snapshot operation is not covered by original spans"),
+        "{error}"
+    );
     let prefix = format!("{}\0", canonical_id(&fixture.store, &fixture.subject));
     let key = fixture
         .store
         .kv
         .scan_prefix(Tree::Envelopes, prefix.as_bytes())
         .map(Result::unwrap)
-        .find(|(_, json)| std::str::from_utf8(json).unwrap() == missing.json)
+        .find(|(key, _)| key.ends_with(missing.signature.as_bytes()))
         .unwrap()
         .0;
     fixture.store.kv.remove(Tree::Envelopes, &key).unwrap();
     let error = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("missing a referenced commit envelope"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("Recovery snapshot operation is not covered by original spans"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn refuses_export_with_unreadable_compact_history() {
+    let fixture = fixture("unreadable_compact_history", EnvelopeRetention::All).await;
+    let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
+    export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
+        .await
+        .unwrap();
+    let prefix = format!("{}\0", canonical_id(&fixture.store, &fixture.subject));
+    let key = fixture
+        .store
+        .kv
+        .scan_prefix(Tree::Envelopes, prefix.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap()
+        .0;
+    fixture
+        .store
+        .kv
+        .insert(Tree::Envelopes, &key, &[1, 0])
+        .unwrap();
+    let error = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Malformed retained recovery envelope"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1361,18 +1583,24 @@ async fn native_export_ceiling_counts_manifest_after_a_valid_signed_payload() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let bundle = decode_bundle(&bytes).unwrap();
+    let bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let payload = encode_native_payload(&bundle.resources).unwrap();
     let manifest_size = serde_json::to_vec(bundle.manifest()).unwrap().len();
     let padding = MAX_BUNDLE_BYTES - BUNDLE_HEADER_BYTES - manifest_size + 1 - payload.len();
     let prefix = format!("{}\0", canonical_id(&fixture.store, &fixture.subject));
-    let (key, mut json) = fixture
+    let (key, _) = fixture
         .store
         .kv
         .scan_prefix(Tree::Envelopes, prefix.as_bytes())
         .next()
         .unwrap()
         .unwrap();
+    let mut json = crate::envelopes::envelopes(&fixture.store, fixture.subject.as_str())
+        .into_iter()
+        .find(|envelope| key.ends_with(envelope.signature.as_bytes()))
+        .unwrap()
+        .json
+        .into_bytes();
     json.resize(json.len() + padding, b' ');
     fixture.store.kv.insert(Tree::Envelopes, &key, &json).unwrap();
     let error = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
@@ -1514,7 +1742,7 @@ async fn complete_bundle_ceiling_includes_header_and_manifest() {
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let bundle = decode_bundle(&bytes).unwrap();
+    let bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
     let manifest_size = serde_json::to_vec(bundle.manifest()).unwrap().len();
     let payload_size = MAX_BUNDLE_BYTES - BUNDLE_HEADER_BYTES - manifest_size;
     let payload = vec![0; payload_size + 1];

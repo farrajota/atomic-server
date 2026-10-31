@@ -10,6 +10,12 @@ import { useProviderAvailability } from './useProviderAvailability';
 import { useHostedAI } from './useHostedAI';
 import { enableHostedAI, type HostedAIStatus } from '@helpers/managed/ai';
 
+const PERSONAL_PROVIDERS: AIProvider[] = [
+  AIProvider.OpenAI,
+  AIProvider.Anthropic,
+  AIProvider.OpenAICompatible,
+];
+
 export const DEFAULT_CHAT_MODEL: AIModelIdentifier = {
   id: '~google/gemini-flash-latest',
   provider: AIProvider.OpenRouter,
@@ -44,9 +50,26 @@ interface AISettingsContextType {
   availableProviders: AIProvider[];
   openRouterAvailable: boolean;
   ollamaAvailable: boolean;
+  openAIAvailable: boolean;
+  anthropicAvailable: boolean;
+  openAICompatibleAvailable: boolean;
   /** The OpenRouter API key for making requests to OpenRouter */
   openRouterApiKey: string | undefined;
   setOpenRouterApiKey: (key: string | undefined) => void;
+  openAIApiKey: string | undefined;
+  setOpenAIApiKey: (key: string | undefined) => void;
+  anthropicApiKey: string | undefined;
+  setAnthropicApiKey: (key: string | undefined) => void;
+  openAICompatibleApiKey: string | undefined;
+  setOpenAICompatibleApiKey: (key: string | undefined) => void;
+  openAICompatibleBaseURL: string | undefined;
+  setOpenAICompatibleBaseURL: (url: string | undefined) => void;
+  openAIModelId: string;
+  setOpenAIModelId: (model: string) => void;
+  anthropicModelId: string;
+  setAnthropicModelId: (model: string) => void;
+  openAICompatibleModelId: string;
+  setOpenAICompatibleModelId: (model: string) => void;
   /** The URL of the Ollama server */
   ollamaUrl: string | undefined;
   setOllamaUrl: (url: string | undefined) => void;
@@ -82,6 +105,23 @@ const initialState: AISettingsContextType = {
   availableProviders: [],
   openRouterAvailable: false,
   ollamaAvailable: false,
+  openAIAvailable: false,
+  anthropicAvailable: false,
+  openAICompatibleAvailable: false,
+  openAIApiKey: undefined,
+  setOpenAIApiKey: () => undefined,
+  anthropicApiKey: undefined,
+  setAnthropicApiKey: () => undefined,
+  openAICompatibleApiKey: undefined,
+  setOpenAICompatibleApiKey: () => undefined,
+  openAICompatibleBaseURL: undefined,
+  setOpenAICompatibleBaseURL: () => undefined,
+  openAIModelId: 'gpt-4.1-mini',
+  setOpenAIModelId: () => undefined,
+  anthropicModelId: 'claude-sonnet-4-5',
+  setAnthropicModelId: () => undefined,
+  openAICompatibleModelId: '',
+  setOpenAICompatibleModelId: () => undefined,
   openRouterApiKey: undefined,
   setOpenRouterApiKey: () => undefined,
   // Unset until the user asks for local AI — see the note on the real default
@@ -141,6 +181,31 @@ export const AISettingsContextProvider = (
   const [openRouterApiKey, setOpenRouterApiKey] = useLocalStorage<
     string | undefined
   >('atomic.ai.openrouter-api-key', undefined);
+  const [openAIApiKey, setOpenAIApiKey] = useLocalStorage<string | undefined>(
+    'atomic.ai.openai-api-key',
+    undefined,
+  );
+  const [anthropicApiKey, setAnthropicApiKey] = useLocalStorage<
+    string | undefined
+  >('atomic.ai.anthropic-api-key', undefined);
+  const [openAICompatibleApiKey, setOpenAICompatibleApiKey] = useLocalStorage<
+    string | undefined
+  >('atomic.ai.openai-compatible-api-key', undefined);
+  const [openAICompatibleBaseURL, setOpenAICompatibleBaseURL] = useLocalStorage<
+    string | undefined
+  >('atomic.ai.openai-compatible-base-url', undefined);
+  const [openAIModelId, setOpenAIModelId] = useLocalStorage(
+    'atomic.ai.openai-model-id',
+    'gpt-4.1-mini',
+  );
+  const [anthropicModelId, setAnthropicModelId] = useLocalStorage(
+    'atomic.ai.anthropic-model-id',
+    'claude-sonnet-4-5',
+  );
+  const [openAICompatibleModelId, setOpenAICompatibleModelId] = useLocalStorage(
+    'atomic.ai.openai-compatible-model-id',
+    '',
+  );
 
   const [openRouterZdr, setOpenRouterZdr] = useLocalStorage(
     'atomic.ai.openRouterZdr',
@@ -188,12 +253,26 @@ export const AISettingsContextProvider = (
         : undefined,
     [hostedAvailable, hostedModelId],
   );
+  const hasPersonalProviderConfig = Boolean(
+    openRouterApiKey ||
+    ollamaUrl ||
+    openAIApiKey ||
+    anthropicApiKey ||
+    openAICompatibleApiKey ||
+    openAICompatibleBaseURL,
+  );
   const defaultChatModel =
-    hostedAvailable && hostedModel && !openRouterApiKey && !ollamaUrl
+    hostedAvailable &&
+    hostedModel &&
+    !hasPersonalProviderConfig &&
+    !PERSONAL_PROVIDERS.includes(storedDefaultChatModel.provider)
       ? hostedModel
       : storedDefaultChatModel;
   const genFeaturesModel =
-    hostedAvailable && hostedModel && !openRouterApiKey && !ollamaUrl
+    hostedAvailable &&
+    hostedModel &&
+    !hasPersonalProviderConfig &&
+    !PERSONAL_PROVIDERS.includes(storedGenFeaturesModel.provider)
       ? hostedModel
       : storedGenFeaturesModel;
 
@@ -207,9 +286,22 @@ export const AISettingsContextProvider = (
   const {
     openRouterAvailable,
     ollamaAvailable,
+    openAIAvailable,
+    anthropicAvailable,
+    openAICompatibleAvailable,
     isProviderAvailable,
     availableProviders,
-  } = useProviderAvailability(openRouterApiKey, ollamaUrl, hostedAvailable);
+  } = useProviderAvailability({
+    openRouterApiKey,
+    ollamaUrl,
+    hostedAvailable,
+    openAIApiKey,
+    anthropicApiKey,
+    openAIModelId,
+    anthropicModelId,
+    openAICompatibleBaseURL,
+    openAICompatibleModelId,
+  });
 
   const mcpServers = mergeDefaultMCPServers(storedMcpServers);
   const setMcpServers = (servers: MCPServer[]) =>
@@ -228,6 +320,20 @@ export const AISettingsContextProvider = (
     setMicrophoneId,
     openRouterApiKey,
     setOpenRouterApiKey,
+    openAIApiKey,
+    setOpenAIApiKey,
+    anthropicApiKey,
+    setAnthropicApiKey,
+    openAICompatibleApiKey,
+    setOpenAICompatibleApiKey,
+    openAICompatibleBaseURL,
+    setOpenAICompatibleBaseURL,
+    openAIModelId,
+    setOpenAIModelId,
+    anthropicModelId,
+    setAnthropicModelId,
+    openAICompatibleModelId,
+    setOpenAICompatibleModelId,
     mcpServers,
     setMcpServers,
     enableAI,
@@ -242,6 +348,9 @@ export const AISettingsContextProvider = (
     availableProviders,
     openRouterAvailable,
     ollamaAvailable,
+    openAIAvailable,
+    anthropicAvailable,
+    openAICompatibleAvailable,
     shouldGenerateTitles,
     setShouldGenerateTitles,
     genFeaturesModel,

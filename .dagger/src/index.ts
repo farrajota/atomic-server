@@ -1428,6 +1428,10 @@ export class AtomicServer {
         '/lib/defaults/tasks.json',
         this.source.file('lib/defaults/tasks.json'),
       )
+      .withFile(
+        '/lib/defaults/vocabularies.json',
+        this.source.file('lib/defaults/vocabularies.json'),
+      )
       // browser/e2e/tests/apps.spec.ts serves this checkout's embedded app SDK
       // as a fixture, read with a plain `readFileSync` at
       // `../../../server/src/plugins/assets/view-client.js`. From /app/e2e/tests
@@ -2579,7 +2583,11 @@ export class AtomicServer {
           mv ~/atomic-server-x86_64-unknown-linux-musl ~/atomic-server &&
           cp ~/atomic-server ~/atomic-server-$(date +"%Y-%m-%dT%H:%M:%S") &&
           systemctl stop atomic &&
-          ./atomic-server export &&
+          data_dir=$(sed -n "s/^ATOMIC_DATA_DIR=//p" ~/.env 2>/dev/null | tail -1 | tr -d "\\"\\047") &&
+          store=\${data_dir:-\$HOME/.local/share/atomic-data}/store/atomic.redb &&
+          test -f "$store" &&
+          cp "$store" ~/atomic-store-$(date +"%Y-%m-%dT%H:%M:%S").redb &&
+          ls -1t ~/atomic-store-2*.redb | tail -n +4 | xargs -r rm -f &&
           systemctl start atomic &&
           systemctl status atomic
         '`,

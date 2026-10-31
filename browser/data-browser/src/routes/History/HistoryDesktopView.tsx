@@ -14,7 +14,9 @@ import {
 import { Tabs } from '@components/Tabs';
 import { plural } from '@helpers/plural';
 import { ResourceCardDefault } from '@views/Card/ResourceCard';
-import { useStore, Resource, type AtomicValue } from '@tomic/react';
+import { useStore } from '@tomic/react';
+import { resourceAtVersion } from './versionHelpers';
+import { VersionContent } from './VersionContent';
 
 export function HistoryDesktopView({
   resource,
@@ -30,32 +32,23 @@ export function HistoryDesktopView({
 }: HistoryViewProps) {
   const store = useStore();
 
-  const selectedVersionResource = useMemo(() => {
-    const res = new Resource(resource.subject);
-    res.setStore(store);
-    res.applyHydratedValues(
-      selectedVersion.propvals.entries() as Iterable<[string, AtomicValue]>,
-    );
+  const selectedVersionResource = useMemo(
+    () => resourceAtVersion(resource, selectedVersion, store),
+    [store, resource, selectedVersion],
+  );
 
-    return res;
-  }, [store, resource.subject, selectedVersion]);
-
-  const olderVersionResource = useMemo(() => {
-    if (!olderVersion) return undefined;
-    const res = new Resource(resource.subject);
-    res.setStore(store);
-    res.applyHydratedValues(
-      olderVersion.propvals.entries() as Iterable<[string, AtomicValue]>,
-    );
-
-    return res;
-  }, [store, resource.subject, olderVersion]);
-
+  const olderVersionResource = useMemo(
+    () =>
+      olderVersion
+        ? resourceAtVersion(resource, olderVersion, store)
+        : undefined,
+    [store, resource, olderVersion],
+  );
   const diff = useResourceDiff(olderVersionResource, selectedVersionResource);
-  const changesCountText = plural(diff.changedProps.length, [
-    '1 Change',
-    '# Changes',
-  ]);
+  const changesCountText = plural(
+    diff.changedProps.length + (diff.bodyChanged ? 1 : 0),
+    ['1 Change', '# Changes'],
+  );
 
   const tabs = [
     { label: changesCountText, value: 'changes' },
@@ -76,7 +69,10 @@ export function HistoryDesktopView({
                     <ResourceDiff diff={diff} />
                   </Tabs.Panel>
                   <Tabs.Panel value='resource'>
-                    <ResourceCardDefault resource={selectedVersionResource} />
+                    <>
+                      <ResourceCardDefault resource={selectedVersionResource} />
+                      <VersionContent resource={selectedVersionResource} />
+                    </>
                   </Tabs.Panel>
                 </Card.Content>
               </Tabs>

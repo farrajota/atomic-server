@@ -294,9 +294,7 @@ export default defineConfig(({ mode }) => {
       // `node_modules`, so the compiler sees its hooks. Tests compile just
       // that package, so a hook the compiler would cache wrongly fails here.
       ...oxcReactCompiler(
-        isVitest
-          ? { only: /\/browser\/react\/src\// }
-          : { compile: true },
+        isVitest ? { only: /\/browser\/react\/src\// } : { compile: true },
       ),
       react(),
       !isVitest &&
@@ -591,6 +589,13 @@ export default defineConfig(({ mode }) => {
     },
     test: {
       setupFiles: ['./src/test-setup.ts'],
+      server: {
+        deps: {
+          // Externalized bindings bypass the Loro web alias and reject SDK
+          // containers against the Node build's distinct Loro constructors.
+          inline: ['loro-prosemirror'],
+        },
+      },
       // The suite runs on a CI host that is also busy with other jobs. A test
       // that dynamically imports a large module spends more than the default
       // five seconds on the import alone, and fails without anything being

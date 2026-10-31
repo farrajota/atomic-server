@@ -6,6 +6,7 @@ mod ai_chat_migration;
 mod ai_chat_migration_test;
 pub mod app_agent;
 pub mod blob_backend;
+pub mod blob_gc;
 mod canonical_scheme;
 mod chat_migration;
 #[cfg(test)]
@@ -1815,6 +1816,30 @@ impl Db {
             .flatten()
     }
 
+    /// Give `resource` its derived `lastCommit`. The value the stored row
+    /// carries wins (set when the commit was applied, equal to the newest
+    /// envelope's commit id). Without one, a stamp an old doc still holds
+    /// stands; without that, the newest envelope (a row written from a synced
+    /// doc), then the genesis commit of a resource named after it.
+    pub(crate) fn serve_derived_last_commit(
+        &self,
+        resource: &mut Resource,
+        subject: &str,
+        stored: Option<Value>,
+    ) {
+        let derived = stored.or_else(|| {
+            if resource.get(urls::LAST_COMMIT).is_ok() {
+                return None;
+            }
+            crate::envelopes::latest_commit_id(self, subject)
+                .or_else(|| crate::envelopes::genesis_commit_id(subject))
+                .map(|id| Value::AtomicUrl(id.into()))
+        });
+        if let Some(derived) = derived {
+            resource.set_derived_last_commit(derived);
+        }
+    }
+
     fn get_did_mapping_hint(&self, subject: &str) -> Option<String> {
         let key = crate::identifiers::canonicalize_scheme(subject);
         let bin = self.kv.get(Tree::DidMapping, key.as_bytes()).ok()??;
@@ -1899,19 +1924,10 @@ impl Db {
             let Some(blob_val) = propvals.get(urls::BLOB) else {
                 continue;
             };
-            let blob_did = blob_val.to_string();
-            let blob_subject = crate::Subject::from_raw(&blob_did, None);
-            let Some(hash_hex) = blob_subject.blob_hash_hex() else {
+            let Some(hash) = crate::Subject::from_raw(&blob_val.to_string(), None).blob_hash()
+            else {
                 continue;
             };
-            let Ok(hash_bytes) = hex::decode(hash_hex) else {
-                continue;
-            };
-            if hash_bytes.len() != 32 {
-                continue;
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&hash_bytes);
             if !seen_blobs.insert((drive.as_str(), hash)) {
                 continue;
             }
@@ -1961,14 +1977,9 @@ impl Db {
 
             let mut blob_bytes = 0;
             if let Some(blob_val) = propvals.get(urls::BLOB) {
-                let blob_subject = crate::Subject::from_raw(&blob_val.to_string(), None);
-                if let Some(hash_bytes) = blob_subject
-                    .blob_hash_hex()
-                    .and_then(|h| hex::decode(h).ok())
-                    .filter(|b| b.len() == 32)
+                if let Some(hash) =
+                    crate::Subject::from_raw(&blob_val.to_string(), None).blob_hash()
                 {
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&hash_bytes);
                     if seen_blobs.insert(hash) {
                         blob_bytes = self.blob_size(&hash).await?.unwrap_or(0);
                     }
@@ -3832,6 +3843,7 @@ impl Db {
         subject: &Subject,
         q: &Query,
         rights_cache: &std::sync::Mutex<RightsCache>,
+        trash: Option<&std::sync::Mutex<crate::trash::TrashLookup<'_>>>,
     ) -> Option<Option<Resource>> {
         let mut resource = match self.get_resource_shallow(subject) {
             Ok(resource) => resource,
@@ -3865,6 +3877,17 @@ impl Db {
             .is_err()
         {
             return None;
+        }
+
+        // Parked in the Trash: not a member unless the query asked for it.
+        if let Some(trash) = trash {
+            if trash
+                .lock()
+                .map(|mut lookup| lookup.is_hidden_member(&resource))
+                .unwrap_or(false)
+            {
+                return None;
+            }
         }
 
         if !q.include_nested {
@@ -3938,6 +3961,7 @@ impl Db {
         let mut total_count = 0;
         let mut seen = HashSet::new();
         let rights_cache = std::sync::Mutex::new(RightsCache::default());
+        let trash = crate::trash::filter_for_query(self, q).map(std::sync::Mutex::new);
         let base_domain = self.get_base_domain();
 
         let atoms = self.get_index_iterator_for_query(q);
@@ -3965,12 +3989,15 @@ impl Db {
             // must not hide a later readable row.
             if q.limit.is_none() || subjects.len() < q.limit.unwrap() {
                 // Sudo without nested bodies needs no per-member work at all.
-                if q.for_agent == ForAgent::Sudo && !q.include_nested {
+                if q.for_agent == ForAgent::Sudo && !q.include_nested && trash.is_none() {
                     subjects.push(subject);
                     continue;
                 }
 
-                match self.resolve_query_member(&subject, q, &rights_cache).await {
+                match self
+                    .resolve_query_member(&subject, q, &rights_cache, trash.as_ref())
+                    .await
+                {
                     Some(body) => {
                         subjects.push(subject);
                         if let Some(resource) = body {
@@ -4040,6 +4067,7 @@ impl Db {
             drive: q.drive.clone(),
             aggregation: None,
             expression_filters: Vec::new(),
+            exclude_trashed: q.exclude_trashed,
         };
 
         let subjects = if requires_query_index(&scan) {
@@ -4118,7 +4146,21 @@ impl Db {
 
         // One instant for the whole pass: a `daysSince` evaluated per row against
         // a moving clock could put two rows of the same day in different buckets.
-        let now_ms = aggregation.now_ms.unwrap_or_else(crate::utils::now);
+        let clock = crate::expression::Clock {
+            now_ms: aggregation.now_ms.unwrap_or_else(crate::utils::now),
+            tz_offset_minutes: aggregation.tz_offset_minutes,
+        };
+        // Parse each formula once for the whole pass, not once per row.
+        let compiled: Vec<_> = aggregation
+            .aggregates
+            .iter()
+            .map(|aggregate| {
+                aggregate
+                    .expression
+                    .as_ref()
+                    .map(|expression| expression.compile(clock).ok())
+            })
+            .collect();
 
         for subject in subjects {
             let Ok(resource) = self.get_resource_shallow(&subject) else {
@@ -4133,10 +4175,16 @@ impl Db {
                 // A computed value stands in for a stored one: `Some(None)` means
                 // "this row has nothing to contribute", which is exactly how a
                 // missing property already reads below.
-                let computed = aggregate
-                    .expression
-                    .as_ref()
-                    .map(|expression| expression.evaluate(&resource, now_ms));
+                let computed = compiled[index].as_ref().map(|compiled| {
+                    compiled.as_ref().and_then(|compiled| {
+                        compiled.evaluate(&|p| {
+                            resource
+                                .get(p)
+                                .ok()
+                                .and_then(|value| compiled.instant(value))
+                        })
+                    })
+                });
 
                 let stored = if computed.is_some() {
                     None
@@ -5104,6 +5152,10 @@ impl Storelike for Db {
                 }
             }
 
+            // `lastCommit` is derived, not part of the doc: the row carries the
+            // id of the envelope the last signed commit kept. Re-applying the
+            // doc below rebuilds the propvals, so hold it aside.
+            let stored_last_commit = propvals.get(urls::LAST_COMMIT).cloned();
             let mut resource = Resource::from_propvals(propvals, res_subject);
             // Authoritative merged CRDT state (full oplog) lives in LoroSnapshots.
             // Propvals may carry a smaller incremental `loroUpdate` from the last commit.
@@ -5137,6 +5189,7 @@ impl Storelike for Db {
                         "Failed to read stored Loro snapshot; serving the stored propvals instead"
                     ),
                 }
+                self.serve_derived_last_commit(&mut resource, &subject_str, stored_last_commit);
             }
             Ok(resource)
         } else {
