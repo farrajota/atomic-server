@@ -1,10 +1,48 @@
 //! End-to-end tests: two Iroh endpoints, real QUIC sync (bulk + live).
 //!
-//! Run (single-threaded — tests share global `LIVE_PEERS` / `ROUTER` state):
-//! `cargo test -p atomic_lib --features "iroh,db-redb" --lib -- sync::iroh_e2e -- --test-threads=1`
+//! Each test runs its original body in an automatically spawned child process,
+//! isolating module-global `LIVE_PEERS` / `ROUTER` state. A module-local lock
+//! serializes only those child resource users; parent tests remain parallel.
+//! Run: `cargo test -p atomic_lib --features "iroh,db-redb" --lib -- sync::iroh_e2e`
 
 use crate::{agents::ForAgent, Db, Storelike};
 use iroh::protocol::Router;
+
+const ISOLATED_TEST_CHILD_ENV: &str = "ATOMIC_IROH_E2E_CHILD_TEST";
+static ISOLATED_TEST_CHILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_in_isolated_test_process() -> bool {
+    let current_thread = std::thread::current();
+    let test_name = current_thread
+        .name()
+        .expect("Iroh E2E test must have a libtest thread name");
+    assert!(
+        test_name.starts_with("sync::iroh_e2e::"),
+        "unexpected Iroh E2E test thread name: {test_name}"
+    );
+
+    if std::env::var(ISOLATED_TEST_CHILD_ENV).ok().as_deref() == Some(test_name) {
+        return false;
+    }
+
+    let _guard = ISOLATED_TEST_CHILD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([test_name, "--exact", "--test-threads=1"])
+        .env(ISOLATED_TEST_CHILD_ENV, test_name)
+        .output()
+        .expect("spawn isolated Iroh E2E test child");
+
+    assert!(
+        output.status.success(),
+        "isolated Iroh E2E test child {test_name} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}
 
 const STROKE_DATA: &str = "https://atomicdata.dev/ontology/canvas/strokeData";
 const FOLDER_PROP: &str = "https://atomicdata.dev/ontology/canvas/folderId";
@@ -121,6 +159,9 @@ async fn assign_folder(db: &Db, canvas: &str, folder: &str) {
 /// us earns a permanent reconnect slot with zero consent.
 #[tokio::test]
 async fn e2e_hello_exchanges_device_names() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     use crate::sync::peer;
 
     let pair = setup_pair("e2e_hello").await;
@@ -181,6 +222,9 @@ async fn e2e_hello_exchanges_device_names() {
 /// Initial bulk sync: canvases, strokes, and bidirectional merge (same agent / drive).
 #[tokio::test]
 async fn e2e_bidirectional_bulk_sync() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_bulk").await;
 
     let canvas_a = pair
@@ -245,6 +289,9 @@ async fn e2e_bidirectional_bulk_sync() {
 /// all and asserts the peer is still there and still syncing.
 #[tokio::test]
 async fn e2e_an_idle_link_survives_on_keepalives() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_idle_link").await;
 
     sync_b_from_a(&pair).await;
@@ -289,6 +336,9 @@ async fn e2e_an_idle_link_survives_on_keepalives() {
 /// into the CRDT would be persisted and synced forever.
 #[tokio::test]
 async fn e2e_presence_crosses_the_link_without_being_stored() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_presence").await;
 
     sync_b_from_a(&pair).await;
@@ -329,6 +379,9 @@ async fn e2e_presence_crosses_the_link_without_being_stored() {
 /// signed commit A validates and applies.
 #[tokio::test]
 async fn e2e_outbox_drains_over_the_live_link() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_outbox").await;
     let canvas = pair
         .db_a
@@ -385,6 +438,9 @@ async fn e2e_outbox_drains_over_the_live_link() {
 
 #[tokio::test]
 async fn e2e_stroke_append_after_sync() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_stroke").await;
 
     let canvas = pair
@@ -433,6 +489,9 @@ async fn e2e_stroke_append_after_sync() {
 /// Gallery folder moves: `folderId` on a canvas propagates over Iroh.
 #[tokio::test]
 async fn e2e_canvas_folder_assignment_syncs() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_folder").await;
 
     let folder = pair
@@ -478,6 +537,9 @@ async fn e2e_canvas_folder_assignment_syncs() {
 /// resync; the bulk path is the fallback, not the rule.
 #[tokio::test]
 async fn e2e_new_resource_after_bulk_resync() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_new_res").await;
 
     pair.db_a
@@ -533,6 +595,9 @@ async fn e2e_new_resource_after_bulk_resync() {
 /// Engine pull still works when live is unavailable (documents mobile fallback path).
 #[tokio::test]
 async fn e2e_engine_pull_after_iroh_bulk_sync() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_engine_pull").await;
 
     let canvas = pair
@@ -617,6 +682,9 @@ async fn e2e_engine_pull_after_iroh_bulk_sync() {
 /// account for its usage (`per_drive_usage`).
 #[tokio::test]
 async fn e2e_managed_node_replicates_missing_drive() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("e2e_replicate").await;
 
     // A has content under the drive; B starts without the drive at all.
@@ -679,6 +747,9 @@ async fn e2e_managed_node_replicates_missing_drive() {
 /// their own workspace belonged to "a different account".
 #[tokio::test]
 async fn pushing_a_workspace_to_an_empty_device_is_not_a_failure() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     use crate::sync::peer;
 
     // The always-on device: its own account, and nothing of Alice's on it.
@@ -733,6 +804,9 @@ async fn pushing_a_workspace_to_an_empty_device_is_not_a_failure() {
 /// one set of checks, every node). The explanation is for what actually failed.
 #[tokio::test]
 async fn peer_sync_says_why_when_a_different_agent_may_read_nothing() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     use crate::sync::peer;
 
     let db_a = Db::init_temp("xagent_a").await.unwrap();
@@ -789,6 +863,9 @@ async fn peer_sync_says_why_when_a_different_agent_may_read_nothing() {
 /// resource on connect and merge its Loro state.
 #[tokio::test]
 async fn same_agent_peers_reconcile_the_agent_resource() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     let pair = setup_pair("agent_reconcile").await;
 
     // B restored from the secret: it holds the key and the drive DID, but the
@@ -835,6 +912,9 @@ async fn same_agent_peers_reconcile_the_agent_resource() {
 /// leaves the server holding your drive with no way to say it is yours.
 #[tokio::test]
 async fn a_device_hands_its_agent_resource_to_a_different_account_server() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     use crate::sync::peer;
 
     // The server: its own account.
@@ -895,6 +975,9 @@ async fn a_device_hands_its_agent_resource_to_a_different_account_server() {
 /// themselves" admits only the holder of the key. This pins that.
 #[tokio::test]
 async fn a_peer_cannot_forge_a_third_agents_resource() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     use crate::agents::{Agent, ForAgent};
     use crate::sync::peer;
 
@@ -943,6 +1026,9 @@ async fn a_peer_cannot_forge_a_third_agents_resource() {
 /// again after a restart.
 #[tokio::test]
 async fn a_completed_peer_sync_names_the_drive_to_reconnect_to() {
+    if run_in_isolated_test_process() {
+        return;
+    }
     use crate::sync::peer;
 
     let db_a = Db::init_temp("active_drive_a").await.unwrap();
