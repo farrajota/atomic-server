@@ -4114,16 +4114,27 @@ async fn restored_source_is_readable_by_a_fresh_authorized_client_offline() {
             .to_request(),
     )
     .await;
-    assert_eq!(response.status(), 401, "anonymous recovery export is forbidden");
+    assert_eq!(
+        response.status(),
+        401,
+        "anonymous recovery export is forbidden"
+    );
     let body = get_body(response);
-    assert!(!body.contains(source_text), "anonymous export leaked source bytes");
+    assert!(
+        !body.contains(source_text),
+        "anonymous export leaked source bytes"
+    );
 
     let export_request = build_request_authenticated("/recovery/export", &source_appstate)
         .method(actix_web::http::Method::POST)
         .set_json(&request)
         .to_request();
     let response = test::call_service(&source_app, export_request).await;
-    assert_eq!(response.status(), 200, "authenticated recovery export failed");
+    assert_eq!(
+        response.status(),
+        200,
+        "authenticated recovery export failed"
+    );
     assert_eq!(
         response
             .headers()
@@ -4139,13 +4150,10 @@ async fn restored_source_is_readable_by_a_fresh_authorized_client_offline() {
     std::fs::create_dir(&target).unwrap();
     let uploads = target.join("uploads");
     std::fs::create_dir(&uploads).unwrap();
-    let restored_store = atomic_lib::Db::init_redb_file(
-        &target,
-        decoded.manifest().base_domain.clone(),
-        &uploads,
-    )
-    .await
-    .unwrap();
+    let restored_store =
+        atomic_lib::Db::init_redb_file(&target, decoded.manifest().base_domain.clone(), &uploads)
+            .await
+            .unwrap();
     atomic_lib::recovery::restore_bundle(&restored_store, &decoded)
         .await
         .unwrap();
@@ -4154,7 +4162,11 @@ async fn restored_source_is_readable_by_a_fresh_authorized_client_offline() {
 
     use clap::Parser;
     let target_data = target.to_string_lossy().into_owned();
-    let target_config = temp.path().join("target-config").to_string_lossy().into_owned();
+    let target_config = temp
+        .path()
+        .join("target-config")
+        .to_string_lossy()
+        .into_owned();
     let opts = Opts::parse_from([
         "atomic-server",
         "--data-dir",
@@ -4211,11 +4223,8 @@ async fn restored_source_is_readable_by_a_fresh_authorized_client_offline() {
         "/history-attribution?subject={}",
         urlencoding::encode(&subject)
     );
-    let response = test::call_service(
-        &app,
-        signed_request(&history_path, &owner).to_request(),
-    )
-    .await;
+    let response =
+        test::call_service(&app, signed_request(&history_path, &owner).to_request()).await;
     let status = response.status();
     let body = get_body(response);
     assert!(

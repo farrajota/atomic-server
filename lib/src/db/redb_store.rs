@@ -23,16 +23,29 @@ struct RedbReadView {
 
 impl KvReadView for RedbReadView {
     fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>> {
-        let table = self.tx.open_table(table_def(tree))
+        let table = self
+            .tx
+            .open_table(table_def(tree))
             .map_err(|e| format!("redb read-view open table: {e}"))?;
-        Ok(table.get(key).map_err(|e| format!("redb read-view get: {e}"))?
+        Ok(table
+            .get(key)
+            .map_err(|e| format!("redb read-view get: {e}"))?
             .map(|value| value.value().to_vec()))
     }
 
-    fn get_bounded(&self, tree: Tree, key: &[u8], max_bytes: usize) -> AtomicResult<Option<Vec<u8>>> {
-        let table = self.tx.open_table(table_def(tree))
+    fn get_bounded(
+        &self,
+        tree: Tree,
+        key: &[u8],
+        max_bytes: usize,
+    ) -> AtomicResult<Option<Vec<u8>>> {
+        let table = self
+            .tx
+            .open_table(table_def(tree))
             .map_err(|e| format!("redb read-view open table: {e}"))?;
-        let value = table.get(key).map_err(|e| format!("redb read-view get: {e}"))?;
+        let value = table
+            .get(key)
+            .map_err(|e| format!("redb read-view get: {e}"))?;
         match value {
             Some(value) => {
                 let bytes = value.value();
@@ -49,25 +62,39 @@ impl KvReadView for RedbReadView {
         self.scan_prefix_bounded(tree, prefix, limit, usize::MAX)
     }
 
-    fn scan_prefix_bounded(&self, tree: Tree, prefix: &[u8], row_limit: usize, max_bytes: usize) -> AtomicResult<Vec<KvPair>> {
-        let table = self.tx.open_table(table_def(tree))
+    fn scan_prefix_bounded(
+        &self,
+        tree: Tree,
+        prefix: &[u8],
+        row_limit: usize,
+        max_bytes: usize,
+    ) -> AtomicResult<Vec<KvPair>> {
+        let table = self
+            .tx
+            .open_table(table_def(tree))
             .map_err(|e| format!("redb read-view open table: {e}"))?;
         let rows = if let Some(end) = prefix_upper_bound(prefix) {
             table.range(prefix..end.as_slice())
         } else {
             table.range(prefix..)
-        }.map_err(|e| format!("redb read-view scan: {e}"))?;
+        }
+        .map_err(|e| format!("redb read-view scan: {e}"))?;
         let mut out = Vec::new();
         let mut bytes_used = 0usize;
         for row in rows {
             let (key, value) = row.map_err(|e| format!("redb read-view row: {e}"))?;
             let key = key.value();
-            if !key.starts_with(prefix) { break; }
+            if !key.starts_with(prefix) {
+                break;
+            }
             if out.len() >= row_limit {
                 return Err(format!("Read-view prefix scan exceeded row limit {row_limit}").into());
             }
             let value = value.value();
-            bytes_used = key.len().checked_add(value.len()).and_then(|n| bytes_used.checked_add(n))
+            bytes_used = key
+                .len()
+                .checked_add(value.len())
+                .and_then(|n| bytes_used.checked_add(n))
                 .filter(|n| *n <= max_bytes)
                 .ok_or_else(|| format!("Read-view prefix scan exceeded byte limit {max_bytes}"))?;
             out.push((key.to_vec(), value.to_vec()));
@@ -336,18 +363,28 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 
 impl KvStore for RedbStore {
     fn read_view(&self) -> AtomicResult<Arc<dyn KvReadView>> {
-        let tx = self.db.begin_read().map_err(|e| format!("redb read-view tx: {e}"))?;
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| format!("redb read-view tx: {e}"))?;
         Ok(Arc::new(RedbReadView { tx }))
     }
 
     fn write_recovery_snapshot(&self, key: &[u8], snapshot: &[u8]) -> AtomicResult<()> {
-        let tx = self.db.begin_write().map_err(|e| format!("redb recovery write tx: {e}"))?;
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| format!("redb recovery write tx: {e}"))?;
         {
-            let mut table = tx.open_table(table_def(Tree::LoroSnapshots))
+            let mut table = tx
+                .open_table(table_def(Tree::LoroSnapshots))
                 .map_err(|e| format!("redb recovery snapshot table: {e}"))?;
-            table.insert(key, snapshot).map_err(|e| format!("redb recovery snapshot insert: {e}"))?;
+            table
+                .insert(key, snapshot)
+                .map_err(|e| format!("redb recovery snapshot insert: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("redb recovery snapshot commit: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("redb recovery snapshot commit: {e}"))?;
         Ok(())
     }
 

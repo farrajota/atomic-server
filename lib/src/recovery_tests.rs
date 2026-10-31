@@ -172,7 +172,10 @@ fn rights_validating_opts() -> crate::commit::CommitOpts {
 
 async fn signed_drive(store: &Db, owner: &Agent, name: &str) -> String {
     let mut builder = crate::commit::CommitBuilder::new("placeholder".into());
-    builder.set(urls::IS_A.into(), Value::ResourceArray(vec![urls::DRIVE.into()]));
+    builder.set(
+        urls::IS_A.into(),
+        Value::ResourceArray(vec![urls::DRIVE.into()]),
+    );
     builder.set(urls::NAME.into(), Value::String(name.into()));
     for property in [urls::READ, urls::WRITE] {
         builder.set(
@@ -225,9 +228,20 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         .iter()
         .find(|entry| entry.subject == canonical_id(&fixture.store, &fixture.subject))
         .unwrap();
-    assert_eq!(source_entry.last_commit, revision(&fixture.store, &fixture.subject));
-    assert_eq!(source_entry.history.attributions.len(), source_history.attributions.len());
-    for (wire, native) in source_entry.history.attributions.iter().zip(&source_history.attributions) {
+    assert_eq!(
+        source_entry.last_commit,
+        revision(&fixture.store, &fixture.subject)
+    );
+    assert_eq!(
+        source_entry.history.attributions.len(),
+        source_history.attributions.len()
+    );
+    for (wire, native) in source_entry
+        .history
+        .attributions
+        .iter()
+        .zip(&source_history.attributions)
+    {
         assert_eq!(wire.spans, native.spans.clone().unwrap());
         assert_eq!(wire.server_spans, native.server_spans.clone().unwrap());
     }
@@ -238,7 +252,9 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         .iter()
         .any(|entry| entry.subject == canonical_id(&fixture.store, &fixture.subject)));
 
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     restore_bundle(&target, &bundle).await.unwrap();
 
     let source_subject = Subject::from_raw(&fixture.subject, target.get_base_domain().as_deref());
@@ -248,10 +264,15 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         value => panic!("unexpected restored Source description: {value:?}"),
     };
     assert_eq!(description.as_bytes(), fixture.source_text.as_bytes());
-    assert_eq!(sha256(description.as_bytes()), sha256(fixture.source_text.as_bytes()));
-    assert!(crate::hierarchy::check_read(&target, &restored, &owner_actor(&fixture.owner))
-        .await
-        .is_ok());
+    assert_eq!(
+        sha256(description.as_bytes()),
+        sha256(fixture.source_text.as_bytes())
+    );
+    assert!(
+        crate::hierarchy::check_read(&target, &restored, &owner_actor(&fixture.owner))
+            .await
+            .is_ok()
+    );
 
     let canonical_subject = canonical_id(&target, &fixture.subject);
     assert_eq!(
@@ -270,14 +291,31 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         .await
         .unwrap();
     assert!(history.complete);
-    assert_eq!(revision(&target, &fixture.subject), source_entry.last_commit);
-    assert_eq!(history.attributions.len(), source_entry.history.attributions.len());
-    for (wire, native) in source_entry.history.attributions.iter().zip(&history.attributions) {
+    assert_eq!(
+        revision(&target, &fixture.subject),
+        source_entry.last_commit
+    );
+    assert_eq!(
+        history.attributions.len(),
+        source_entry.history.attributions.len()
+    );
+    for (wire, native) in source_entry
+        .history
+        .attributions
+        .iter()
+        .zip(&history.attributions)
+    {
         assert_eq!(wire.spans, native.spans.clone().unwrap());
         assert_eq!(wire.server_spans, native.server_spans.clone().unwrap());
     }
-    assert!(history.attributions.iter().all(|attribution| attribution.verified));
-    assert!(history.changes.iter().any(|change| change.origin == crate::envelopes::ChangeOrigin::Signed));
+    assert!(history
+        .attributions
+        .iter()
+        .all(|attribution| attribution.verified));
+    assert!(history
+        .changes
+        .iter()
+        .any(|change| change.origin == crate::envelopes::ChangeOrigin::Signed));
     assert_change_attribution_matches(&source_history, &history);
     assert!(history
         .attributions
@@ -335,7 +373,10 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
         .await
         .unwrap();
     let mut builder = crate::commit::CommitBuilder::new(resource.get_subject().clone());
-    builder.set(urls::NAME.into(), Value::String("later full snapshot".into()));
+    builder.set(
+        urls::NAME.into(),
+        Value::String("later full snapshot".into()),
+    );
     let mut later = builder
         .sign(&fixture.owner, &fixture.store, &resource)
         .await
@@ -375,7 +416,10 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
         .find(|entry| entry.subject == canonical_id(&fixture.store, &fixture.subject))
         .unwrap();
     assert_eq!(entry.envelopes[0].created_at, 1);
-    assert_eq!(entry.last_commit, revision(&fixture.store, &fixture.subject));
+    assert_eq!(
+        entry.last_commit,
+        revision(&fixture.store, &fixture.subject)
+    );
     assert_eq!(
         entry.last_commit,
         crate::identifiers::commit_subject(&latest_signature)
@@ -386,14 +430,19 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
         .find(|resource| resource.subject == entry.subject)
         .unwrap();
     let snapshot_doc = strict_snapshot_doc(&resource.snapshot).unwrap();
-    assert!(snapshot_doc.get_all_properties().get(urls::LAST_COMMIT).is_none());
+    assert!(snapshot_doc
+        .get_all_properties()
+        .get(urls::LAST_COMMIT)
+        .is_none());
     let latest_envelope = resource
         .envelopes
         .iter()
         .find(|envelope| envelope.signature == latest_signature)
         .unwrap();
     let latest_json: serde_json::Value = serde_json::from_str(&latest_envelope.json).unwrap();
-    assert!(latest_json.get(urls::PREVIOUS_COMMIT).map_or(true, serde_json::Value::is_null));
+    assert!(latest_json
+        .get(urls::PREVIOUS_COMMIT)
+        .map_or(true, serde_json::Value::is_null));
     for (token, signature) in &original_signatures {
         let attribution = entry
             .history
@@ -404,7 +453,9 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
         assert_eq!(&attribution.signature, signature);
         assert_eq!(attribution.signer, fixture.owner.subject.to_string());
     }
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     restore_bundle(&target, &bundle).await.unwrap();
     let history = crate::envelopes::attribute_history(&target, &fixture.subject)
         .await
@@ -417,17 +468,30 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
         assert_eq!(wire.server_spans, native.server_spans.clone().unwrap());
     }
     for (token, signature) in &original_signatures {
-        let change = history.changes.iter().find(|change| change.message.as_deref() == Some(token.as_str())).unwrap();
+        let change = history
+            .changes
+            .iter()
+            .find(|change| change.message.as_deref() == Some(token.as_str()))
+            .unwrap();
         assert_eq!(change.origin, crate::envelopes::ChangeOrigin::Signed);
-        assert_eq!(change.signer.as_deref(), Some(fixture.owner.subject.as_str()));
-        assert_eq!(&history.attributions[change.attribution.unwrap()].signature, signature);
+        assert_eq!(
+            change.signer.as_deref(),
+            Some(fixture.owner.subject.as_str())
+        );
+        assert_eq!(
+            &history.attributions[change.attribution.unwrap()].signature,
+            signature
+        );
     }
     assert_change_attribution_matches(&source_history, &history);
     let restored = target
         .get_resource(&Subject::from(fixture.subject.as_str()))
         .await
         .unwrap();
-    assert_eq!(restored.get(urls::NAME).unwrap().to_string(), "later full snapshot");
+    assert_eq!(
+        restored.get(urls::NAME).unwrap().to_string(),
+        "later full snapshot"
+    );
     assert_eq!(
         crate::envelopes::envelopes(&target, &fixture.subject),
         crate::envelopes::envelopes(&fixture.store, &fixture.subject)
@@ -442,7 +506,10 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
 
     for legacy in [false, true] {
         let mut builder = crate::commit::CommitBuilder::new("did:ad:placeholder".into());
-        builder.set(urls::IS_A.into(), Value::ResourceArray(vec![urls::CLASS.into()]));
+        builder.set(
+            urls::IS_A.into(),
+            Value::ResourceArray(vec![urls::CLASS.into()]),
+        );
         builder.set(
             urls::NAME.into(),
             Value::String("Ordinary rights-validating Source".into()),
@@ -451,7 +518,10 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
             urls::DESCRIPTION.into(),
             Value::Markdown(fixture.source_text.clone()),
         );
-        builder.set(urls::SHORTNAME.into(), Value::Slug("ordinary-source".into()));
+        builder.set(
+            urls::SHORTNAME.into(),
+            Value::Slug("ordinary-source".into()),
+        );
         builder.set(
             urls::PARENT.into(),
             Value::AtomicUrl(fixture.drive.as_str().into()),
@@ -466,10 +536,8 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
                 )
                 .await
                 .unwrap();
-            commit.subject = crate::identifiers::resource_subject(
-                commit.signature.as_deref().unwrap(),
-            )
-            .into();
+            commit.subject =
+                crate::identifiers::resource_subject(commit.signature.as_deref().unwrap()).into();
             commit
         } else {
             crate::commit::Commit::create_did(builder, &fixture.owner, &fixture.store)
@@ -480,7 +548,9 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
         let author_doc = strict_snapshot_doc(commit.loro_update.as_deref().unwrap()).unwrap();
         assert!(!author_doc.get_all_properties().contains_key(urls::WRITE));
         if legacy {
-            assert!(!author_doc.get_all_properties().contains_key(urls::DRIVE_PROP));
+            assert!(!author_doc
+                .get_all_properties()
+                .contains_key(urls::DRIVE_PROP));
         }
         commit
             .validate_signature(&LocalRecoveryStore::new(&fixture.store))
@@ -543,7 +613,9 @@ async fn ordinary_rights_validating_genesis_and_reparent_preserve_exact_bookkeep
                 .await
                 .unwrap();
             let bundle = decode_for_owner(&bytes, &fixture.owner).unwrap();
-            let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+            let target = Db::init_redb(Some("https://localhost".into()))
+                .await
+                .unwrap();
             restore_bundle(&target, &bundle).await.unwrap();
             let restored = target
                 .get_resource(&Subject::from(subject.as_str()))
@@ -605,12 +677,18 @@ async fn native_drive_bookkeeping_uses_original_parent_receipts_after_parent_mov
     let second_drive = signed_drive(&fixture.store, &fixture.owner, "Later parent home").await;
     let mut builder = crate::commit::CommitBuilder::new("did:ad:placeholder".into());
     builder.is_genesis = true;
-    builder.set(urls::IS_A.into(), Value::ResourceArray(vec![urls::CLASS.into()]));
+    builder.set(
+        urls::IS_A.into(),
+        Value::ResourceArray(vec![urls::CLASS.into()]),
+    );
     builder.set(
         urls::NAME.into(),
         Value::String("Legacy child with derived drive".into()),
     );
-    builder.set(urls::SHORTNAME.into(), Value::Slug("historical-child".into()));
+    builder.set(
+        urls::SHORTNAME.into(),
+        Value::Slug("historical-child".into()),
+    );
     builder.set(
         urls::DESCRIPTION.into(),
         Value::Markdown(fixture.source_text.clone()),
@@ -627,7 +705,8 @@ async fn native_drive_bookkeeping_uses_original_parent_receipts_after_parent_mov
         )
         .await
         .unwrap();
-    commit.subject = crate::identifiers::resource_subject(commit.signature.as_deref().unwrap()).into();
+    commit.subject =
+        crate::identifiers::resource_subject(commit.signature.as_deref().unwrap()).into();
     let child = commit.subject.to_string();
     fixture
         .store
@@ -688,7 +767,9 @@ async fn native_drive_bookkeeping_uses_original_parent_receipts_after_parent_mov
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     restore_bundle(&target, &decode_for_owner(&bytes, &fixture.owner).unwrap())
         .await
         .unwrap();
@@ -771,7 +852,9 @@ async fn export_source_proof_uses_the_store_default_agent_and_fails_without_its_
     let source_signer = Agent::new(Some("Recovery source signer")).unwrap();
     fixture.store.set_default_agent(source_signer.clone());
     let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
-    let bytes = export_bundle(&fixture.store, &request, &requester).await.unwrap();
+    let bytes = export_bundle(&fixture.store, &request, &requester)
+        .await
+        .unwrap();
     let bundle = decode_for_owner(&bytes, &source_signer).unwrap();
     assert_eq!(
         bundle.manifest.source_agent,
@@ -789,7 +872,8 @@ async fn export_source_proof_uses_the_store_default_agent_and_fails_without_its_
 }
 
 #[tokio::test]
-async fn source_proof_requires_independent_pin_and_binds_manifest_inventory_spans_revision_and_payload() {
+async fn source_proof_requires_independent_pin_and_binds_manifest_inventory_spans_revision_and_payload(
+) {
     let fixture = fixture("source_proof", EnvelopeRetention::All).await;
     let request = request_for(&fixture.store, &fixture.drive, &fixture.subject);
     let bytes = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
@@ -810,8 +894,7 @@ async fn source_proof_requires_independent_pin_and_binds_manifest_inventory_span
         let mut altered = original.clone();
         match mutation {
             "scope" => altered.manifest.allowed_drives[0] = "atomic:drive:changed".into(),
-            "inventory" =>
-                altered.manifest.resources[0].envelopes[0].sha256 = "f".repeat(64),
+            "inventory" => altered.manifest.resources[0].envelopes[0].sha256 = "f".repeat(64),
             "spans" => altered.manifest.resources[0].history.attributions[0]
                 .spans
                 .push(crate::loro::ChangeSpan {
@@ -819,8 +902,9 @@ async fn source_proof_requires_independent_pin_and_binds_manifest_inventory_span
                     counter: 0,
                     length: 1,
                 }),
-            "revision" => { altered.manifest.resources[0].last_commit =
-                "atomic:commit:source-proof-substitution".into()
+            "revision" => {
+                altered.manifest.resources[0].last_commit =
+                    "atomic:commit:source-proof-substitution".into()
             }
             _ => unreachable!(),
         }
@@ -838,11 +922,8 @@ async fn source_proof_requires_independent_pin_and_binds_manifest_inventory_span
 
     let mut attacker_signed = original.clone();
     let proof = source_proof_message(&attacker_signed.manifest).unwrap();
-    attacker_signed.manifest.source_signature = crate::agents::sign_message(
-        &proof,
-        attacker.private_key.as_deref().unwrap(),
-    )
-    .unwrap();
+    attacker_signed.manifest.source_signature =
+        crate::agents::sign_message(&proof, attacker.private_key.as_deref().unwrap()).unwrap();
     let attacker_signed_bytes = seal_bundle(
         &attacker_signed.manifest,
         &encode_native_payload(&attacker_signed.resources).unwrap(),
@@ -914,16 +995,23 @@ async fn refuses_selected_file_payloads_and_latest_only_history() {
         &file_fixture.drive,
         &file_fixture.subject,
     );
-    export_bundle(&file_fixture.store, &positive, &owner_actor(&file_fixture.owner))
-        .await
-        .unwrap();
+    export_bundle(
+        &file_fixture.store,
+        &positive,
+        &owner_actor(&file_fixture.owner),
+    )
+    .await
+    .unwrap();
     let file = file_fixture
         .store
         .create_resource(
             urls::FILE,
             &file_fixture.drive,
             "Attachment",
-            Some(vec![(urls::DESCRIPTION, Value::Markdown("not a Source".into()))]),
+            Some(vec![(
+                urls::DESCRIPTION,
+                Value::Markdown("not a Source".into()),
+            )]),
         )
         .await
         .unwrap();
@@ -963,19 +1051,19 @@ async fn detects_a_revision_change_after_the_immutable_view_opens() {
         .await
         .unwrap();
     resource
-        .set(urls::NAME.into(), Value::String("raced revision".into()), &fixture.store)
+        .set(
+            urls::NAME.into(),
+            Value::String("raced revision".into()),
+            &fixture.store,
+        )
         .await
         .unwrap();
     resource.save_locally(&fixture.store).await.unwrap();
 
-    let error = export_bundle_from_view(
-        &fixture.store,
-        view,
-        &request,
-        &owner_actor(&fixture.owner),
-    )
-    .await
-    .unwrap_err();
+    let error =
+        export_bundle_from_view(&fixture.store, view, &request, &owner_actor(&fixture.owner))
+            .await
+            .unwrap_err();
     assert!(error.to_string().contains("changed during export"));
 }
 
@@ -1003,18 +1091,17 @@ async fn detects_ancestor_read_revocation_after_view_opens() {
         .unwrap();
     let view = fixture.store.kv.read_view().unwrap();
     drive
-        .set(urls::READ.into(), Value::ResourceArray(vec![]), &fixture.store)
+        .set(
+            urls::READ.into(),
+            Value::ResourceArray(vec![]),
+            &fixture.store,
+        )
         .await
         .unwrap();
     drive.save_locally(&fixture.store).await.unwrap();
-    let error = export_bundle_from_view(
-        &fixture.store,
-        view,
-        &request,
-        &owner_actor(&reader),
-    )
-    .await
-    .unwrap_err();
+    let error = export_bundle_from_view(&fixture.store, view, &request, &owner_actor(&reader))
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("changed during export"));
 }
 
@@ -1033,18 +1120,18 @@ async fn detects_reparent_after_view_opens() {
         .await
         .unwrap();
     resource
-        .set(urls::PARENT.into(), Value::AtomicUrl(other.into()), &fixture.store)
+        .set(
+            urls::PARENT.into(),
+            Value::AtomicUrl(other.into()),
+            &fixture.store,
+        )
         .await
         .unwrap();
     resource.save_locally(&fixture.store).await.unwrap();
-    let error = export_bundle_from_view(
-        &fixture.store,
-        view,
-        &request,
-        &owner_actor(&fixture.owner),
-    )
-    .await
-    .unwrap_err();
+    let error =
+        export_bundle_from_view(&fixture.store, view, &request, &owner_actor(&fixture.owner))
+            .await
+            .unwrap_err();
     assert!(error.to_string().contains("changed during export"));
 }
 
@@ -1097,7 +1184,10 @@ async fn rejects_resealed_snapshot_with_unmaterialized_causal_operations() {
     bundle.manifest.payload_sha256 = sha256(&payload);
     let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
     let error = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap_err();
-    assert!(error.to_string().contains("pending causal operations"), "{error}");
+    assert!(
+        error.to_string().contains("pending causal operations"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1115,16 +1205,19 @@ async fn refuses_resealed_unsigned_content_and_container_operations() {
             .iter()
             .position(|resource| resource.subject == canonical_id(&fixture.store, &fixture.subject))
             .unwrap();
-        let doc = crate::loro::AtomicLoroDoc::from_snapshot(&bundle.resources[index].snapshot)
-            .unwrap();
+        let doc =
+            crate::loro::AtomicLoroDoc::from_snapshot(&bundle.resources[index].snapshot).unwrap();
         if container_mutation {
             doc.doc()
                 .get_map("unsigned-hidden-container")
                 .insert("payload", "forged")
                 .unwrap();
         } else {
-            doc.set_property(urls::DESCRIPTION, &Value::Markdown("forged Source text".into()))
-                .unwrap();
+            doc.set_property(
+                urls::DESCRIPTION,
+                &Value::Markdown("forged Source text".into()),
+            )
+            .unwrap();
         }
         let snapshot = doc.export_snapshot();
         let resource = resource_from_snapshot(&bundle.resources[index].subject, &snapshot).unwrap();
@@ -1136,7 +1229,9 @@ async fn refuses_resealed_unsigned_content_and_container_operations() {
         bundle.resources[index].snapshot = snapshot;
         let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
         let forged = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
-        let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+        let target = Db::init_redb(Some("https://localhost".into()))
+            .await
+            .unwrap();
         let error = restore_bundle(&target, &forged).await.unwrap_err();
         assert!(
             error
@@ -1202,12 +1297,15 @@ async fn refuses_resealed_unsigned_acl_drive_and_late_signer_grants() {
         bundle.resources[index].snapshot = snapshot;
         let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
         let forged = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
-        let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+        let target = Db::init_redb(Some("https://localhost".into()))
+            .await
+            .unwrap();
         let error = restore_bundle(&target, &forged).await.unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("Recovery snapshot operation is not covered by original spans"), "{mutation}: {error}"
+                .contains("Recovery snapshot operation is not covered by original spans"),
+            "{mutation}: {error}"
         );
     }
 }
@@ -1227,9 +1325,14 @@ async fn source_authenticated_invalid_native_signature_is_rejected() {
     let malformed_bytes = reseal_modified_envelope(&mut bundle, 0, 0, &fixture.owner).unwrap();
     let authenticated = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
 
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     let error = restore_bundle(&target, &authenticated).await.unwrap_err();
-    assert!(error.to_string().contains("signature must be 64 bytes"), "{error}");
+    assert!(
+        error.to_string().contains("signature must be 64 bytes"),
+        "{error}"
+    );
     assert!(target
         .get_resource(&Subject::from(fixture.drive.as_str()))
         .await
@@ -1254,7 +1357,9 @@ async fn rejects_unknown_envelope_properties_without_contacting_loopback() {
     *envelope = serde_json::to_string(&json).unwrap();
     let malformed_bytes = reseal_modified_envelope(&mut bundle, 0, 0, &fixture.owner).unwrap();
     let authenticated = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     let error = restore_bundle(&target, &authenticated).await.unwrap_err();
     assert!(error.to_string().contains("unsupported property"));
     assert_eq!(
@@ -1274,7 +1379,10 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
             "Nested class",
             Some(vec![
                 (urls::SHORTNAME, Value::Slug("nested-class".into())),
-                (urls::DESCRIPTION, Value::Markdown("Nested custom class".into())),
+                (
+                    urls::DESCRIPTION,
+                    Value::Markdown("Nested custom class".into()),
+                ),
             ]),
         )
         .await
@@ -1376,7 +1484,9 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
     let bytes = export_bundle(&fixture.store, &complete, &owner_actor(&fixture.owner))
         .await
         .unwrap();
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     restore_bundle(&target, &decode_for_owner(&bytes, &fixture.owner).unwrap())
         .await
         .unwrap();
@@ -1433,7 +1543,9 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
         incomplete_bundle.manifest.envelope_count -= removed_envelopes;
         let malformed_bytes = reseal_as_source(&mut incomplete_bundle, &fixture.owner).unwrap();
         let resealed = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
-        let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+        let target = Db::init_redb(Some("https://localhost".into()))
+            .await
+            .unwrap();
         let error = restore_bundle(&target, &resealed).await.unwrap_err();
         assert!(
             error
@@ -1441,7 +1553,10 @@ async fn signed_optional_property_and_nested_class_require_explicit_support() {
                 .contains("Recovery dependency is not explicit"),
             "missing {missing_kind}: {error}"
         );
-        assert!(error.to_string().contains(&omitted), "missing {missing_kind}: {error}");
+        assert!(
+            error.to_string().contains(&omitted),
+            "missing {missing_kind}: {error}"
+        );
     }
 }
 
@@ -1454,7 +1569,10 @@ async fn declared_missing_external_ancestor_never_contacts_loopback() {
         .unwrap();
     let trap = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     trap.set_nonblocking(true).unwrap();
-    let missing = format!("http://{}/unmaterialized-ancestor", trap.local_addr().unwrap());
+    let missing = format!(
+        "http://{}/unmaterialized-ancestor",
+        trap.local_addr().unwrap()
+    );
     let mut child = fixture
         .store
         .get_resource(&Subject::from(fixture.subject.as_str()))
@@ -1476,20 +1594,19 @@ async fn declared_missing_external_ancestor_never_contacts_loopback() {
         expected_last_commit: "atomic:commit:unavailable".into(),
     });
     let outsider = Agent::new(Some("No ancestor grant")).unwrap();
-    let error = export_bundle(
-        &fixture.store,
-        &request,
-        &owner_actor(&outsider),
-    )
-    .await
-    .unwrap_err();
+    let error = export_bundle(&fixture.store, &request, &owner_actor(&outsider))
+        .await
+        .unwrap_err();
     assert!(
         error
             .to_string()
             .contains("not authorized for every selected resource"),
         "{error}"
     );
-    assert_eq!(trap.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        trap.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[tokio::test]
@@ -1517,7 +1634,9 @@ async fn later_signed_snapshot_cannot_replace_missing_original_envelope() {
     bundle.manifest.envelope_count -= 1;
     let malformed_bytes = reseal_as_source(&mut bundle, &fixture.owner).unwrap();
     let resealed = decode_for_owner(&malformed_bytes, &fixture.owner).unwrap();
-    let target = Db::init_redb(Some("https://localhost".into())).await.unwrap();
+    let target = Db::init_redb(Some("https://localhost".into()))
+        .await
+        .unwrap();
     let error = restore_bundle(&target, &resealed).await.unwrap_err();
     assert!(
         error
@@ -1571,7 +1690,9 @@ async fn refuses_export_with_unreadable_compact_history() {
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("Malformed retained recovery envelope"),
+        error
+            .to_string()
+            .contains("Malformed retained recovery envelope"),
         "{error}"
     );
 }
@@ -1602,7 +1723,11 @@ async fn native_export_ceiling_counts_manifest_after_a_valid_signed_payload() {
         .json
         .into_bytes();
     json.resize(json.len() + padding, b' ');
-    fixture.store.kv.insert(Tree::Envelopes, &key, &json).unwrap();
+    fixture
+        .store
+        .kv
+        .insert(Tree::Envelopes, &key, &json)
+        .unwrap();
     let error = export_bundle(&fixture.store, &request, &owner_actor(&fixture.owner))
         .await
         .unwrap_err();
@@ -1720,9 +1845,12 @@ async fn populated_sled_backend_refuses_recovery_but_preserves_ordinary_reads() 
     let error = export_bundle(&store, &request, &owner_actor(&owner))
         .await
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not support consistent read views"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support consistent read views"),
+        "{error}"
+    );
     let after = store
         .get_resource(&Subject::from(subject.as_str()))
         .await

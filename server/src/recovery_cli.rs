@@ -116,7 +116,10 @@ fn protected_paths(args: &[OsString]) -> AtomicServerResult<Vec<PathBuf>> {
     let mut protected = Vec::new();
     let data_dir = directory_override(args, "--data-dir")
         .or_else(|| std::env::var_os("ATOMIC_DATA_DIR").map(PathBuf::from))
-        .or_else(|| { project_dirs.as_ref().map(|dirs| dirs.data_dir().to_path_buf())
+        .or_else(|| {
+            project_dirs
+                .as_ref()
+                .map(|dirs| dirs.data_dir().to_path_buf())
         })
         .unwrap_or_else(|| PathBuf::from("atomic-data/data"));
     protected.push(data_dir);
@@ -129,7 +132,10 @@ fn protected_paths(args: &[OsString]) -> AtomicServerResult<Vec<PathBuf>> {
     }
     if let Some(cache_dir) = directory_override(args, "--cache-dir")
         .or_else(|| std::env::var_os("ATOMIC_CACHE_DIR").map(PathBuf::from))
-        .or_else(|| { project_dirs.as_ref().map(|dirs| dirs.cache_dir().to_path_buf())
+        .or_else(|| {
+            project_dirs
+                .as_ref()
+                .map(|dirs| dirs.cache_dir().to_path_buf())
         })
     {
         protected.push(cache_dir);
@@ -201,8 +207,11 @@ pub async fn restore(
 }
 
 fn read_bundle(path: &Path) -> AtomicServerResult<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| { format!("Could not inspect recovery bundle {}: {error}", path.display())
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "Could not inspect recovery bundle {}: {error}",
+            path.display()
+        )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("Recovery bundle input must be a regular non-symlink file".into());
@@ -482,7 +491,10 @@ mod tests {
             missing_pin_target.clone().into_os_string(),
         ];
         let error = run_from_args(&missing_pin_args).await.unwrap_err();
-        assert!(error.to_string().contains("trusted-source-agent"), "{error}");
+        assert!(
+            error.to_string().contains("trusted-source-agent"),
+            "{error}"
+        );
         assert!(!missing_pin_target.exists());
         let attacker = atomic_lib::agents::Agent::new(Some("Wrong recovery source pin")).unwrap();
         let rejected_target = temp.path().join("wrong-source-target");
@@ -498,7 +510,10 @@ mod tests {
             OsString::from(attacker.subject.to_string()),
         ];
         let error = run_from_args(&rejected_args).await.unwrap_err();
-        assert!(error.to_string().contains("trusted source-agent pin"), "{error}");
+        assert!(
+            error.to_string().contains("trusted source-agent pin"),
+            "{error}"
+        );
         assert!(!rejected_target.exists());
 
         let args = vec![

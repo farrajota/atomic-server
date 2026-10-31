@@ -1063,7 +1063,9 @@ pub(crate) fn recovery_span_ops(
     }
 
     let mut identities = std::collections::HashSet::with_capacity(history.attributions.len());
-    history.attributions.iter()
+    history
+        .attributions
+        .iter()
         .map(|attribution| {
             if !attribution.verified
                 || attribution.signer.is_empty()
@@ -1073,13 +1075,15 @@ pub(crate) fn recovery_span_ops(
                     != crate::identifiers::commit_subject(&attribution.signature)
                 || !identities.insert(attribution.signature.as_str())
             {
-            return Err("Recovery attribution does not match its verified envelope".into());
-        }
+                return Err("Recovery attribution does not match its verified envelope".into());
+            }
             let spans = SpanRecord {
-                client: attribution.spans
+                client: attribution
+                    .spans
                     .as_deref()
                     .ok_or("Recovery signed spans are missing")?,
-                server: attribution.server_spans
+                server: attribution
+                    .server_spans
                     .as_deref()
                     .ok_or("Recovery server spans are missing")?,
             };
@@ -1087,7 +1091,7 @@ pub(crate) fn recovery_span_ops(
                 tree: Tree::EnvelopeSpans,
                 method: Method::Insert,
                 key: key(subject, attribution.created_at, &attribution.signature),
-            val: Some(serde_json::to_vec(&spans)?),
+                val: Some(serde_json::to_vec(&spans)?),
             })
         })
         .collect()
@@ -1137,9 +1141,7 @@ impl std::io::Write for OperationDigest {
             .checked_add(bytes.len())
             .filter(|next| *next <= self.limit)
             .ok_or_else(|| {
-                std::io::Error::other(
-                    "Recovery operation proof exceeds its 1 GiB work limit",
-                )
+                std::io::Error::other("Recovery operation proof exceeds its 1 GiB work limit")
             })?;
         self.hash.update(bytes);
         self.bytes = next;
@@ -1163,10 +1165,6 @@ fn operation_digest<T: serde::Serialize + ?Sized>(
     serde_json::to_writer(&mut writer, changes)?;
     Ok((writer.hash.finalize().into(), writer.bytes))
 }
-
-
-
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoverySpanOwner {
@@ -1280,11 +1278,14 @@ fn recovery_owner_for_range(
     end: i32,
     work: &mut usize,
 ) -> AtomicResult<RecoverySpanOwner> {
-    let mut index = spans.partition_point(|span|
-        span.peer < peer || (span.peer == peer && span.end <= start));
+    let mut index =
+        spans.partition_point(|span| span.peer < peer || (span.peer == peer && span.end <= start));
     let mut cursor = start;
     let mut owner = None;
-    while let Some(span) = spans.get(index).filter(|span| span.peer == peer && span.start < end) {
+    while let Some(span) = spans
+        .get(index)
+        .filter(|span| span.peer == peer && span.start < end)
+    {
         RecoveryOperationProof::charge_work(work, 1)?;
         let covered_from = span.start.max(start);
         if covered_from > cursor {
@@ -1292,7 +1293,9 @@ fn recovery_owner_for_range(
         }
         if let Some(previous) = owner {
             if previous != span.owner {
-                return Err("Recovery snapshot change mixes signed owners or server bookkeeping".into());
+                return Err(
+                    "Recovery snapshot change mixes signed owners or server bookkeeping".into(),
+                );
             }
         } else {
             owner = Some(span.owner);
@@ -1454,7 +1457,9 @@ impl RecoveryOperationProof {
             operation_digest(&supplied.changes, remaining - signed_bytes)?;
         self.compared_bytes += signed_bytes + supplied_bytes;
         if signed_bytes != supplied_bytes || signed_hash != supplied_hash {
-            return Err("Recovery snapshot operations differ from original signed native bytes".into());
+            return Err(
+                "Recovery snapshot operations differ from original signed native bytes".into(),
+            );
         }
         self.ranges.push((start, end));
         self.prerequisites.push(after);
@@ -1499,8 +1504,7 @@ impl RecoveryOperationProof {
         attributions: &[Attribution],
         spans: &[RecoveryOwnedSpan],
     ) -> AtomicResult<Vec<RecoverySpanOwner>> {
-        if self.ranges.len() != attributions.len()
-            || self.prerequisites.len() != attributions.len()
+        if self.ranges.len() != attributions.len() || self.prerequisites.len() != attributions.len()
         {
             return Err("Recovery signed envelope inventory is inconsistent".into());
         }
@@ -1518,7 +1522,11 @@ impl RecoveryOperationProof {
         }
         for (index, attribution) in attributions.iter().enumerate() {
             let (start, end) = &self.ranges[index];
-            for span in attribution.spans.as_deref().ok_or("Recovery signed spans are missing")? {
+            for span in attribution
+                .spans
+                .as_deref()
+                .ok_or("Recovery signed spans are missing")?
+            {
                 let span_end = recovery_span_end(span)?;
                 if span.counter < start.get(&span.peer).copied().unwrap_or(0)
                     || span_end > end.get(&span.peer).copied().unwrap_or(0)
@@ -1568,8 +1576,7 @@ impl RecoveryOperationProof {
             }
             change_owners.push(change_owner.ok_or("Recovery snapshot change has no operations")?);
         }
-        if normalized_recovery_ranges(snapshot_ranges)?
-            != normalized_recovery_ranges(span_ranges)?
+        if normalized_recovery_ranges(snapshot_ranges)? != normalized_recovery_ranges(span_ranges)?
         {
             return Err("Recovery original spans do not exactly cover snapshot operations".into());
         }
@@ -1596,10 +1603,10 @@ impl RecoveryOperationProof {
             return Err("Recovery server bookkeeping precedes its signed update".into());
         }
         let mut prior = before.clone();
-        for span in spans.iter().filter(|span| { span.owner == RecoverySpanOwner::Client(owner_index)
-            || span.owner == RecoverySpanOwner::Server(owner_index)
-        })
-        {
+        for span in spans.iter().filter(|span| {
+            span.owner == RecoverySpanOwner::Client(owner_index)
+                || span.owner == RecoverySpanOwner::Server(owner_index)
+        }) {
             let present = prior.get(&span.peer).copied().unwrap_or(0);
             if present > span.start {
                 if span.start == 0 {
@@ -1629,12 +1636,14 @@ impl RecoveryOperationProof {
         if is_new
             && resource.get_subject().is_did()
             && !crate::hierarchy::is_chat_log(&resource)
-            && !resource.get(crate::urls::IS_A)
+            && !resource
+                .get(crate::urls::IS_A)
                 .ok()
                 .and_then(|value| value.to_subjects(None).ok())
                 .is_some_and(|classes| classes.iter().any(|class| class == crate::urls::AGENT))
         {
-            let mut writers = resource.get(crate::urls::WRITE)
+            let mut writers = resource
+                .get(crate::urls::WRITE)
                 .ok()
                 .and_then(|value| value.to_subjects(None).ok())
                 .unwrap_or_default();
@@ -1985,7 +1994,9 @@ fn recovery_drive_insert_values(
         {
             if crate::identifiers::canonicalize_scheme(key)
                 == crate::identifiers::canonicalize_scheme(crate::urls::DRIVE_PROP)
-                && !values.iter().any(|existing| existing.as_str() == value.as_ref())
+                && !values
+                    .iter()
+                    .any(|existing| existing.as_str() == value.as_ref())
             {
                 values.push(value.to_string());
             }
@@ -2052,14 +2063,9 @@ async fn recovery_claimed_drive_is_appendable(
         return false;
     };
     let agent: crate::agents::ForAgent = signer.into();
-    crate::hierarchy::check_rights(
-        &local,
-        &drive,
-        &agent,
-        crate::hierarchy::Right::Append,
-    )
-    .await
-    .is_ok()
+    crate::hierarchy::check_rights(&local, &drive, &agent, crate::hierarchy::Right::Append)
+        .await
+        .is_ok()
 }
 
 fn recovery_derived_drive(
@@ -2094,7 +2100,8 @@ fn recovery_derived_drive(
         let doc = match store.kv.get(Tree::LoroSnapshots, id.as_bytes())? {
             Some(snapshot) => crate::recovery::strict_snapshot_doc(&snapshot)?,
             None if !members.contains(&id) => {
-                let subject = crate::Subject::from_raw(&current, store.get_base_domain().as_deref());
+                let subject =
+                    crate::Subject::from_raw(&current, store.get_base_domain().as_deref());
                 store
                     .get_resource_shallow(&store.normalize_subject(&subject))?
                     .build_state_doc()?
@@ -2122,7 +2129,9 @@ fn recovery_derived_drive(
             if length == 0 {
                 continue;
             }
-            let last = change.counter.checked_add(length - 1)
+            let last = change
+                .counter
+                .checked_add(length - 1)
                 .ok_or("Recovery drive history counter overflow")?;
             versions.push(loro::ID::new(change.peer, last));
         }
@@ -2136,9 +2145,9 @@ fn recovery_derived_drive(
             let historical;
             let state = if let Some(version) = version {
                 let mut state = crate::Resource::new(current.clone());
-                state.apply_state_doc(doc.fork_at(
-                    &crate::loro::VersionID::from_frontiers(&loro::Frontiers::from_id(version)),
-                )?)?;
+                state.apply_state_doc(doc.fork_at(&crate::loro::VersionID::from_frontiers(
+                    &loro::Frontiers::from_id(version),
+                ))?)?;
                 historical = state;
                 &historical
             } else {
@@ -2153,7 +2162,9 @@ fn recovery_derived_drive(
                 let parent_id = identity(&parent);
                 let next_depth = depth + 1;
                 if next_depth < 32
-                    && scheduled.get(&parent_id).is_none_or(|best| next_depth < *best)
+                    && scheduled
+                        .get(&parent_id)
+                        .is_none_or(|best| next_depth < *best)
                 {
                     scheduled.insert(parent_id, next_depth);
                     pending.push((parent, next_depth));
@@ -2258,13 +2269,8 @@ pub(crate) async fn recovery_history_from_view(
     let pure = recovery_envelope_id(store, subject);
     let stored_doc = crate::recovery::strict_snapshot_doc(snapshot)
         .map_err(|error| format!("Recovery snapshot is invalid for {pure}: {error}"))?;
-    let envelopes = recovery_envelopes_from_view(
-        store,
-        view,
-        subject,
-        envelope_limit,
-        envelope_byte_limit,
-    )?;
+    let envelopes =
+        recovery_envelopes_from_view(store, view, subject, envelope_limit, envelope_byte_limit)?;
     if envelopes.is_empty() {
         return Err(format!("Recovery history is missing for {pure}").into());
     }
@@ -2313,7 +2319,9 @@ pub(crate) async fn recovery_history_from_view(
         if let Some(previous) = &commit.previous_commit {
             let previous = crate::identifiers::canonicalize_scheme(previous);
             if previous == current_commit_id || !inventory.contains(&previous) {
-                return Err("Recovery signed predecessor is missing from the source inventory".into());
+                return Err(
+                    "Recovery signed predecessor is missing from the source inventory".into(),
+                );
             }
         }
         // Native signature validation above also checks the genesis identity:

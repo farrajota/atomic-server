@@ -15,7 +15,12 @@ pub type KvIter = Box<dyn Iterator<Item = AtomicResult<KvPair>> + Send>;
 pub trait KvReadView: Send + Sync {
     fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>>;
 
-    fn get_bounded(&self, _tree: Tree, _key: &[u8], _max_bytes: usize) -> AtomicResult<Option<Vec<u8>>> {
+    fn get_bounded(
+        &self,
+        _tree: Tree,
+        _key: &[u8],
+        _max_bytes: usize,
+    ) -> AtomicResult<Option<Vec<u8>>> {
         Err("Storage backend does not support bounded read-view gets".into())
     }
 
@@ -31,7 +36,6 @@ pub trait KvReadView: Send + Sync {
         Err("Storage backend does not support bounded read-view scans".into())
     }
 }
-
 
 /// A storage backend for the Db.
 /// All methods operate on named trees (namespaces).

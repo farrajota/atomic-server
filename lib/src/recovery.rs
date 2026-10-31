@@ -169,7 +169,10 @@ impl KvStore for ReadViewStore {
     }
 
     fn scan_prefix(&self, tree: Tree, prefix: &[u8]) -> KvIter {
-        match self.view.scan_prefix_bounded(tree, prefix, MAX_ENVELOPES, self.max_bytes) {
+        match self
+            .view
+            .scan_prefix_bounded(tree, prefix, MAX_ENVELOPES, self.max_bytes)
+        {
             Ok(rows) => Box::new(rows.into_iter().map(Ok)),
             Err(error) => Box::new(std::iter::once(Err(error))),
         }
@@ -323,8 +326,8 @@ pub fn parse_request(bytes: &[u8]) -> AtomicResult<RecoveryRequest> {
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err(format!("Recovery request exceeds {MAX_REQUEST_BYTES} bytes").into());
     }
-    let request: RecoveryRequest = serde_json::from_slice(bytes)
-        .map_err(|_| { crate::errors::AtomicError::parse_error("Invalid recovery request", None, None)
+    let request: RecoveryRequest = serde_json::from_slice(bytes).map_err(|_| {
+        crate::errors::AtomicError::parse_error("Invalid recovery request", None, None)
     })?;
     if request.version != 1 {
         return Err("Unsupported recovery request version".into());
@@ -337,7 +340,10 @@ pub fn parse_request(bytes: &[u8]) -> AtomicResult<RecoveryRequest> {
     }
     if request.resources.iter().any(|entry| {
         entry.subject.trim().is_empty() || entry.expected_last_commit.trim().is_empty()
-    }) || request.allowed_drives.iter().any(|drive| drive.trim().is_empty())
+    }) || request
+        .allowed_drives
+        .iter()
+        .any(|drive| drive.trim().is_empty())
     {
         return Err("Recovery request subjects, revisions, and drives must be explicit".into());
     }
@@ -407,7 +413,9 @@ async fn export_bundle_from_view(
         ));
         let subject = canonical_id(&pinned, normalized.as_str());
         if is_pinned_builtin(&subject) {
-            return Err("Pinned built-ins are local dependencies, not recovery payload rows".into());
+            return Err(
+                "Pinned built-ins are local dependencies, not recovery payload rows".into(),
+            );
         }
 
         let mut resource = pinned.get_resource_shallow(&normalized)?;
@@ -430,10 +438,15 @@ async fn export_bundle_from_view(
         }
         atomic_read_check(&pinned, &resource, actor).await?;
         if resource.has_class(urls::COMMIT) || resource.get_subject().is_commit_did() {
-            return Err("Commit rows are native history evidence, not selected recovery resources".into());
+            return Err(
+                "Commit rows are native history evidence, not selected recovery resources".into(),
+            );
         }
         if has_unsupported_blob_payload(&resource, &subject) {
-            return Err(format!("Recovery does not support selected file/blob payloads ({subject})").into());
+            return Err(format!(
+                "Recovery does not support selected file/blob payloads ({subject})"
+            )
+            .into());
         }
 
         let last_commit = canonical_id(
@@ -552,7 +565,10 @@ async fn export_bundle_from_view(
 }
 
 fn encode_native_payload(resources: &[RecoveryResource]) -> AtomicResult<Vec<u8>> {
-    let envelope_count: usize = resources.iter().map(|resource| resource.envelopes.len()).sum();
+    let envelope_count: usize = resources
+        .iter()
+        .map(|resource| resource.envelopes.len())
+        .sum();
     if envelope_count > MAX_ENVELOPES {
         return Err("Recovery bundle exceeds the native envelope count limit".into());
     }
@@ -600,7 +616,9 @@ fn native_payload_length(
             .ok_or("Recovery payload size overflow")?;
     }
     if !envelopes.is_empty() {
-        total = total.checked_add(2).ok_or("Recovery payload size overflow")?;
+        total = total
+            .checked_add(2)
+            .ok_or("Recovery payload size overflow")?;
     }
     for (subject, json) in envelopes {
         if subject.len() > u16::MAX as usize || json.len() > u32::MAX as usize {
@@ -659,12 +677,13 @@ impl LimitedWriter {
 
 impl Write for LimitedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let next = self.bytes.len().checked_add(bytes.len()).ok_or_else(||
-            io::Error::other("recovery manifest size overflow"))?;
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("recovery manifest size overflow"))?;
         if next > self.limit {
-            return Err(io::Error::other(
-                "recovery manifest exceeds bundle limit",
-            ));
+            return Err(io::Error::other("recovery manifest exceeds bundle limit"));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -745,7 +764,10 @@ fn source_proof_message(manifest: &RecoveryManifest) -> AtomicResult<Vec<u8>> {
     Ok(message)
 }
 
-fn verify_source_proof(manifest: &RecoveryManifest, trusted_source_agent: &str) -> AtomicResult<()> {
+fn verify_source_proof(
+    manifest: &RecoveryManifest,
+    trusted_source_agent: &str,
+) -> AtomicResult<()> {
     let trusted = canonical_source_agent(trusted_source_agent)?;
     let declared = canonical_source_agent(&manifest.source_agent)?;
     if manifest.source_agent != declared {
@@ -793,8 +815,8 @@ pub fn decode_bundle(bytes: &[u8], trusted_source_agent: &str) -> AtomicResult<R
     if Sha256::digest(manifest_bytes).as_slice() != &bytes[12..BUNDLE_HEADER_BYTES] {
         return Err("Recovery manifest checksum mismatch".into());
     }
-    let manifest: RecoveryManifest = serde_json::from_slice(manifest_bytes)
-        .map_err(|_| { crate::errors::AtomicError::parse_error("Invalid recovery manifest", None, None)
+    let manifest: RecoveryManifest = serde_json::from_slice(manifest_bytes).map_err(|_| {
+        crate::errors::AtomicError::parse_error("Invalid recovery manifest", None, None)
     })?;
     let payload = &bytes[manifest_end..];
     verify_source_proof(&manifest, &trusted_source_agent)?;
@@ -803,7 +825,10 @@ pub fn decode_bundle(bytes: &[u8], trusted_source_agent: &str) -> AtomicResult<R
         return Err("Recovery native payload length or checksum mismatch".into());
     }
     let resources = decode_native_payload(&manifest, payload)?;
-    Ok(RecoveryBundle { manifest, resources })
+    Ok(RecoveryBundle {
+        manifest,
+        resources,
+    })
 }
 
 fn validate_manifest(manifest: &RecoveryManifest) -> AtomicResult<()> {
@@ -841,13 +866,20 @@ fn validate_manifest(manifest: &RecoveryManifest) -> AtomicResult<()> {
             .ok_or("Recovery manifest revision is not a native commit DID")?;
         let signature_bytes = crate::agents::decode_base64(commit_signature)
             .map_err(|_| "Recovery manifest revision has an invalid native signature")?;
-        if revision != entry.last_commit || signature_bytes.len() != 64 || entry.snapshot_length == 0 {
+        if revision != entry.last_commit
+            || signature_bytes.len() != 64
+            || entry.snapshot_length == 0
+        {
             return Err("Recovery manifest has a missing or invalid revision or snapshot".into());
         }
         if entry.history.retention != "all"
             || !entry.history.complete
             || entry.history.attributions.is_empty()
-            || entry.history.attributions.iter().any(|attribution| !attribution.verified)
+            || entry
+                .history
+                .attributions
+                .iter()
+                .any(|attribution| !attribution.verified)
             || entry.envelopes.len() != entry.history.attributions.len()
         {
             return Err("Recovery manifest history proof is incomplete".into());
@@ -857,7 +889,9 @@ fn validate_manifest(manifest: &RecoveryManifest) -> AtomicResult<()> {
                 || envelope.created_at != attribution.created_at
                 || envelope.length == 0
             {
-                return Err("Recovery manifest envelope and attribution inventories disagree".into());
+                return Err(
+                    "Recovery manifest envelope and attribution inventories disagree".into(),
+                );
             }
         }
         if let Some(hash) = &entry.description_sha256 {
@@ -948,10 +982,16 @@ fn decode_native_payload(
             {
                 return Err("Recovery envelope membership, length, or hash mismatch".into());
             }
-            let json: serde_json::Value = serde_json::from_str(&envelope.json)
-                .map_err(|_| { crate::errors::AtomicError::parse_error("Invalid signed recovery envelope", None, None)
+            let json: serde_json::Value = serde_json::from_str(&envelope.json).map_err(|_| {
+                crate::errors::AtomicError::parse_error(
+                    "Invalid signed recovery envelope",
+                    None,
+                    None,
+                )
             })?;
-            if json.get(urls::SIGNATURE).and_then(serde_json::Value::as_str)
+            if json
+                .get(urls::SIGNATURE)
+                .and_then(serde_json::Value::as_str)
                 != Some(expected.signature.as_str())
                 || json
                     .get(urls::CREATED_AT)
@@ -1054,14 +1094,20 @@ pub async fn restore_bundle(store: &Db, bundle: &RecoveryBundle) -> AtomicResult
     let mut verified_scope = Vec::with_capacity(bundle.resources.len());
     for (resource, manifest) in bundle.resources.iter().zip(&bundle.manifest.resources) {
         let snapshot = view
-            .get_bounded(Tree::LoroSnapshots, resource.subject.as_bytes(), MAX_BUNDLE_BYTES)?
+            .get_bounded(
+                Tree::LoroSnapshots,
+                resource.subject.as_bytes(),
+                MAX_BUNDLE_BYTES,
+            )?
             .ok_or("Restored recovery snapshot is missing")?;
         if snapshot != resource.snapshot
             || snapshot.len() != manifest.snapshot_length
             || sha256(&snapshot) != manifest.snapshot_sha256
             || version_vector(&snapshot)? != manifest.version_vector
         {
-            return Err("Restored recovery snapshot does not preserve original bytes and vectors".into());
+            return Err(
+                "Restored recovery snapshot does not preserve original bytes and vectors".into(),
+            );
         }
         let restored = pinned.get_resource_shallow(&Subject::from_raw(
             &resource.subject,
@@ -1071,11 +1117,12 @@ pub async fn restore_bundle(store: &Db, bundle: &RecoveryBundle) -> AtomicResult
             .get(urls::LAST_COMMIT)
             .map_err(|_| "Restored recovery projection has no lastCommit")?
             .to_string();
-        if canonical_id(&pinned, &restored_revision)
-            != canonical_id(&pinned, &manifest.last_commit)
+        if canonical_id(&pinned, &restored_revision) != canonical_id(&pinned, &manifest.last_commit)
             || description_hash(&restored) != manifest.description_sha256
         {
-            return Err("Restored recovery content or projected revision differs from its manifest".into());
+            return Err(
+                "Restored recovery content or projected revision differs from its manifest".into(),
+            );
         }
         let refs = required_dependencies(&pinned, &restored);
         verified_scope.push(scope_info(
@@ -1172,7 +1219,9 @@ fn history_proof(history: RecoveryHistoryAttribution) -> AtomicResult<RecoveryHi
                     signature: attribution.signature,
                     verified: attribution.verified,
                     tokens: attribution.tokens,
-                    spans: attribution.spans.ok_or("Original recovery client spans are missing")?,
+                    spans: attribution
+                        .spans
+                        .ok_or("Original recovery client spans are missing")?,
                     server_spans: attribution
                         .server_spans
                         .ok_or("Original recovery server spans are missing")?,
@@ -1184,7 +1233,9 @@ fn history_proof(history: RecoveryHistoryAttribution) -> AtomicResult<RecoveryHi
     })
 }
 
-fn native_history_from_proof(history: &RecoveryHistory) -> AtomicResult<RecoveryHistoryAttribution> {
+fn native_history_from_proof(
+    history: &RecoveryHistory,
+) -> AtomicResult<RecoveryHistoryAttribution> {
     if history.retention != "all" || !history.complete {
         return Err("Authenticated recovery history is incomplete".into());
     }

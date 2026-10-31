@@ -38,21 +38,33 @@ struct CompressedReadView {
 
 impl CompressedReadView {
     fn decode(&self, tree: Tree, key: &[u8], value: Vec<u8>) -> AtomicResult<Vec<u8>> {
-        if tree != Tree::LoroSnapshots || value.get(..2) != Some(&[MARKER, CODEC_SNAPSHOT_DELTA][..]) {
-            return if is_compressed_tree(tree) { decode(value) } else { Ok(value) };
+        if tree != Tree::LoroSnapshots
+            || value.get(..2) != Some(&[MARKER, CODEC_SNAPSHOT_DELTA][..])
+        {
+            return if is_compressed_tree(tree) {
+                decode(value)
+            } else {
+                Ok(value)
+            };
         }
         let delta = miniz_oxide::inflate::decompress_to_vec(&value[2..])
             .map_err(|e| format!("Could not decompress a stored snapshot: {e:?}"))?;
-        let commit_key = genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
-        let row = self.inner.get(Tree::Resources, &commit_key)?
+        let commit_key =
+            genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
+        let row = self
+            .inner
+            .get(Tree::Resources, &commit_key)?
             .ok_or_else(|| {
-        format!(
-            "The genesis commit a snapshot is stored against is missing for {}",
-            String::from_utf8_lossy(key)
-        )
-    })?;
-        let base = base_from_row(&row)
-            .ok_or_else(|| { format!("Could not decode the genesis commit for {}", String::from_utf8_lossy(key))
+                format!(
+                    "The genesis commit a snapshot is stored against is missing for {}",
+                    String::from_utf8_lossy(key)
+                )
+            })?;
+        let base = base_from_row(&row).ok_or_else(|| {
+            format!(
+                "Could not decode the genesis commit for {}",
+                String::from_utf8_lossy(key)
+            )
         })?;
         rebuild_snapshot(&base, &delta)
     }
@@ -64,7 +76,9 @@ impl CompressedReadView {
         value: Vec<u8>,
         max_bytes: usize,
     ) -> AtomicResult<Vec<u8>> {
-        if tree != Tree::LoroSnapshots || value.get(..2) != Some(&[MARKER, CODEC_SNAPSHOT_DELTA][..]) {
+        if tree != Tree::LoroSnapshots
+            || value.get(..2) != Some(&[MARKER, CODEC_SNAPSHOT_DELTA][..])
+        {
             let decoded = if is_compressed_tree(tree) {
                 decode_bounded(value, max_bytes)?
             } else {
@@ -78,14 +92,17 @@ impl CompressedReadView {
 
         let delta = miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
             .map_err(|e| format!("Could not decompress bounded snapshot delta: {e:?}"))?;
-        let commit_key = genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
-        let row = self.inner.get_bounded(Tree::Resources, &commit_key, max_bytes)?
+        let commit_key =
+            genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
+        let row = self
+            .inner
+            .get_bounded(Tree::Resources, &commit_key, max_bytes)?
             .ok_or_else(|| {
-        format!(
-            "The genesis commit a snapshot is stored against is missing for {}",
-            String::from_utf8_lossy(key)
-        )
-    })?;
+                format!(
+                    "The genesis commit a snapshot is stored against is missing for {}",
+                    String::from_utf8_lossy(key)
+                )
+            })?;
         let base = base_from_row_bounded(&row, max_bytes)?;
         let snapshot = rebuild_snapshot(&base, &delta)?;
         if snapshot.len() > max_bytes {
@@ -97,20 +114,33 @@ impl CompressedReadView {
 
 impl KvReadView for CompressedReadView {
     fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>> {
-        self.inner.get(tree, key)?.map(|value| self.decode(tree, key, value)).transpose()
+        self.inner
+            .get(tree, key)?
+            .map(|value| self.decode(tree, key, value))
+            .transpose()
     }
 
-    fn get_bounded(&self, tree: Tree, key: &[u8], max_bytes: usize) -> AtomicResult<Option<Vec<u8>>> {
-        self.inner.get_bounded(tree, key, max_bytes)?
+    fn get_bounded(
+        &self,
+        tree: Tree,
+        key: &[u8],
+        max_bytes: usize,
+    ) -> AtomicResult<Option<Vec<u8>>> {
+        self.inner
+            .get_bounded(tree, key, max_bytes)?
             .map(|value| self.decode_bounded(tree, key, value, max_bytes))
             .transpose()
     }
 
     fn scan_prefix(&self, tree: Tree, prefix: &[u8], limit: usize) -> AtomicResult<Vec<KvPair>> {
-        self.inner.scan_prefix(tree, prefix, limit)?.into_iter().map(|(key, value)| {
-            let decoded = self.decode(tree, &key, value)?;
-            Ok((key, decoded))
-        }).collect()
+        self.inner
+            .scan_prefix(tree, prefix, limit)?
+            .into_iter()
+            .map(|(key, value)| {
+                let decoded = self.decode(tree, &key, value)?;
+                Ok((key, decoded))
+            })
+            .collect()
     }
 
     fn scan_prefix_bounded(
@@ -120,14 +150,20 @@ impl KvReadView for CompressedReadView {
         row_limit: usize,
         max_bytes: usize,
     ) -> AtomicResult<Vec<KvPair>> {
-        let rows = self.inner.scan_prefix_bounded(tree, prefix, row_limit, max_bytes)?;
+        let rows = self
+            .inner
+            .scan_prefix_bounded(tree, prefix, row_limit, max_bytes)?;
         let mut out = Vec::with_capacity(rows.len());
         let mut bytes_used = 0usize;
         for (key, value) in rows {
-            let remaining = max_bytes.checked_sub(bytes_used).and_then(|n| n.checked_sub(key.len()))
+            let remaining = max_bytes
+                .checked_sub(bytes_used)
+                .and_then(|n| n.checked_sub(key.len()))
                 .ok_or_else(|| format!("Read-view prefix scan exceeded byte limit {max_bytes}"))?;
             let decoded = self.decode_bounded(tree, &key, value, remaining)?;
-            bytes_used = bytes_used.checked_add(key.len()).and_then(|n| n.checked_add(decoded.len()))
+            bytes_used = bytes_used
+                .checked_add(key.len())
+                .and_then(|n| n.checked_add(decoded.len()))
                 .filter(|n| *n <= max_bytes)
                 .ok_or_else(|| format!("Read-view prefix scan exceeded byte limit {max_bytes}"))?;
             out.push((key, decoded));
@@ -200,8 +236,9 @@ fn decode_bounded(value: Vec<u8>, max_bytes: usize) -> AtomicResult<Vec<u8>> {
     match value.get(1) {
         Some(&CODEC_RAW) if value.len().saturating_sub(2) <= max_bytes => Ok(value[2..].to_vec()),
         Some(&CODEC_RAW) => Err(format!("Read-view value exceeded byte limit {max_bytes}").into()),
-        Some(&CODEC_DEFLATE) => { miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
-            .map_err(|e| format!("Could not decompress bounded value: {e:?}").into())
+        Some(&CODEC_DEFLATE) => {
+            miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
+                .map_err(|e| format!("Could not decompress bounded value: {e:?}").into())
         }
         Some(&CODEC_SNAPSHOT_DELTA) => Err("A snapshot delta can only be read with its key".into()),
         other => Err(format!("Unknown storage codec {other:?}").into()),
@@ -235,9 +272,11 @@ fn base_from_row_bounded(row: &[u8], max_bytes: usize) -> AtomicResult<Vec<u8>> 
     let row = decode_bounded(row.to_vec(), max_bytes)?;
     let mut propvals = super::encoding::decode_propvals(&row)?;
     match propvals.remove(crate::urls::LORO_UPDATE) {
-        Some(crate::Value::LoroDoc(bytes)) if !bytes.is_empty() && bytes.len() <= max_bytes => { Ok(bytes)
+        Some(crate::Value::LoroDoc(bytes)) if !bytes.is_empty() && bytes.len() <= max_bytes => {
+            Ok(bytes)
         }
-        Some(crate::Value::LoroDoc(_)) => { Err(format!("Read-view genesis snapshot exceeded byte limit {max_bytes}").into())
+        Some(crate::Value::LoroDoc(_)) => {
+            Err(format!("Read-view genesis snapshot exceeded byte limit {max_bytes}").into())
         }
         _ => Err("The genesis commit has no stored Loro snapshot".into()),
     }
@@ -362,7 +401,9 @@ impl CompressedKv {
 
 impl KvStore for CompressedKv {
     fn read_view(&self) -> AtomicResult<Arc<dyn KvReadView>> {
-        Ok(Arc::new(CompressedReadView { inner: self.inner.read_view()? }))
+        Ok(Arc::new(CompressedReadView {
+            inner: self.inner.read_view()?,
+        }))
     }
 
     fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>> {
@@ -385,7 +426,8 @@ impl KvStore for CompressedKv {
     }
 
     fn write_recovery_snapshot(&self, key: &[u8], snapshot: &[u8]) -> AtomicResult<()> {
-        self.inner.insert(Tree::LoroSnapshots, key, &encode(snapshot))
+        self.inner
+            .insert(Tree::LoroSnapshots, key, &encode(snapshot))
     }
 
     fn remove(&self, tree: Tree, key: &[u8]) -> AtomicResult<()> {
