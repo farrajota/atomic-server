@@ -208,8 +208,8 @@ async fn restores_original_snapshot_history_and_full_source_for_fresh_reader() {
         .unwrap()
         .unwrap();
     let doc = strict_snapshot_doc(&original_snapshot).unwrap();
-    assert!(doc.get_all_datatypes().get(urls::LAST_COMMIT).is_none());
-    assert!(doc.get_all_properties().get(urls::LAST_COMMIT).is_none());
+    assert!(!doc.get_all_datatypes().contains_key(urls::LAST_COMMIT));
+    assert!(!doc.get_all_properties().contains_key(urls::LAST_COMMIT));
     let source_history = crate::envelopes::attribute_history(&fixture.store, &fixture.subject)
         .await
         .unwrap();
@@ -430,10 +430,9 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
         .find(|resource| resource.subject == entry.subject)
         .unwrap();
     let snapshot_doc = strict_snapshot_doc(&resource.snapshot).unwrap();
-    assert!(snapshot_doc
+    assert!(!snapshot_doc
         .get_all_properties()
-        .get(urls::LAST_COMMIT)
-        .is_none());
+        .contains_key(urls::LAST_COMMIT));
     let latest_envelope = resource
         .envelopes
         .iter()
@@ -442,7 +441,7 @@ async fn restores_receipt_free_cumulative_updates_with_optional_predecessors() {
     let latest_json: serde_json::Value = serde_json::from_str(&latest_envelope.json).unwrap();
     assert!(latest_json
         .get(urls::PREVIOUS_COMMIT)
-        .map_or(true, serde_json::Value::is_null));
+        .is_none_or(serde_json::Value::is_null));
     for (token, signature) in &original_signatures {
         let attribution = entry
             .history

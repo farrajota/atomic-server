@@ -1320,6 +1320,25 @@ struct RecoveryOperationProof {
     comparisons: usize,
     document_work: usize,
 }
+#[derive(Clone, Copy)]
+struct RecoveryServerSnapshot<'a> {
+    store: &'a Db,
+    members: &'a std::collections::HashSet<String>,
+    subject: &'a str,
+    stored: &'a crate::loro::AtomicLoroDoc,
+    spans: &'a [RecoveryOwnedSpan],
+    property_root: &'a serde_json::Value,
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryServerTransition<'a> {
+    resource: &'a crate::Resource,
+    old: &'a crate::Resource,
+    signer: &'a str,
+    is_new: bool,
+    parent_changed: bool,
+    drive_changed: bool,
+}
 
 impl RecoveryOperationProof {
     fn new(doc: &crate::loro::AtomicLoroDoc, envelopes: usize) -> AtomicResult<Self> {
@@ -1585,17 +1604,19 @@ impl RecoveryOperationProof {
 
     async fn verify_server_change(
         &mut self,
-        store: &Db,
-        members: &std::collections::HashSet<String>,
-        subject: &str,
-        stored: &crate::loro::AtomicLoroDoc,
+        snapshot: &RecoveryServerSnapshot<'_>,
         attribution: &Attribution,
         owner_index: usize,
-        spans: &[RecoveryOwnedSpan],
-        property_root: &serde_json::Value,
         change: &loro::JsonChange,
         seen: &mut RecoveryServerActions,
     ) -> AtomicResult<()> {
+        let RecoveryServerSnapshot {
+            subject,
+            stored,
+            spans,
+            property_root,
+            ..
+        } = *snapshot;
         Self::charge_work(&mut self.comparisons, self.document_work)?;
         let causal = Self::causal_before(stored, change, change.id.counter)?;
         let before = causal.oplog_vv();
@@ -1631,6 +1652,14 @@ impl RecoveryOperationProof {
         };
         let parent_changed = property_changed(crate::urls::PARENT);
         let drive_changed = property_changed(crate::urls::DRIVE_PROP);
+        let transition = RecoveryServerTransition {
+            resource: &resource,
+            old: &old,
+            signer: &attribution.signer,
+            is_new,
+            parent_changed,
+            drive_changed,
+        };
 
         let mut writer_action = None;
         if is_new
@@ -1658,18 +1687,7 @@ impl RecoveryOperationProof {
         if drive_triggered {
             for candidate in recovery_drive_insert_values(change, property_root)? {
                 if self
-                    .server_drive_candidate_allowed(
-                        store,
-                        members,
-                        subject,
-                        &resource,
-                        &old,
-                        &attribution.signer,
-                        &candidate,
-                        is_new,
-                        parent_changed,
-                        drive_changed,
-                    )
+                    .server_drive_candidate_allowed(snapshot, &transition, &candidate)
                     .await?
                 {
                     let action = Some(RecoveryDriveAction::Set(candidate));
@@ -1679,16 +1697,7 @@ impl RecoveryOperationProof {
                 }
             }
             if self
-                .server_drive_removal_allowed(
-                    store,
-                    members,
-                    &resource,
-                    &old,
-                    &attribution.signer,
-                    is_new,
-                    parent_changed,
-                    drive_changed,
-                )
+                .server_drive_removal_allowed(snapshot, &transition)
                 .await?
             {
                 drive_actions.push(Some(RecoveryDriveAction::Remove));
@@ -1741,17 +1750,24 @@ impl RecoveryOperationProof {
 
     async fn server_drive_candidate_allowed(
         &mut self,
-        store: &Db,
-        members: &std::collections::HashSet<String>,
-        subject: &str,
-        resource: &crate::Resource,
-        old: &crate::Resource,
-        signer: &str,
+        snapshot: &RecoveryServerSnapshot<'_>,
+        transition: &RecoveryServerTransition<'_>,
         candidate: &str,
-        is_new: bool,
-        parent_changed: bool,
-        drive_changed: bool,
     ) -> AtomicResult<bool> {
+        let RecoveryServerSnapshot {
+            store,
+            members,
+            subject,
+            ..
+        } = *snapshot;
+        let RecoveryServerTransition {
+            resource,
+            old,
+            signer,
+            is_new,
+            parent_changed,
+            drive_changed,
+        } = *transition;
         let current_drive = resource
             .get(crate::urls::DRIVE_PROP)
             .ok()
@@ -1838,15 +1854,18 @@ impl RecoveryOperationProof {
 
     async fn server_drive_removal_allowed(
         &mut self,
-        store: &Db,
-        members: &std::collections::HashSet<String>,
-        resource: &crate::Resource,
-        old: &crate::Resource,
-        signer: &str,
-        is_new: bool,
-        parent_changed: bool,
-        drive_changed: bool,
+        snapshot: &RecoveryServerSnapshot<'_>,
+        transition: &RecoveryServerTransition<'_>,
     ) -> AtomicResult<bool> {
+        let RecoveryServerSnapshot { store, members, .. } = *snapshot;
+        let RecoveryServerTransition {
+            resource,
+            old,
+            signer,
+            is_new,
+            parent_changed,
+            drive_changed,
+        } = *transition;
         if is_new
             || parent_changed
             || !drive_changed
@@ -1889,19 +1908,22 @@ impl RecoveryOperationProof {
         let spans = recovery_owned_spans(attributions)?;
         let owners = self.validate_snapshot_ownership(stored, attributions, &spans)?;
         let property_root = recovery_property_root()?;
+        let snapshot = RecoveryServerSnapshot {
+            store,
+            members,
+            subject,
+            stored,
+            spans: &spans,
+            property_root: &property_root,
+        };
         let mut seen = vec![RecoveryServerActions::default(); attributions.len()];
         let changes = std::mem::take(&mut self.changes);
         for (change, owner) in changes.iter().zip(owners) {
             if let RecoverySpanOwner::Server(index) = owner {
                 self.verify_server_change(
-                    store,
-                    members,
-                    subject,
-                    stored,
+                    &snapshot,
                     &attributions[index],
                     index,
-                    &spans,
-                    &property_root,
                     change,
                     &mut seen[index],
                 )
