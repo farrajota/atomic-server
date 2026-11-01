@@ -15,6 +15,8 @@ pub enum AppErrorType {
     /// refusal reports itself as a crash, and a caller cannot tell "you may
     /// not do that yet" from "something here is broken".
     BadRequest,
+    /// Current state conflicts with the requested revision; rendered as 409.
+    Conflict,
     /// A write refused by `crate::rate_limit`; rendered as `429` with `Retry-After`.
     TooManyRequests,
     /// The node is over its hard commit limit; rendered as `503` with
@@ -78,6 +80,7 @@ impl ResponseError for AtomicServerError {
             AppErrorType::NotFound => StatusCode::NOT_FOUND,
             AppErrorType::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             AppErrorType::BadRequest => StatusCode::BAD_REQUEST,
+            AppErrorType::Conflict => StatusCode::CONFLICT,
             AppErrorType::Other => StatusCode::INTERNAL_SERVER_ERROR,
             AppErrorType::Unauthorized => StatusCode::UNAUTHORIZED,
             AppErrorType::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
@@ -151,6 +154,7 @@ impl From<atomic_lib::errors::AtomicError> for AtomicServerError {
             // fault here: 400, so it neither reads as a crash to the caller
             // nor reaches Sentry as one.
             atomic_lib::AtomicErrorType::ParseError => AppErrorType::BadRequest,
+            atomic_lib::AtomicErrorType::Conflict => AppErrorType::Conflict,
             atomic_lib::AtomicErrorType::OtherError => AppErrorType::Other,
         };
         let subject = error

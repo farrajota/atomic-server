@@ -459,7 +459,9 @@ async fn export_bundle_from_view(
         if canonical_id(&pinned, &last_commit)
             != canonical_id(&pinned, &selection.expected_last_commit)
         {
-            return Err(format!("Recovery revision mismatch for {subject}").into());
+            return Err(crate::errors::AtomicError::conflict(format!(
+                "Recovery revision mismatch for {subject}"
+            )));
         }
 
         let description_sha256 = description_hash(&resource);
