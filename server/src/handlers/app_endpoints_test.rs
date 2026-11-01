@@ -849,3 +849,88 @@ async fn plugin_routes_bind_the_body_with_v2() {
     .await;
     assert_eq!(garbled.status(), 400);
 }
+
+#[actix_rt::test]
+async fn recovery_export_refuses_stale_revision_as_conflict() {
+    use actix_web::http::{Method, StatusCode};
+    use atomic_lib::recovery::{RecoveryRequest, RecoverySelection};
+
+    let fixture = fixture("recovery_stale_revision").await;
+    let store = &fixture.appstate.store;
+    store.set_envelope_retention(atomic_lib::envelopes::EnvelopeRetention::All);
+    let subject = store
+        .create_resource(
+            urls::CLASS,
+            &fixture.drive,
+            "Recovery revision",
+            Some(vec![
+                (
+                    urls::DESCRIPTION,
+                    Value::Markdown("Recovery revision fixture".into()),
+                ),
+                (urls::SHORTNAME, Value::Slug("recovery-revision".into())),
+            ]),
+        )
+        .await
+        .unwrap();
+    let mut resource = store.get_resource(&subject.as_str().into()).await.unwrap();
+    let stale_revision = resource.get(urls::LAST_COMMIT).unwrap().to_string();
+    resource
+        .set(
+            urls::NAME.into(),
+            Value::String("Updated revision".into()),
+            store,
+        )
+        .await
+        .unwrap();
+    resource.save_locally(store).await.unwrap();
+    let current = store.get_resource(&subject.as_str().into()).await.unwrap();
+    let current_revision = current.get(urls::LAST_COMMIT).unwrap().to_string();
+    assert_ne!(stale_revision, current_revision);
+    let drive = store
+        .get_resource(&fixture.drive.as_str().into())
+        .await
+        .unwrap();
+    let drive_revision = drive.get(urls::LAST_COMMIT).unwrap().to_string();
+
+    let service = test::init_service(
+        App::new()
+            .app_data(Data::new(fixture.appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let response = test::call_service(
+        &service,
+        signed("/recovery/export", &fixture.appstate)
+            .method(Method::POST)
+            .set_json(RecoveryRequest {
+                version: 1,
+                resources: vec![
+                    RecoverySelection {
+                        subject: subject.clone(),
+                        expected_last_commit: stale_revision,
+                    },
+                    RecoverySelection {
+                        subject: fixture.drive.clone(),
+                        expected_last_commit: drive_revision,
+                    },
+                ],
+                allowed_drives: vec![fixture.drive.clone()],
+            })
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let body = body_of(response);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("Recovery revision mismatch"));
+    let unchanged = store.get_resource(&subject.as_str().into()).await.unwrap();
+    assert_eq!(
+        unchanged.get(urls::LAST_COMMIT).unwrap().to_string(),
+        current_revision
+    );
+    assert_eq!(
+        unchanged.get(urls::NAME).unwrap().to_string(),
+        "Updated revision"
+    );
+}

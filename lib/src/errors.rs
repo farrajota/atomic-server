@@ -31,6 +31,7 @@ pub enum AtomicErrorType {
     ParseError,
     OtherError,
     MethodNotAllowed,
+    Conflict,
 }
 
 impl std::error::Error for AtomicError {
@@ -80,6 +81,15 @@ impl AtomicError {
                 error_type: AtomicErrorType::UnauthorizedError,
                 subject: self.subject,
             },
+        }
+    }
+
+    /// Current state no longer matches a caller's precondition (HTTP 409).
+    pub fn conflict(message: String) -> AtomicError {
+        AtomicError {
+            message,
+            error_type: AtomicErrorType::Conflict,
+            subject: None,
         }
     }
 
