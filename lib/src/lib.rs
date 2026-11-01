@@ -101,6 +101,8 @@ pub mod metrics;
 pub mod parse;
 #[cfg(feature = "db")]
 pub mod plugins;
+#[cfg(feature = "db")]
+pub mod recovery;
 pub mod website;
 
 pub mod lens;
@@ -122,6 +124,8 @@ pub mod subject;
 pub(crate) mod subject_lock;
 pub mod sync;
 pub mod test_utils;
+#[cfg(feature = "db")]
+pub mod trash;
 pub mod urls;
 pub mod utils;
 pub mod validate;

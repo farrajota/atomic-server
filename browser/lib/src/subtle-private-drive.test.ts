@@ -19,6 +19,7 @@ describe('derived personal drive under SubtleCrypto', () => {
         JSON.stringify({
           privateKey: keys.privateKey,
           subject: 'did:ad:agent:test',
+          initialDrive: 'did:ad:drive:initial',
         }),
       ),
     );
@@ -36,6 +37,9 @@ describe('derived personal drive under SubtleCrypto', () => {
     const second = await b.privateDriveSubject();
 
     expect(first).toBe(second);
+    expect(a.aiChatsFolders).toEqual(b.aiChatsFolders);
+    expect(a.aiChatsFolders[a.privateDrive!]).toBeDefined();
+    expect(a.aiChatsFolders['atomic:drive:initial']).toBeDefined();
   });
 
   it('is stable across repeated calls on one Agent', async ({ expect }) => {

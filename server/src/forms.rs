@@ -49,7 +49,7 @@ pub async fn drive_of(store: &impl Storelike, resource: &Resource) -> Option<Str
         let parent: Subject = parent.to_string().into();
         // A parent on another server names whatever drive it likes; nothing
         // reached through one is this form's.
-        if store.normalize_subject(&parent).is_external() {
+        if matches!(store.normalize_subject(&parent), Subject::External(_)) {
             return None;
         }
         let Ok(next) = store.get_resource(&parent).await else {

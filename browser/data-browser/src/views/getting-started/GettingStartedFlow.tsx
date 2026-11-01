@@ -14,16 +14,20 @@ import {
 import toast from 'react-hot-toast';
 import React, { FormEvent, useEffect, useRef, useState } from 'react';
 import { styled, keyframes } from 'styled-components';
-import { useStore } from '@tomic/react';
+import { StoreEvents, useStore } from '@tomic/react';
 import { Agent, decodeSecret } from '@tomic/lib';
 import { useNavigateWithTransition } from '../../hooks/useNavigateWithTransition';
 import { useWelcomeLayoutEffect } from '../../hooks/useWelcomeLayoutEffect';
 import { useSettings } from '../../helpers/AppSettings';
 import { saveAgentToIDB } from '../../helpers/agentStorage';
+import { adoptAgentOnDevice } from '../../helpers/adoptAgent';
 import { beat } from '../../helpers/deviceLock';
 import { fetchPrivateDriveSubject } from '../../helpers/privateDrive';
 import { connectHostedDrive, shortDid } from '../../helpers/managed/reconcile';
-import { deviceHasDriveData } from '../../helpers/driveData';
+import {
+  deviceHasDriveData,
+  findAccessibleDrives,
+} from '../../helpers/driveData';
 import { discoverHomeServerForApp } from '../../helpers/discoverHomeServer';
 import { openPrivateHome } from '../../helpers/openPrivateHome';
 import { privateHomeNudge } from '../../helpers/privateHomeNudge';
@@ -130,6 +134,9 @@ type Props = {
  * that never stopped, on a device holding nothing.
  */
 const SIGN_IN_LOOKUP_TIMEOUT_MS = 8_000;
+/** Long enough for the local DB-key wrapper's 20s loader bound, still finite. */
+const IDENTITY_SAVE_TIMEOUT_MS = 30_000;
+const IDENTITY_SAVE_TIMED_OUT = Symbol('identity-save-timed-out');
 
 /**
  * How long sign-in waits for a vault restore before falling through to the
@@ -237,18 +244,29 @@ export function GettingStartedFlow({
     }
   }
 
-  const nextPath =
-    requestedNextUrl?.origin === window.location.origin &&
+  const isLocalAppNext =
+    requestedNextUrl !== undefined &&
+    requestedNextUrl.origin === window.location.origin &&
     (requestedNextUrl.pathname === pathNames.app ||
-      requestedNextUrl.pathname.startsWith(`${pathNames.app}/`))
+      requestedNextUrl.pathname.startsWith(`${pathNames.app}/`));
+  const isAuthFlowNext =
+    requestedNextUrl !== undefined &&
+    isLocalAppNext &&
+    (requestedNextUrl.pathname === paths.welcome ||
+      requestedNextUrl.pathname === paths.onboarding);
+  const nextPath =
+    requestedNextUrl !== undefined && isLocalAppNext && !isAuthFlowNext
       ? `${requestedNextUrl.pathname}${requestedNextUrl.search}${requestedNextUrl.hash}`
       : undefined;
-  const nextDrive = nextPath
-    ? undefined
-    : requestedNext ||
-      new URLSearchParams(window.location.search).get('drive') ||
-      new URLSearchParams(window.location.search).get('subject') ||
-      undefined;
+  const explicitNextDrive =
+    new URLSearchParams(window.location.search).get('drive') ||
+    new URLSearchParams(window.location.search).get('subject') ||
+    undefined;
+  const nextDrive = isAuthFlowNext
+    ? explicitNextDrive
+    : isLocalAppNext
+      ? undefined
+      : requestedNext || explicitNextDrive;
   // Only this named, internal destination is accepted; never navigate to an
   // arbitrary return URL supplied by a link. Adding a passkey needs the local
   // identity unlocked before the account settings can edit its backup.
@@ -295,6 +313,17 @@ export function GettingStartedFlow({
     string | undefined
   >();
   const stepDotsSlotRef = useRef<HTMLDivElement | null>(null);
+  const [identitySaveFailed, setIdentitySaveFailed] = useState(false);
+  const signInAttemptRef = useRef(0);
+  const signInAbortRef = useRef<AbortController | null>(null);
+  const failedIdentitySecretRef = useRef<string | null>(null);
+  useEffect(
+    () => () => {
+      signInAttemptRef.current += 1;
+      signInAbortRef.current?.abort();
+    },
+    [],
+  );
   const [secretValue, setSecretValue] = useState('');
   /** A pasted secret for another agent, held until the user says which wins. */
   const [secretConflict, setSecretConflict] = useState<
@@ -592,11 +621,49 @@ export function GettingStartedFlow({
     secret: string,
     confirmed?: SecretAccountConflict,
   ) {
+    const attempt = ++signInAttemptRef.current;
+    signInAbortRef.current?.abort();
+    const controller = new AbortController();
+    signInAbortRef.current = controller;
+    let expectedAgentSubject = store.getAgent()?.subject;
+    let identityChanged = false;
+    const offAgentChanged = store.on(StoreEvents.AgentChanged, active => {
+      if (active?.subject !== expectedAgentSubject) {
+        identityChanged = true;
+        controller.abort();
+      }
+    });
+    let watchingAgent = true;
+
+    const stopWatchingAgent = () => {
+      if (!watchingAgent) return;
+      watchingAgent = false;
+      offAgentChanged();
+    };
+
+    controller.signal.addEventListener('abort', stopWatchingAgent, {
+      once: true,
+    });
+
+    const isCurrentAttempt = () => {
+      if (attempt !== signInAttemptRef.current || identityChanged) return false;
+      if (store.getAgent()?.subject === expectedAgentSubject) return true;
+
+      identityChanged = true;
+      controller.abort();
+
+      return false;
+    };
+
     setLoading(true);
     setError(undefined);
+    setIdentitySaveFailed(false);
+
+    failedIdentitySecretRef.current = null;
 
     try {
       const newAgent = await Agent.fromSecret(secret);
+      if (!isCurrentAttempt()) return;
 
       const conflict =
         confirmed ??
@@ -607,6 +674,7 @@ export function GettingStartedFlow({
               null,
             )
           : null);
+      if (!isCurrentAttempt()) return;
 
       if (conflict && !confirmed) {
         setSecretConflict({ ...conflict, secret });
@@ -618,8 +686,42 @@ export function GettingStartedFlow({
       setSecretConflict(null);
       setWorkspaceStage('identity');
       setStep('opening-workspace');
+      const saved = await withDeadline<
+        true | { error: unknown } | typeof IDENTITY_SAVE_TIMED_OUT
+      >(
+        saveAgentToIDB(secret, {
+          adoptOnDevice: false,
+          signal: controller.signal,
+        }).then(
+          (): true => true,
+          (cause: unknown) => ({ error: cause }),
+        ),
+        IDENTITY_SAVE_TIMEOUT_MS,
+        IDENTITY_SAVE_TIMED_OUT,
+      );
+
+      if (!isCurrentAttempt()) return;
+
+      if (saved === IDENTITY_SAVE_TIMED_OUT) {
+        controller.abort();
+        throw new Error(
+          'Could not save this identity to browser storage before the 30-second limit. Check that browser storage is available, then retry. Your current identity and local cache were left unchanged.',
+        );
+      }
+
+      if (saved !== true) {
+        const reason =
+          saved.error instanceof Error ? ` ${saved.error.message}` : '';
+        throw new Error(
+          `Could not save this identity to browser storage.${reason} Check that browser storage is available, then retry. Your current identity and local cache were left unchanged.`,
+          { cause: saved.error },
+        );
+      }
+
+      expectedAgentSubject = newAgent.subject;
       setAgent(newAgent);
-      await saveAgentToIDB(secret);
+      if (!isCurrentAttempt()) return;
+      void adoptAgentOnDevice(secret);
       // However they got in — passkey, code, or secret — the device is open
       // again, so start the clock fresh (see deviceLock.ts).
       beat();
@@ -631,6 +733,8 @@ export function GettingStartedFlow({
           undefined,
         );
       }
+
+      if (!isCurrentAttempt()) return;
 
       // One sign-in: the identity just unlocked signs the account in too, so
       // the portal is not left asking again. In the background; the app does
@@ -673,6 +777,7 @@ export function GettingStartedFlow({
               false,
             )
           : false;
+      if (!isCurrentAttempt()) return;
 
       setWorkspaceStage('local');
       let target =
@@ -683,21 +788,32 @@ export function GettingStartedFlow({
           undefined,
         ));
 
+      if (!isCurrentAttempt()) return;
       // Resolve hosting before a failed read sends this device to Cloud Vault.
       const hostedByAccount = target
-        ? await connectHostedDrive(store, target, setServer)
+        ? await connectHostedDrive(store, target, setServer, isCurrentAttempt)
         : false;
 
+      if (!isCurrentAttempt()) return;
       // No account to ask (or it does not know this drive): the secret alone
       // names the drive, and pkarr says which servers announced it. Only
       // when the server in use does not already have it.
       const hosted =
         hostedByAccount ||
         (!!target &&
-          (await discoverHomeServerForApp(store, target, setBaseURL, subject =>
-            deviceHasDriveData(store, subject),
+          (await discoverHomeServerForApp(
+            store,
+            target,
+            server => {
+              if (isCurrentAttempt()) setBaseURL(server);
+            },
+            subject =>
+              isCurrentAttempt()
+                ? deviceHasDriveData(store, subject)
+                : Promise.resolve(false),
           )));
 
+      if (!isCurrentAttempt()) return;
       // Check for existing data before creating anything, so a newly writable
       // home is never mistaken for successful recovery of previous content.
       const canRead = (subject: string, refresh = hosted) =>
@@ -718,6 +834,7 @@ export function GettingStartedFlow({
       const legacyHome = newAgent.initialDrive;
 
       let hasData = !!target && (await canRead(target));
+      if (!isCurrentAttempt()) return;
 
       if (
         !hasData &&
@@ -727,10 +844,28 @@ export function GettingStartedFlow({
         legacyHome !== target
       ) {
         hasData = await canRead(legacyHome);
+        if (!isCurrentAttempt()) return;
 
         // Open nodes can materialize the derived home below. Owner nodes
         // must open the readable existing home without enrolling a new one.
         if (hasData && !acceptsNewDrives) target = legacyHome;
+      }
+
+      // A service identity may have access to shared drives without owning a
+      // personal home or carrying a drive list. On owner-mode servers, discover
+      // existing readable Drives rather than trying to enroll a private one.
+      if (!hasData && !nextDrive && !returnToAgent && !acceptsNewDrives) {
+        const accessible = await withDeadline(
+          findAccessibleDrives(store),
+          SIGN_IN_LOOKUP_TIMEOUT_MS,
+          [] as string[],
+        );
+        if (!isCurrentAttempt()) return;
+
+        if (accessible.length > 0) {
+          target = accessible[0];
+          hasData = true;
+        }
       }
 
       // A device holding nothing may still be one download from holding
@@ -753,9 +888,11 @@ export function GettingStartedFlow({
           VAULT_RESTORE_TIMEOUT_MS,
           { status: 'no-backup' as const, reason: 'timed out' },
         );
+        if (!isCurrentAttempt()) return;
 
         if (restored.status === 'restored') {
           hasData = await canRead(target, false);
+          if (!isCurrentAttempt()) return;
         } else if (restored.status === 'no-backup') {
           vaultReason = restored.reason;
         } else {
@@ -772,15 +909,18 @@ export function GettingStartedFlow({
       // with its secret's `initialDrive`, which for an account made elsewhere
       // is that server's URL, and handing that to `setDrive` moves the app.
       if (target && isOriginWithoutNode(store.getServerUrl())) {
+        if (!isCurrentAttempt()) return;
         store.registerLocalOnlyDrive(target);
       }
 
       // Recover first, but connecting a device is optional for the identity's
       // own home. A foreign requested workspace must never be synthesized.
+      if (!isCurrentAttempt()) return;
       const home =
         !hasData && target && !returnToAgent && acceptsNewDrives
           ? await openPrivateHome(store, target, true)
           : undefined;
+      if (!isCurrentAttempt()) return;
 
       if (home) {
         if (home === 'created') privateHomeNudge();
@@ -802,6 +942,7 @@ export function GettingStartedFlow({
             SIGN_IN_LOOKUP_TIMEOUT_MS,
             undefined,
           );
+          if (!isCurrentAttempt()) return;
         }
 
         // Every account gets a backup, not only the ones onboarding made
@@ -822,20 +963,41 @@ export function GettingStartedFlow({
         setStep('connect-device');
       }
     } catch (err) {
-      setError(
-        err instanceof Error ? err : new Error('Could not parse that secret.'),
+      if (!isCurrentAttempt()) return;
+      const failure =
+        err instanceof Error ? err : new Error('Could not parse that secret.');
+      const identityFailed = failure.message.startsWith(
+        'Could not save this identity',
       );
+      setIdentitySaveFailed(identityFailed);
+      failedIdentitySecretRef.current = identityFailed ? secret : null;
+      setError(failure);
       setStep('signin');
     } finally {
-      setLoading(false);
+      if (attempt === signInAttemptRef.current) {
+        setLoading(false);
+
+        if (signInAbortRef.current === controller) {
+          signInAbortRef.current = null;
+        }
+      }
+
+      stopWatchingAgent();
     }
   }
 
   useEffect(() => {
-    if (step !== 'restore' && step !== 'signin') return;
+    if (
+      (step !== 'restore' && step !== 'signin') ||
+      identitySaveFailed ||
+      signInAbortRef.current
+    ) {
+      return;
+    }
+
     let cancelled = false;
     setRestore({ phase: 'checking' });
-    setError(undefined);
+    if (!identitySaveFailed) setError(undefined);
 
     void (async () => {
       try {
@@ -896,7 +1058,7 @@ export function GettingStartedFlow({
     return () => {
       cancelled = true;
     };
-  }, [step, restoreAttempt]);
+  }, [step, restoreAttempt, identitySaveFailed]);
 
   /**
    * Unlock a backup with its passkey — one prompt, no typing. Returns whether
@@ -907,6 +1069,8 @@ export function GettingStartedFlow({
 
     setLoading(true);
     setError(undefined);
+    failedIdentitySecretRef.current = null;
+    setIdentitySaveFailed(false);
 
     try {
       const secret = await decryptEnvelopeWithPasskey(backup);
@@ -944,6 +1108,8 @@ export function GettingStartedFlow({
    */
   async function handleSignInClick() {
     setError(undefined);
+    failedIdentitySecretRef.current = null;
+    setIdentitySaveFailed(false);
     setSecretValue('');
 
     const unlockable = readUnlockableCachedBackups();
@@ -966,6 +1132,8 @@ export function GettingStartedFlow({
 
     setLoading(true);
     setError(undefined);
+    failedIdentitySecretRef.current = null;
+    setIdentitySaveFailed(false);
 
     try {
       const isEnvelopeV2 = restore.secret.format_version >= 2;
@@ -1292,6 +1460,8 @@ export function GettingStartedFlow({
                         disabled={loading}
                         onClick={() => {
                           setError(undefined);
+                          failedIdentitySecretRef.current = null;
+                          setIdentitySaveFailed(false);
                           setPreferCodeEntry(true);
                           setStep('restore');
                         }}
@@ -1315,6 +1485,12 @@ export function GettingStartedFlow({
                         // nothing to confirm with a button: signing in the
                         // moment it's valid covers typing and pasting alike.
                         onChange={e => {
+                          if (identitySaveFailed) {
+                            failedIdentitySecretRef.current = null;
+                            setIdentitySaveFailed(false);
+                            setError(undefined);
+                          }
+
                           setSecretValue(e.target.value);
                           void trySecret(e.target.value);
                         }}
@@ -1343,6 +1519,22 @@ export function GettingStartedFlow({
                         {secretError ?? error?.message}
                       </CardError>
                     ) : null}
+                    {identitySaveFailed ? (
+                      <Button
+                        type='button'
+                        subtle
+                        disabled={loading || !failedIdentitySecretRef.current}
+                        onClick={() => {
+                          const failedSecret = failedIdentitySecretRef.current;
+
+                          if (failedSecret) {
+                            void handleSignInWithSecret(failedSecret);
+                          }
+                        }}
+                      >
+                        Retry saving identity
+                      </Button>
+                    ) : null}
                     {/* Native installs need a way to link the portal before
                         the backup check can succeed. Once linked, the restore
                         step checks whether this account has a backup. */}
@@ -1355,6 +1547,8 @@ export function GettingStartedFlow({
                         subtle
                         onClick={() => {
                           setError(undefined);
+                          failedIdentitySecretRef.current = null;
+                          setIdentitySaveFailed(false);
                           setSecretError(undefined);
                           setRestoreCodeInput('');
                           setPreferCodeEntry(false);
@@ -1385,6 +1579,8 @@ export function GettingStartedFlow({
                           )
                             return;
                           setError(undefined);
+                          failedIdentitySecretRef.current = null;
+                          setIdentitySaveFailed(false);
 
                           if (createTarget.kind === 'portal') {
                             const url = safePortalUrl(createTarget.url);
@@ -1413,6 +1609,8 @@ export function GettingStartedFlow({
                 onClick={() => {
                   setError(undefined);
                   setSecretValue('');
+                  failedIdentitySecretRef.current = null;
+                  setIdentitySaveFailed(false);
 
                   if (returnToPortal && knownPortalUrl && !isRunningInTauri()) {
                     window.location.assign(
@@ -1529,6 +1727,8 @@ export function GettingStartedFlow({
                         disabled={loading}
                         onClick={() => {
                           setError(undefined);
+                          failedIdentitySecretRef.current = null;
+                          setIdentitySaveFailed(false);
                           setPreferCodeEntry(true);
                         }}
                       >
@@ -1586,6 +1786,8 @@ export function GettingStartedFlow({
                           disabled={loading}
                           onClick={() => {
                             setError(undefined);
+                            failedIdentitySecretRef.current = null;
+                            setIdentitySaveFailed(false);
                             setPreferCodeEntry(false);
                           }}
                         >
@@ -1604,6 +1806,8 @@ export function GettingStartedFlow({
                 subtle
                 onClick={() => {
                   setError(undefined);
+                  failedIdentitySecretRef.current = null;
+                  setIdentitySaveFailed(false);
                   setRestoreCodeInput('');
                   setStep('signin');
                 }}

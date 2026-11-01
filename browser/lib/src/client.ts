@@ -8,7 +8,12 @@ import {
   signRequest,
   legacyAgentForRequest,
 } from './authentication.js';
-import { AtomicError, ErrorType } from './error.js';
+import {
+  AtomicError,
+  ErrorType,
+  NOT_AVAILABLE_LOCALLY_MESSAGE,
+} from './error.js';
+import { busyRetryAfterMs, DEFAULT_BUSY_RETRY_MS, ErrorCode } from './ws-v2.js';
 import { pageRequestSignal } from './page-request-signal.js';
 // Import directly from the modules to avoid a circular dep through `./index.js`
 // — under some bundlers the re-exported binding lands as `undefined` at runtime
@@ -82,8 +87,34 @@ interface HTTPResourceResult {
 }
 
 /** Contains a `fetch` instance, provides methods to GET and POST several types */
+/** Response header of `POST /commit`: the node's write-load hint in ms. */
+const PACE_HEADER = 'X-Atomic-Pace-Ms';
+const RETRY_AFTER_MS_HEADER = 'X-Atomic-Retry-After-Ms';
+
+/** The delay a 429/503 asks for: the precise millisecond header, else the
+ *  standard `Retry-After` (seconds), else the hint in the body, else a
+ *  default. */
+function retryAfterMsOf(response: Response, message: string): number {
+  const exact = Number(response.headers?.get(RETRY_AFTER_MS_HEADER));
+
+  if (response.headers?.get(RETRY_AFTER_MS_HEADER) && Number.isFinite(exact)) {
+    return exact;
+  }
+
+  const secs = Number(response.headers?.get('Retry-After'));
+
+  if (response.headers?.get('Retry-After') && Number.isFinite(secs)) {
+    return secs * 1000;
+  }
+
+  return busyRetryAfterMs(message, ErrorCode.BUSY) ?? DEFAULT_BUSY_RETRY_MS;
+}
+
 export class Client {
   private __fetchOverride?: typeof fetch;
+  /** Called with the `X-Atomic-Pace-Ms` hint of every acknowledged
+   *  `POST /commit`. The store points it at the outbox. */
+  public paceListener?: (paceMs: number) => void;
 
   public constructor(fetchOverride?: typeof fetch) {
     if (fetchOverride) {
@@ -329,6 +360,17 @@ export class Client {
       const body = await response.text();
 
       if (response.status === 200) {
+        // An origin that runs no node (a portal, a static host) answers every
+        // path with its index.html. For an identifier that means "nothing
+        // here", not "a broken resource": say so, so the UI can offer the
+        // vault instead of a JSON parse error.
+        if (isAtomicIdentifier(subject) && /^\s*</.test(body)) {
+          throw new AtomicError(
+            NOT_AVAILABLE_LOCALLY_MESSAGE,
+            ErrorType.Transport,
+          );
+        }
+
         try {
           const json = JSON.parse(body);
 
@@ -420,10 +462,25 @@ export class Client {
     const body = await response.text();
 
     if (response.status !== 200) {
+      learnServerClock(body);
+
+      // 429 (write rate limit) and 503 (node overloaded) both mean "nothing
+      // was attempted, wait this long". Not worth the error logs below.
+      if (response.status === 429 || response.status === 503) {
+        const error = new AtomicError(body, ErrorType.Server, ErrorCode.BUSY);
+        error.retryAfterMs = retryAfterMsOf(response, error.message);
+        throw error;
+      }
+
       console.error('[postCommit] Server error body:', body);
       console.error('[postCommit] Commit sent:', serialized);
-      learnServerClock(body);
       throw new AtomicError(body, ErrorType.Server);
+    }
+
+    const pace = Number(response.headers?.get(PACE_HEADER));
+
+    if (response.headers?.get(PACE_HEADER) && Number.isFinite(pace)) {
+      this.paceListener?.(pace);
     }
 
     return parseCommitJSON(body);

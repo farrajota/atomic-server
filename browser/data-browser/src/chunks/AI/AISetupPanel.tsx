@@ -104,6 +104,23 @@ const AISetupPanelSession: React.FC<{ onDismiss?: () => void }> = ({
     availableProviders,
     openRouterAvailable,
     ollamaAvailable,
+    openAIApiKey,
+    setOpenAIApiKey,
+    openAIAvailable,
+    openAIModelId,
+    setOpenAIModelId,
+    anthropicApiKey,
+    setAnthropicApiKey,
+    anthropicAvailable,
+    anthropicModelId,
+    setAnthropicModelId,
+    openAICompatibleBaseURL,
+    setOpenAICompatibleBaseURL,
+    openAICompatibleApiKey,
+    setOpenAICompatibleApiKey,
+    openAICompatibleAvailable,
+    openAICompatibleModelId,
+    setOpenAICompatibleModelId,
     setGenFeaturesModel,
   } = useAISettings();
   const { agents, saveAgents } = useAIAgentConfig();
@@ -290,8 +307,9 @@ const AISetupPanelSession: React.FC<{ onDismiss?: () => void }> = ({
           </Column>
         )}
         <Subtle>
-          Use OpenRouter (cloud models) or Ollama (local models). At least one
-          provider must be connected before you can continue.
+          Use OpenAI, Anthropic, OpenAI-compatible, OpenRouter (cloud models),
+          or Ollama (local models). At least one provider must be connected
+          before you can continue.
         </Subtle>
         <ProvidersGrid>
           <OutlinedSection title='OpenRouter'>
@@ -338,6 +356,139 @@ const AISetupPanelSession: React.FC<{ onDismiss?: () => void }> = ({
                   aria-label='Ollama URL'
                 />
               </FullWidthField>
+            </ProviderSection>
+          </OutlinedSection>
+          <OutlinedSection title='OpenAI'>
+            <ProviderSection>
+              <ProviderStatus
+                connected={openAIAvailable}
+                configured={Boolean(openAIApiKey)}
+              />
+              <FullWidthField>
+                <InputStyled
+                  type='password'
+                  autoComplete='new-password'
+                  value={openAIApiKey || ''}
+                  onChange={e => setOpenAIApiKey(e.target.value || undefined)}
+                  aria-label='OpenAI API key'
+                />
+              </FullWidthField>
+              <Subtle>
+                This key stays in this browser&apos;s local storage. Requests
+                are sent directly over HTTPS from this browser to OpenAI and
+                require provider access and browser CORS permission.
+              </Subtle>
+              <FullWidthField>
+                <InputStyled
+                  value={openAIModelId}
+                  onChange={e => {
+                    const id = e.target.value;
+                    setOpenAIModelId(id);
+
+                    if (defaultChatModel.provider === AIProvider.OpenAI) {
+                      setDefaultChatModel({ id, provider: AIProvider.OpenAI });
+                    }
+                  }}
+                  aria-label='OpenAI model ID'
+                />
+              </FullWidthField>
+            </ProviderSection>
+          </OutlinedSection>
+          <OutlinedSection title='Anthropic'>
+            <ProviderSection>
+              <ProviderStatus
+                connected={anthropicAvailable}
+                configured={Boolean(anthropicApiKey)}
+              />
+              <FullWidthField>
+                <InputStyled
+                  type='password'
+                  autoComplete='new-password'
+                  value={anthropicApiKey || ''}
+                  onChange={e =>
+                    setAnthropicApiKey(e.target.value || undefined)
+                  }
+                  aria-label='Anthropic API key'
+                />
+              </FullWidthField>
+              <Subtle>
+                This key stays in this browser&apos;s local storage. Requests
+                are sent directly over HTTPS from this browser to Anthropic and
+                require provider access and browser CORS permission.
+              </Subtle>
+              <FullWidthField>
+                <InputStyled
+                  value={anthropicModelId}
+                  onChange={e => {
+                    const id = e.target.value;
+                    setAnthropicModelId(id);
+
+                    if (defaultChatModel.provider === AIProvider.Anthropic) {
+                      setDefaultChatModel({
+                        id,
+                        provider: AIProvider.Anthropic,
+                      });
+                    }
+                  }}
+                  aria-label='Anthropic model ID'
+                />
+              </FullWidthField>
+            </ProviderSection>
+          </OutlinedSection>
+          <OutlinedSection title='OpenAI-compatible'>
+            <ProviderSection>
+              <ProviderStatus
+                connected={openAICompatibleAvailable}
+                configured={Boolean(openAICompatibleBaseURL)}
+              />
+              <FullWidthField>
+                <InputStyled
+                  type='url'
+                  value={openAICompatibleBaseURL || ''}
+                  placeholder='https://proxy.example/v1'
+                  onChange={e =>
+                    setOpenAICompatibleBaseURL(e.target.value || undefined)
+                  }
+                  aria-label='OpenAI-compatible base URL'
+                />
+              </FullWidthField>
+              <FullWidthField>
+                <InputStyled
+                  type='password'
+                  autoComplete='new-password'
+                  value={openAICompatibleApiKey || ''}
+                  onChange={e =>
+                    setOpenAICompatibleApiKey(e.target.value || undefined)
+                  }
+                  aria-label='OpenAI-compatible API key (optional)'
+                />
+              </FullWidthField>
+              <FullWidthField>
+                <InputStyled
+                  value={openAICompatibleModelId}
+                  onChange={e => {
+                    const id = e.target.value;
+                    setOpenAICompatibleModelId(id);
+
+                    if (
+                      defaultChatModel.provider === AIProvider.OpenAICompatible
+                    ) {
+                      setDefaultChatModel({
+                        id,
+                        provider: AIProvider.OpenAICompatible,
+                      });
+                    }
+                  }}
+                  aria-label='OpenAI-compatible model ID'
+                />
+              </FullWidthField>
+              <Subtle>
+                Keys stay in this browser&apos;s local storage. Requests go
+                directly from this browser to the configured provider or proxy,
+                which must be reachable from the browser and allow CORS. Use
+                HTTPS except for local development endpoints. No endpoint checks
+                are made until you send a request.
+              </Subtle>
             </ProviderSection>
           </OutlinedSection>
         </ProvidersGrid>

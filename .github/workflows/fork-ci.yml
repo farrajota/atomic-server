@@ -1,0 +1,107 @@
+name: Fork package CI
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  validate:
+    name: Build and test packages
+    if: github.repository == 'farrajota/atomic-server'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      CI: true
+    steps:
+      - name: Check out dispatched or event revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Rust toolchain and build targets
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown, wasm32-wasip2
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: fork-ci-linux
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential clang cmake libssl-dev nasm pkg-config protobuf-compiler
+
+      - name: Install pinned pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: browser/pnpm-lock.yaml
+
+      - name: Install locked browser workspace dependencies
+        working-directory: browser
+        run: pnpm install --frozen-lockfile
+
+      # Native tool bootstrap uses host flags; wasm/.cargo/config.toml supplies
+      # wasm_js flags only for the wasm32-unknown-unknown browser artifact.
+      - name: Build locked browser WASM artifact
+        working-directory: wasm
+        run: |
+          cargo run --locked --quiet --package cargo-bin -- wasm-pack build --target web --out-dir pkg
+          mkdir -p ../browser/data-browser/public/wasm
+          cp pkg/atomic_wasm.js pkg/atomic_wasm_bg.wasm ../browser/data-browser/public/wasm/
+
+      # Build the production browser/form workspace against the generated WASM;
+      # do not invoke its alternate wasm-pack path a second time.
+      - name: Build browser workspace
+        working-directory: browser
+        env:
+          SKIP_WASM_BUILD: '1'
+        run: pnpm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Check Rust workspace
+        run: cargo check --locked --workspace --exclude atomic-server-tauri --no-default-features --features light,wasm-plugins
+
+      - name: Run warning-clean Rust Clippy
+        run: cargo clippy --locked --workspace --exclude atomic-server-tauri --no-deps --all-targets --no-default-features --features light,wasm-plugins -- -D warnings
+
+      - name: Test native Rust workspace
+        env:
+          ATOMICSERVER_REQUIRE_PLUGIN_RUNTIME: 'true'
+        run: cargo test --locked --workspace --exclude atomic-server-tauri --no-default-features --features light,wasm-plugins
+
+      - name: Test browser and SDK workspace
+        working-directory: browser
+        run: pnpm run test
+
+      - name: Test LocalThought unit suite
+        run: browser/node_modules/.bin/vitest run --config integrations/localthought/vitest.config.ts
+
+      - name: Test MCP integration unit suite
+        run: node --test browser/data-browser/scripts/integration-mcp.test.mjs

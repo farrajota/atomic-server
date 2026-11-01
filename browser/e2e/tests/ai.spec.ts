@@ -1,4 +1,4 @@
-import { isAtomicIdentifier } from '@tomic/lib';
+import { ai, core, isAtomicIdentifier } from '@tomic/lib';
 import { test, expect } from './fixtures';
 import { before, waitForSynced, reloadReconnected } from './test-utils';
 import {
@@ -44,6 +44,36 @@ test.describe('AI Chat', () => {
     await expect(
       page.getByTestId('sidebar').getByRole('link', { name: 'Test Chat' }),
     ).toBeVisible({ timeout: 15_000 });
+    const href = await page
+      .getByTestId('sidebar')
+      .getByRole('link', { name: 'Test Chat' })
+      .getAttribute('href');
+    const chatSubject = isAtomicIdentifier(href!)
+      ? href!
+      : new URL(href!, page.url()).searchParams.get('subject')!;
+    const location = await page.evaluate(
+      async ({ subject, parentProperty, folderPointer }) => {
+        const store = window.store;
+        const chat = await store.getResource(subject);
+        const driveSubject = await store.privateDriveSubject();
+        const drive = await store.getResource(driveSubject);
+        const folderSubject = drive.get(folderPointer) as string;
+
+        return {
+          parent: chat.get(parentProperty),
+          folder: folderSubject,
+          drive: driveSubject,
+        };
+      },
+      {
+        subject: chatSubject,
+        parentProperty: core.properties.parent,
+        folderPointer: ai.properties.aiChatsFolder,
+      },
+    );
+    expect(location.folder).toBeTruthy();
+    expect(location.parent).toBe(location.folder);
+    expect(location.parent).not.toBe(location.drive);
   });
 
   test('persists a partial assistant reply before the stream finishes and restores it after refresh', async ({

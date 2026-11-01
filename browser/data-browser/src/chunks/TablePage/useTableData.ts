@@ -8,6 +8,7 @@ import {
   UseCollectionResult,
   useResource,
   useStore,
+  useString,
   useSubject,
 } from '@tomic/react';
 import { useTableView, UseTableViewResult } from './useTableView';
@@ -15,6 +16,7 @@ import { toAggregation } from './tableAggregates';
 import { quantizedNow, splitFilters } from './tableFiltering';
 
 const PAGE_SIZE = 30;
+const TABLE_DRIVE_PROPERTY = 'https://atomicdata.dev/properties/drive';
 
 type UseTableDataResult = {
   tableClass: Resource;
@@ -40,6 +42,7 @@ export function useTableData(
   const store = useStore();
 
   const [classSubject] = useSubject(resource, core.properties.classtype);
+  const [tableDrive] = useString(resource, TABLE_DRIVE_PROPERTY);
   const tableClass = useResource(classSubject);
 
   // Only constraints with an actual value narrow the query; an in-progress
@@ -81,6 +84,7 @@ export function useTableData(
     sort_by: sorting.prop,
     sort_desc: sorting.sortDesc,
     aggregation,
+    drive: tableDrive,
   };
 
   const { collection, ready, invalidateCollection, mapAll } = useCollection(

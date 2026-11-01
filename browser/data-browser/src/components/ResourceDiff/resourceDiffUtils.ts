@@ -1,9 +1,33 @@
-import { isJSONObject, type AtomicValue, type Resource } from '@tomic/react';
+import {
+  commits,
+  getLoroBodySignature,
+  isJSONObject,
+  type AtomicValue,
+  type Resource,
+} from '@tomic/react';
 
 export interface AtomicDiff {
   oldResource?: Resource;
   newResource: Resource;
   changedProps: string[];
+  bodyChanged: boolean;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(
+        ([key, nested]) => `${JSON.stringify(key)}:${stableStringify(nested)}`,
+      )
+      .join(',')}}`;
+  }
+
+  return JSON.stringify(value) ?? '';
 }
 
 export function isPropEqual(
@@ -24,12 +48,11 @@ export function isPropEqual(
     return false;
   }
 
-  if (isJSONObject(oldProp) && isJSONObject(newProp)) {
-    return JSON.stringify(oldProp) === JSON.stringify(newProp);
-  }
-
-  if (Array.isArray(oldProp) && Array.isArray(newProp)) {
-    return JSON.stringify(oldProp) === JSON.stringify(newProp);
+  if (
+    (isJSONObject(oldProp) && isJSONObject(newProp)) ||
+    (Array.isArray(oldProp) && Array.isArray(newProp))
+  ) {
+    return stableStringify(oldProp) === stableStringify(newProp);
   }
 
   return oldProp === newProp;
@@ -42,14 +65,27 @@ function getChangedProps(
   const changedProps: string[] = [];
 
   if (!oldResource) {
-    return newResource
-      .getEntries()
-      .map(([key]) => key)
-      .filter(key => !key.includes('loroUpdate'));
+    changedProps.push(
+      ...newResource
+        .getEntries()
+        .map(([key]) => key)
+        .filter(
+          key =>
+            key !== commits.properties.lastCommit &&
+            key !== commits.properties.loroUpdate,
+        ),
+    );
+
+    return changedProps;
   }
 
   for (const [key, value] of oldResource.getEntries()) {
-    if (key.includes('loroUpdate')) continue;
+    if (
+      key === commits.properties.lastCommit ||
+      key === commits.properties.loroUpdate
+    ) {
+      continue;
+    }
 
     if (!isPropEqual(value, newResource.get(key))) {
       changedProps.push(key);
@@ -57,7 +93,12 @@ function getChangedProps(
   }
 
   for (const [key] of newResource.getEntries()) {
-    if (key.includes('loroUpdate')) continue;
+    if (
+      key === commits.properties.lastCommit ||
+      key === commits.properties.loroUpdate
+    ) {
+      continue;
+    }
 
     if (oldResource.get(key) === undefined) {
       changedProps.push(key);
@@ -72,10 +113,15 @@ export function useResourceDiff(
   newResource: Resource,
 ): AtomicDiff {
   const changedProps = getChangedProps(oldResource, newResource);
+  const bodyChanged = oldResource
+    ? getLoroBodySignature(oldResource.getLoroDoc()) !==
+      getLoroBodySignature(newResource.getLoroDoc())
+    : newResource.hasLoroBody();
 
   return {
     oldResource,
     newResource,
     changedProps,
+    bodyChanged,
   };
 }

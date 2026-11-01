@@ -28,20 +28,20 @@ A static resource has a _content addressable_ URL, which means that its URL will
 
 ## Who signed a version
 
-Every applied commit leaves its signed JSON-AD on the resource it changed, in
-a side tree on the node (`Tree::Envelopes`). It is not a resource and it is
-not indexed: it never appears in queries or collections. A node keeps either
-the envelope that produced the current state (`--envelope-retention latest`,
-the default) or every envelope (`all`), which turns the Loro history into a
-signed audit log.
+The Loro document of a resource holds every change, but not the proof of who
+made it. That proof is the signed commit itself, so after applying a commit a
+node can keep it. Kept commits live in a side tree on the node (internally
+`Tree::Envelopes`, the code's name for a stored commit). They are not resources
+and are not indexed: they never appear in queries or collections. By default, a
+node retains the newest envelope per resource (`--envelope-retention latest`).
+Set a resource's `retention` property to `audit` to keep every commit for it and
+its descendants; `--envelope-retention all` retains every commit node-wide.
 
-When a node applies a signed commit, it records which Loro op IDs
-(`peer`, `counter`, `length`) the commit's `loroUpdate` added to the stored
-document, and which ops the server wrote on top while applying it (the
-`lastCommit` stamp, the derived `drive`). That is how a version in History
-maps to its signer. Change messages are chosen by the client, so they are
-never used as evidence: a change without a message, or one reusing someone
-else's message, is still attributed to the envelope that brought it in.
+A kept commit is stored compactly when its signed `loroUpdate` can be reconstructed byte for byte: raw update bytes, signer and previous-commit ids, with signature, creation time and subject in the row key. Reading rebuilds the exact signed JSON-AD from the row alone, without the Loro document; otherwise the full JSON is retained. Signatures are checked on import and by `/history-attribution`, not on a plain row read. Undecodable rows are reported as `unreadable`, make history incomplete, and are never guessed, substituted for newer rows or pruned on a wrong assumption.
+
+When a node applies a signed commit, it records the Loro op IDs (`peer`, `counter`, `length`) the commit's `loroUpdate` added, and which ops the server wrote while applying it (including derived values). This maps History versions to their signer; client-chosen change messages are not evidence. Each commit's change token is carried in its message and the kept commit that introduced it carries the same token inside `loroUpdate`.
+
+A resource can request an audit log by setting `retention` to `audit` (default `compact`): the node keeps every commit of that resource and its descendants. The setting is inherited and only raises retention; `compact` cannot lower an audited ancestor, and `--envelope-retention all` audits everything. Only `compact` and `audit` are accepted. Audit protects commits from then on; already-dropped commits are not recovered. Removing audit or moving a resource out of an audited folder does not delete the audit-era commits; the lowering commit is retained with them, while subsequent commits again replace the newest row. Writers can change `retention`; who may lower it remains an open question for an owner level. A receiver with a newer commit still drops an older incoming one, and a node missing an ancestor retains incoming commits until it can read the whole chain. Retention applies independently on each node.
 
 `GET /history-attribution?subject=<subject>` returns, for a resource the
 caller may read:
@@ -82,15 +82,4 @@ caller may read:
 }
 ```
 
-Each entry in `changes` is one Loro change of the stored document, with its
-`origin`: `signed` (all its ops came in with one envelope whose signature
-verifies here), `unverified` (one envelope, signature does not verify),
-`server` (written by the node while applying envelopes), `unattributed` (some
-op came in without a signed commit recorded here) or `ambiguous` (covered by
-more than one source). `verified` means the answering node re-checked the
-signature with the same code it applies commits with. `complete` means every
-change is `signed` or `server`. `spans` is `null` for an envelope the node did
-not apply itself (it arrived with a bulk push or a vault pack); its ops are
-then unattributed on that node. `tokens` lists the messages of the changes an
-envelope introduced, for display only. A version no envelope covers is shown
-as *Unattributed*; a signer is never guessed.
+Each entry in `changes` is one Loro change of the stored document. `origin` is `signed` when all its ops came from one envelope whose signature verifies here, `unverified` when that envelope's signature does not verify, `server` for node-written ops, `unattributed` when no signed commit is recorded here, or `ambiguous` when more than one source covers it. `verified` means the answering node re-checked the signature using its commit-application verification. `complete` means every client-authored change in the oplog is claimed by a verified kept commit. `spans` is null for an envelope not applied locally (for example, imported via bulk push or vault pack); its ops are then unattributed on this node. `tokens` lists change messages for display only. A version no kept commit covers is shown as *Unattributed*; a signer is never guessed.

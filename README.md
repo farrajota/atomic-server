@@ -44,7 +44,9 @@ _Status: alpha. [Breaking changes](CHANGELOG.md) are expected until 1.0._
 - 🧰  **Templates**: issue tracker, CRM, project tasks, time tracker and more.
 - 🌐  **Websites**: design pages in the browser, publish in one click, roll back any version.
 - 🗂️  **Virtual drive**: mount your drive as a folder in Finder or Explorer (desktop app).
-- ✨  **AI** with [MCP](https://modelcontextprotocol.io/) support, any model via OpenRouter or local Ollama.
+- **AI** with [MCP](https://modelcontextprotocol.io/) support, using OpenAI,
+  Anthropic, OpenAI-compatible APIs (including CLIProxyAPI), OpenRouter, or
+  local Ollama. Connect a provider in AI chat setup or Settings > AI.
 - 🧩  **Apps**: custom screens in plain JavaScript, backed by your own data.
 - 🔌  **Plugins and integrations**: Wasm plugins, and syncing from GitHub and more.
 - 💬  **Group chat**: channels with attachments, search and replies.

@@ -11,12 +11,48 @@ pub type KvPair = (Vec<u8>, Vec<u8>);
 /// Iterator over key-value pairs from a store.
 pub type KvIter = Box<dyn Iterator<Item = AtomicResult<KvPair>> + Send>;
 
+/// A consistent immutable snapshot of bounded key/value reads.
+pub trait KvReadView: Send + Sync {
+    fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>>;
+
+    fn get_bounded(
+        &self,
+        _tree: Tree,
+        _key: &[u8],
+        _max_bytes: usize,
+    ) -> AtomicResult<Option<Vec<u8>>> {
+        Err("Storage backend does not support bounded read-view gets".into())
+    }
+
+    fn scan_prefix(&self, tree: Tree, prefix: &[u8], limit: usize) -> AtomicResult<Vec<KvPair>>;
+
+    fn scan_prefix_bounded(
+        &self,
+        _tree: Tree,
+        _prefix: &[u8],
+        _row_limit: usize,
+        _max_bytes: usize,
+    ) -> AtomicResult<Vec<KvPair>> {
+        Err("Storage backend does not support bounded read-view scans".into())
+    }
+}
+
 /// A storage backend for the Db.
 /// All methods operate on named trees (namespaces).
 ///
 /// Implementations must ensure that [`KvStore::apply_batch`] is atomic:
 /// either all operations succeed or none are applied.
 pub trait KvStore: Send + Sync {
+    /// Open a true immutable snapshot, or fail if the backend cannot provide one.
+    fn read_view(&self) -> AtomicResult<std::sync::Arc<dyn KvReadView>> {
+        Err("Storage backend does not support consistent read views".into())
+    }
+
+    /// Store exact native snapshot bytes without delta compression.
+    fn write_recovery_snapshot(&self, _key: &[u8], _snapshot: &[u8]) -> AtomicResult<()> {
+        Err("Storage backend does not support exact recovery snapshots".into())
+    }
+
     /// Get a value by key from a specific tree.
     fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>>;
 
@@ -46,6 +82,24 @@ pub trait KvStore: Send + Sync {
         limit: usize,
     ) -> AtomicResult<Vec<KvPair>> {
         self.range(tree, start, end, false).take(limit).collect()
+    }
+
+    /// Keys and value lengths in `[start, end)`, at most `limit`, without
+    /// copying the values where the backend can avoid it. Lets the blob sweep
+    /// list gigabytes of file bytes page by page. Errors are returned, never
+    /// skipped: a listing that silently loses rows is not a listing.
+    fn range_value_sizes(
+        &self,
+        tree: Tree,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: usize,
+    ) -> AtomicResult<Vec<(Vec<u8>, u64)>> {
+        Ok(self
+            .range_page(tree, start, end, limit)?
+            .into_iter()
+            .map(|(key, value)| (key, value.len() as u64))
+            .collect())
     }
 
     /// Iterate over all entries in a tree, ordered by key.

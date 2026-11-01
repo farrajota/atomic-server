@@ -2712,6 +2712,8 @@ async fn drive_usage_endpoint() {
         "blobBytes should equal the uploaded content length: {body}"
     );
     assert!(json.get("loroBytes").is_some(), "loroBytes missing: {body}");
+    // An open node hosts every drive it holds.
+    assert_eq!(json["enrolled"], true, "{body}");
 
     // The per-resource breakdown must add up to the drive totals, with the
     // uploaded file's bytes attributed to exactly one resource.
@@ -2734,6 +2736,77 @@ async fn drive_usage_endpoint() {
     assert_eq!(blob_total, test_content.len() as u64, "{body}");
     assert_eq!(rows.len() as u64, json["resourceCount"].as_u64().unwrap());
     assert_eq!(loro_total, json["loroBytes"].as_u64().unwrap());
+}
+
+/// `GET /drive-usage` says whether the node still admits the drive, rather
+/// than leaving clients to infer it from "the node holds data". A drive whose
+/// plan was switched off keeps its data on a managed node but is no longer
+/// enrolled.
+#[actix_rt::test]
+async fn drive_usage_reports_enrollment_on_a_managed_node() {
+    let unique_string = atomic_lib::utils::random_string(10);
+    use clap::Parser;
+    let opts = Opts::parse_from([
+        "atomic-server",
+        "--initialize",
+        "--data-dir",
+        &format!("./.temp/{}/db", unique_string),
+        "--config-dir",
+        &format!("./.temp/{}/config", unique_string),
+    ]);
+
+    let mut config = config::build_config(opts).expect("failed init config");
+    config.search_index_path = format!("./.temp/{}/search_index", unique_string).into();
+    let appstate = crate::appstate::AppState::init(config.clone())
+        .await
+        .expect("failed init appstate");
+
+    let data = Data::new(appstate.clone());
+    let app = test::init_service(
+        App::new()
+            .app_data(data)
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    // The drive and its data exist while the node is still open.
+    let drive_did = atomic_lib::test_utils::create_test_drive(&appstate.store)
+        .await
+        .unwrap();
+
+    // Now the node becomes managed: only drives the control plane lists are
+    // enrolled. This one is not (plan switched off), yet its data stays.
+    let policy = std::sync::Arc::new(atomic_lib::sync::policy::AllowlistPolicy::new());
+    appstate.store.set_sync_policy(policy.clone());
+
+    macro_rules! usage {
+        () => {{
+            let uri = format!(
+                "/drive-usage?subject={}",
+                urlencoding::encode(drive_did.as_str())
+            );
+            let req = build_request_authenticated(&uri, &appstate).to_request();
+            let resp = test::call_service(&app, req).await;
+            let status = resp.status();
+            let body = get_body(resp);
+            assert!(status.is_success(), "drive-usage status {status}: {body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        }};
+    }
+
+    let json = usage!();
+    assert!(json["resourceCount"].as_u64().unwrap() >= 1, "{json}");
+    assert_eq!(json["enrolled"], false, "data without enrollment: {json}");
+
+    policy.set_drive_policies([(drive_did.to_string(), None)]);
+    let json = usage!();
+    assert_eq!(json["enrolled"], true, "{json}");
+
+    // Over quota is still enrolled: the drive is hosted, just full.
+    policy.set_drive_policies([(drive_did.to_string(), Some(1))]);
+    policy.record_drive_usage([(drive_did.to_string(), 10)]);
+    let json = usage!();
+    assert_eq!(json["enrolled"], true, "{json}");
 }
 
 /// `GET /server` describes the node itself as a `Server` resource, replacing the
@@ -3954,4 +4027,233 @@ async fn genesis_route_serves_only_the_certificate_of_a_drive() {
             "{subject:?}"
         );
     }
+}
+
+/// A fresh server instance and signed client read populated recovery data without fetching it.
+#[actix_rt::test]
+async fn restored_source_is_readable_by_a_fresh_authorized_client_offline() {
+    use atomic_lib::{
+        agents::Agent,
+        envelopes::EnvelopeRetention,
+        recovery::{RecoveryRequest, RecoverySelection},
+        Storelike, Value,
+    };
+
+    let source_appstate = init_test_appstate(&["--envelope-retention", "all"]).await;
+    let source_store = &source_appstate.store;
+    source_store.set_envelope_retention(EnvelopeRetention::All);
+    let owner = source_store.get_default_agent().unwrap();
+    let drive = source_store.ensure_private_drive().await.unwrap();
+    let source_text = "original source bytes\nsecond line\ntrailing spaces  \n";
+    let subject = source_store
+        .create_resource(
+            urls::CLASS,
+            &drive,
+            "Recovered Source",
+            Some(vec![
+                (urls::DESCRIPTION, Value::Markdown(source_text.into())),
+                (urls::SOURCE, Value::String(source_text.into())),
+                (urls::SHORTNAME, Value::Slug("recovered-source".into())),
+            ]),
+        )
+        .await
+        .unwrap();
+    let mut resource = source_store
+        .get_resource(&atomic_lib::Subject::from_raw(
+            &subject,
+            source_store.get_base_domain().as_deref(),
+        ))
+        .await
+        .unwrap();
+    resource
+        .set(
+            urls::NAME.into(),
+            Value::String("Restored Source".into()),
+            source_store,
+        )
+        .await
+        .unwrap();
+    resource.save_locally(source_store).await.unwrap();
+
+    let revision = |id: &str| {
+        source_store
+            .get_resource_shallow(&atomic_lib::Subject::from_raw(
+                id,
+                source_store.get_base_domain().as_deref(),
+            ))
+            .unwrap()
+            .get(urls::LAST_COMMIT)
+            .unwrap()
+            .to_string()
+    };
+    let request = RecoveryRequest {
+        version: 1,
+        resources: vec![
+            RecoverySelection {
+                subject: drive.clone(),
+                expected_last_commit: revision(&drive),
+            },
+            RecoverySelection {
+                subject: subject.clone(),
+                expected_last_commit: revision(&subject),
+            },
+        ],
+        allowed_drives: vec![drive],
+    };
+    let source_app = test::init_service(
+        App::new()
+            .app_data(Data::new(source_appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let response = test::call_service(
+        &source_app,
+        TestRequest::post()
+            .uri("/recovery/export")
+            .set_json(&request)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        401,
+        "anonymous recovery export is forbidden"
+    );
+    let body = get_body(response);
+    assert!(
+        !body.contains(source_text),
+        "anonymous export leaked source bytes"
+    );
+
+    let export_request = build_request_authenticated("/recovery/export", &source_appstate)
+        .method(actix_web::http::Method::POST)
+        .set_json(&request)
+        .to_request();
+    let response = test::call_service(&source_app, export_request).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "authenticated recovery export failed"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/vnd.atomic-recovery")
+    );
+    let bundle = test::read_body(response).await.to_vec();
+    let decoded = atomic_lib::recovery::decode_bundle(&bundle, owner.subject.as_str()).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("restored-store");
+    std::fs::create_dir(&target).unwrap();
+    let uploads = target.join("uploads");
+    std::fs::create_dir(&uploads).unwrap();
+    let restored_store =
+        atomic_lib::Db::init_redb_file(&target, decoded.manifest().base_domain.clone(), &uploads)
+            .await
+            .unwrap();
+    atomic_lib::recovery::restore_bundle(&restored_store, &decoded)
+        .await
+        .unwrap();
+    restored_store.flush().unwrap();
+    drop(restored_store);
+
+    use clap::Parser;
+    let target_data = target.to_string_lossy().into_owned();
+    let target_config = temp
+        .path()
+        .join("target-config")
+        .to_string_lossy()
+        .into_owned();
+    let opts = Opts::parse_from([
+        "atomic-server",
+        "--data-dir",
+        &target_data,
+        "--config-dir",
+        &target_config,
+        "--envelope-retention",
+        "all",
+    ]);
+    let mut config = config::build_config(opts).expect("failed init restored config");
+    config.store_path = target;
+    config.search_index_path = temp.path().join("search-index");
+    config.vector_search_index_path = temp.path().join("vector-search-index");
+    let restored_appstate = AppState::init(config).await.unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(restored_appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+
+    let signed_request = |path: &str, agent: &Agent| {
+        let origin = restored_appstate.config.get_origin();
+        let url = format!("{origin}{path}");
+        let headers = atomic_lib::client::get_authentication_headers(&url, agent).unwrap();
+        let mut req = TestRequest::with_uri(path);
+        for header in headers {
+            req = req.insert_header(header);
+        }
+        if let Ok(parsed) = url::Url::parse(&origin) {
+            if let Some(host) = parsed.host_str() {
+                let authority = parsed
+                    .port()
+                    .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
+                req = req.insert_header(("Host", authority));
+            }
+        }
+        req.insert_header(("Accept", "application/ad+json"))
+    };
+
+    let path = format!("/{subject}");
+    let response = test::call_service(&app, signed_request(&path, &owner).to_request()).await;
+    let status = response.status();
+    let body = get_body(response);
+    assert!(
+        status.is_success(),
+        "restored resource read failed: {status}: {body}"
+    );
+    let restored_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(restored_json[urls::SOURCE].as_str(), Some(source_text));
+    assert_eq!(restored_json[urls::DESCRIPTION].as_str(), Some(source_text));
+
+    let history_path = format!(
+        "/history-attribution?subject={}",
+        urlencoding::encode(&subject)
+    );
+    let response =
+        test::call_service(&app, signed_request(&history_path, &owner).to_request()).await;
+    let status = response.status();
+    let body = get_body(response);
+    assert!(
+        status.is_success(),
+        "restored history read failed: {status}: {body}"
+    );
+    let history: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(history["complete"], true, "{body}");
+    assert!(
+        history["attributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["signer"] == owner.subject.to_string() && entry["verified"] == true
+            }),
+        "original signed history was not verified: {body}"
+    );
+
+    let outsider = Agent::new(Some("Unauthorized recovery client")).unwrap();
+    let response = test::call_service(&app, signed_request(&path, &outsider).to_request()).await;
+    assert_eq!(
+        response.status(),
+        401,
+        "an unauthorized client read restored data"
+    );
+    let body = get_body(response);
+    assert!(
+        !body.contains(source_text),
+        "unauthorized response leaked source bytes: {body}"
+    );
 }

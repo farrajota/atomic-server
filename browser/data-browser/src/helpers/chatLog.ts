@@ -175,17 +175,8 @@ export async function queryPages(
     .setPreferServer(true);
 
   if (drive) builder.setDrive(drive);
-  const collection = builder.build();
-  await collection.waitForReady();
-  const pages: string[] = [];
 
-  for (let i = 0; i < collection.totalMembers; i++) {
-    const member = await collection.getMemberWithIndex(i);
-
-    if (member) pages.push(member);
-  }
-
-  return pages;
+  return builder.build().getAllMembers();
 }
 
 /** Every page, oldest first: the ones in a query and the ones this client made. */
@@ -212,6 +203,8 @@ export interface SendLogMessage {
   kind?: string;
   /** Writes the entry as this author instead of the signed-in agent (the demo's personas). */
   author?: string;
+  /** When the message was written (ms); now when absent. Backdates history. */
+  at?: number;
   /** Pages of this chat the client already knows. */
   pages: string[];
   scope: string;
@@ -242,7 +235,17 @@ export function appendToChatLog(
 
 async function append(
   store: Store,
-  { parent, about, text, replyTo, kind, author, pages, scope }: SendLogMessage,
+  {
+    parent,
+    about,
+    text,
+    replyTo,
+    kind,
+    author,
+    at,
+    pages,
+    scope,
+  }: SendLogMessage,
 ): Promise<string> {
   const candidates = mergePages(store, scope, pages);
   const infos: PageInfo[] = [];
@@ -266,6 +269,7 @@ async function append(
     ...(replyTo && { r: replyTo }),
     ...(kind && { k: kind }),
     ...(author && { a: author }),
+    ...(at !== undefined && { c: at }),
   };
 
   if (target) {
@@ -341,6 +345,8 @@ export interface SendEntryOptions {
   kind?: string;
   /** See {@link SendLogMessage.author}. */
   author?: string;
+  /** See {@link SendLogMessage.at}. */
+  at?: number;
 }
 
 /**
@@ -350,7 +356,7 @@ export interface SendEntryOptions {
  */
 export async function sendLogEntry(
   store: Store,
-  { parent, text, about, replyTo, kind, author }: SendEntryOptions,
+  { parent, text, about, replyTo, kind, author, at }: SendEntryOptions,
 ): Promise<string> {
   const property = about
     ? dataBrowser.properties.about
@@ -379,6 +385,7 @@ export async function sendLogEntry(
     replyTo,
     kind,
     author,
+    at,
     pages,
     scope,
   });

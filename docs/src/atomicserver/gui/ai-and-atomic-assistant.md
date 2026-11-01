@@ -6,18 +6,34 @@ And if you want nothing to do with AI, you can disable it completely in the sett
 
 ![AI Sidebar](../../assets/ui-guide/ai_sidebar_example.avif)
 
-AtomicServer integrates with large language models (LLMs) via two main providers:
+AtomicServer supports hosted OpenRouter and Ollama, and can also connect directly to OpenAI and Anthropic or to an OpenAI-compatible chat-completions service.
 
-- **OpenRouter**: A cloud-based API that gives access to a wide range of commercial and open-source models (e.g., GPT-4, Claude, Mixtral, etc.).
-- **Ollama**: A self-hosted, local LLM server that runs models on your own hardware for privacy and offline use.
+Direct OpenAI and Anthropic requests use API keys configured in AI settings. Their default model IDs are `gpt-4.1-mini` and `claude-sonnet-4-5`; model IDs remain editable and must match the provider's exact model ID. For OpenAI-compatible services, configure an explicit browser-reachable HTTP(S) base URL and exact model ID; a key is optional for endpoints that do not require one. For example, a compatible proxy may use `https://cliproxyapi.zay.home/v1`. The endpoint must be reachable from the browser, and its CORS policy must allow the app's origin. Anthropic browser requests also require the provider's explicit browser-client header to be accepted.
+
+Provider keys and endpoint settings are stored in this browser's local settings, unencrypted, and are sent from the browser to the selected provider or compatible endpoint. Do not enter credentials on a shared or untrusted device. An OpenAI, Anthropic or other consumer/API subscription does not automatically provide an API key or API billing; obtain API credentials separately. A compatible proxy that authenticates a subscription remains independently configured and authenticated: Atomic does not provide or bypass that proxy authentication.
+
+Voice transcription remains the existing OpenRouter-specific feature; configuring OpenAI, Anthropic or an OpenAI-compatible chat endpoint does not configure speech services.
 
 ## Configuring AI
 
-Before you start using the AI features you will need to configure an AI provider. This is straightforward and can be done on the settings page.
+Configure an AI provider on the settings page. Choose the provider and set its key, model ID, and—when using an OpenAI-compatible service—its base URL there.
+Provider settings and model choice are separate. In each provider section, enter its key (where required), exact model ID and, for an OpenAI-compatible service, its base URL. These settings configure the provider; they do not by themselves choose it as the default for new chats. Use the provider's **Use OpenAI for new chats**, **Use Anthropic for new chats**, or **Use compatible model for new chats** button to save that default.
+
+In **Generative features**, the **Provider** control only selects or filters which provider's model control is shown; changing it alone does not save a model choice. To commit the generative-features model, select the provider and edit the **Model ID** field. If the configured ID is already displayed, re-enter that exact ID to commit it.
+
+To change the model for the current chat, open **AI Chat options** and choose **Model**. This saves the selection to the current agent's explicit model when it has one; otherwise it updates the default chat model. An agent-specific model therefore takes precedence over the default for that agent.
 
 ### OpenRouter
 
-If you want to use OpenRouter, you will need an OpenRouter account with some credits. You can link it to AtomicServer by clicking the "Login with OpenRouter" button or pasting your API key in the text field.
+OpenRouter offers access to a wide range of commercial and open-source models. You can link an account in the app or enter an OpenRouter API key.
+
+### Direct OpenAI and Anthropic
+
+Enter the corresponding API key in AI settings and select or enter the exact model ID. Requests go directly from the browser; provider CORS settings must permit the app origin. Anthropic must allow the explicit browser-client header used for browser requests.
+
+### OpenAI-compatible endpoint
+
+Set the endpoint's explicit browser-reachable HTTP(S) base URL, exact model ID (the compatible model is initially unset), and optional API key in AI settings. For example, `https://cliproxyapi.zay.home/v1` is a base URL for a compatible proxy; use the exact model ID accepted by that proxy. The endpoint must allow browser requests from the app's origin through CORS. If the proxy relies on a consumer subscription, its authentication remains external to Atomic and must be configured at the proxy.
 
 ### Ollama
 

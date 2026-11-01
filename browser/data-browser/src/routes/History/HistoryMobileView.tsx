@@ -13,8 +13,7 @@ import {
   DialogTitle,
   useDialog,
 } from '../../components/Dialog';
-import type { Version } from '@tomic/react';
-import { useStore, Resource, type AtomicValue } from '@tomic/react';
+import { useStore, type Version } from '@tomic/react';
 import {
   ResourceDiff,
   useResourceDiff,
@@ -22,6 +21,8 @@ import {
 import { plural } from '@helpers/plural';
 import { Tabs } from '@components/Tabs';
 import { ResourceCardDefault } from '@views/Card/ResourceCard';
+import { resourceAtVersion } from './versionHelpers';
+import { VersionContent } from './VersionContent';
 
 export function HistoryMobileView({
   resource,
@@ -36,33 +37,24 @@ export function HistoryMobileView({
   const [dialogProps, showDialog, closeDialog] = useDialog();
   const store = useStore();
 
-  const selectedVersionResource = useMemo(() => {
-    const res = new Resource(resource.subject);
-    res.setStore(store);
-    res.applyHydratedValues(
-      selectedVersion.propvals.entries() as Iterable<[string, AtomicValue]>,
-    );
+  const selectedVersionResource = useMemo(
+    () => resourceAtVersion(resource, selectedVersion, store),
+    [store, resource, selectedVersion],
+  );
 
-    return res;
-  }, [store, resource.subject, selectedVersion]);
-
-  const olderVersionResource = useMemo(() => {
-    if (!olderVersion) return undefined;
-    const res = new Resource(resource.subject);
-    res.setStore(store);
-    res.applyHydratedValues(
-      olderVersion.propvals.entries() as Iterable<[string, AtomicValue]>,
-    );
-
-    return res;
-  }, [store, resource.subject, olderVersion]);
-
+  const olderVersionResource = useMemo(
+    () =>
+      olderVersion
+        ? resourceAtVersion(resource, olderVersion, store)
+        : undefined,
+    [store, resource, olderVersion],
+  );
   const diff = useResourceDiff(olderVersionResource, selectedVersionResource);
 
-  const changesCountText = plural(diff.changedProps.length, [
-    '1 Change',
-    '# Changes',
-  ]);
+  const changesCountText = plural(
+    diff.changedProps.length + (diff.bodyChanged ? 1 : 0),
+    ['1 Change', '# Changes'],
+  );
 
   const tabs = [
     { label: changesCountText, value: 'changes' },
@@ -101,9 +93,12 @@ export function HistoryMobileView({
                         <ResourceDiff diff={diff} />
                       </Tabs.Panel>
                       <Tabs.Panel value='resource'>
-                        <ResourceCardDefault
-                          resource={selectedVersionResource}
-                        />
+                        <>
+                          <ResourceCardDefault
+                            resource={selectedVersionResource}
+                          />
+                          <VersionContent resource={selectedVersionResource} />
+                        </>
                       </Tabs.Panel>
                     </Card.Content>
                   </Tabs>

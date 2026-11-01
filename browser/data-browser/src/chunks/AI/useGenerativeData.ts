@@ -5,6 +5,7 @@ import { useAISettings } from '@components/AI/AISettingsContext';
 import { useGetModel } from './useModel';
 import { simplifyConversation } from './simplifyConversation';
 import { AIProvider } from '@components/AI/aiContstants';
+import { redactProviderError } from './providerModel';
 
 const titleSystemPrompt = `You are a specialized AI system that generates titles for AI conversations.
 You will be given the first part of a conversation between the user and an AI assistant.
@@ -49,8 +50,15 @@ export function parseChatTitle(
 }
 
 export const useGenerativeData = () => {
-  const { defaultChatModel, genFeaturesModel, isProviderAvailable } =
-    useAISettings();
+  const {
+    defaultChatModel,
+    genFeaturesModel,
+    isProviderAvailable,
+    openRouterApiKey,
+    openAIApiKey,
+    anthropicApiKey,
+    openAICompatibleApiKey,
+  } = useAISettings();
 
   const getModel = useGetModel();
   const modelIdentifier = selectGenerativeFeaturesModel(
@@ -103,6 +111,13 @@ ${convoString}
 
         return parseChatTitle(cleanGeneratedTextLine(text));
       },
+      error =>
+        redactProviderError(error, [
+          openRouterApiKey,
+          openAIApiKey,
+          anthropicApiKey,
+          openAICompatibleApiKey,
+        ]),
     );
   };
 
@@ -115,11 +130,12 @@ export async function optionalGeneratedData<T>(
   message: string,
   fallback: T,
   generate: () => Promise<T>,
+  sanitizeError?: (error: unknown) => string,
 ): Promise<T> {
   try {
     return await generate();
   } catch (error) {
-    console.warn(message, error);
+    console.warn(message, sanitizeError ? sanitizeError(error) : error);
 
     return fallback;
   }
@@ -144,6 +160,14 @@ export function selectGenerativeFeaturesModel(
 ): AIModelIdentifier | undefined {
   if (isProviderAvailable(genFeaturesModel.provider)) {
     return genFeaturesModel;
+  }
+
+  if (
+    genFeaturesModel.provider === AIProvider.OpenAI ||
+    genFeaturesModel.provider === AIProvider.Anthropic ||
+    genFeaturesModel.provider === AIProvider.OpenAICompatible
+  ) {
+    return undefined;
   }
 
   if (isProviderAvailable(defaultChatModel.provider)) {

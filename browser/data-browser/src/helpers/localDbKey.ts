@@ -1,4 +1,6 @@
 import { del, get, keys, set, update } from 'idb-keyval';
+import { encodeB64 } from '@tomic/lib';
+import { base64ToBytes, randomBytes } from './bytes';
 
 /**
  * Per-agent encryption keys for the local OPFS ClientDb cache.
@@ -74,26 +76,26 @@ export interface SignInCredentials {
   /** The agent's vault proof (`Agent.vaultProofFromSecret`), base64url. */
   vaultProof: string;
 }
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return btoa(binary);
+interface DbKeyWrite {
+  key: string;
+  value: unknown;
 }
 
-function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
+export interface PreparedDbKeyOnSignIn {
+  sessionKeyKey: string;
+  dbKey: Uint8Array;
+  source: 'wrapped' | 'session' | 'generated';
+  writes: DbKeyWrite[];
+  deletes: string[];
+}
 
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+/** A surviving cache key must not be replaced or given to another credential. */
+export class DbKeyConflictError extends Error {
+  constructor() {
+    super(
+      'The existing local cache key conflicts with this identity or its wrapped records. Retry with the original identity; your stored identity and cache have not been changed.',
+    );
   }
-
-  return bytes;
 }
 
 /**
@@ -111,13 +113,6 @@ function base64urlToBytes(value: string): Uint8Array<ArrayBuffer> {
   }
 
   return base64ToBytes(normalized);
-}
-
-function randomBytes(length: number): Uint8Array<ArrayBuffer> {
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-
-  return bytes;
 }
 
 /**
@@ -187,8 +182,8 @@ export async function wrapDbKey(
 
   return {
     version: WRAP_FORMAT_VERSION,
-    iv: bytesToBase64(iv),
-    wrapped: bytesToBase64(new Uint8Array(wrapped)),
+    iv: encodeB64(iv),
+    wrapped: encodeB64(new Uint8Array(wrapped)),
   };
 }
 
@@ -405,32 +400,77 @@ function wrapDbKeyV2(
  *   survives the next sign-out.
  * - Nothing exists → generate a fresh DbKey and store both records.
  *
- * A record that fails to unwrap (corrupt, or wrapped under a different key) is
- * discarded and the next version down is tried; with none left a fresh key is
- * generated — the cache it protected is unreadable either way. A v2 record is
- * never discarded because the wasm bundle failed to load: that throws and
- * leaves every record in place, so the next sign-in can retry.
+ * An unreadable wrapped record falls back to the next version. If a session
+ * key survives but no wrapper proves this credential owns it, fail without
+ * changing records. Only a cache with no surviving session key can receive a
+ * fresh key after all wrappers fail. A wasm loading failure also leaves every
+ * record in place so the next sign-in can retry.
  */
-export async function ensureDbKeyOnSignIn(
+export async function prepareDbKeyOnSignIn(
   agentSubject: string,
   credentials: SignInCredentials,
   loadWrapOps: () => Promise<DbKeyWrapOps> = loadDefaultWrapOps,
-): Promise<Uint8Array> {
+  signal?: AbortSignal,
+): Promise<PreparedDbKeyOnSignIn> {
+  const assertActive = () => {
+    if (signal?.aborted) {
+      throw new DOMException(
+        'Identity save was cancelled.',
+        /* @wc-ignore */ 'AbortError',
+      );
+    }
+  };
+
   const fingerprint = await agentDbFingerprint(agentSubject);
+  assertActive();
   const proof = decodeVaultProof(credentials.vaultProof);
+  const sessionKeyKey = SESSION_KEY_PREFIX + fingerprint;
   const v2Key = WRAPPED_KEY_V2_PREFIX + fingerprint;
   const v1Key = WRAPPED_KEY_PREFIX + fingerprint;
+  const sessionKey = (await get(sessionKeyKey)) as Uint8Array | undefined;
+  assertActive();
+  const writes: DbKeyWrite[] = [];
+  const deletes: string[] = [];
+
+  const makePlan = (
+    dbKey: Uint8Array,
+    source: PreparedDbKeyOnSignIn['source'],
+    additionalWrites: DbKeyWrite[] = [],
+  ): PreparedDbKeyOnSignIn => {
+    if (
+      source === 'wrapped' &&
+      sessionKey &&
+      (sessionKey.length !== dbKey.length ||
+        sessionKey.some((byte, index) => byte !== dbKey[index]))
+    ) {
+      throw new DbKeyConflictError();
+    }
+
+    return {
+      sessionKeyKey,
+      dbKey,
+      source,
+      writes: [
+        ...(source === 'session' ? [] : [{ key: sessionKeyKey, value: dbKey }]),
+        ...additionalWrites,
+      ],
+      deletes: [...deletes],
+    };
+  };
 
   let ops: DbKeyWrapOps | undefined;
   let opsError: unknown;
 
   try {
     ops = await withTimeout(loadWrapOps(), WRAP_OPS_LOAD_TIMEOUT_MS);
-  } catch (e) {
-    opsError = e;
+  } catch (error) {
+    opsError = error;
   }
 
+  assertActive();
+
   const v2Record = (await get(v2Key)) as WrappedDbKeyRecordV2 | undefined;
+  assertActive();
 
   if (v2Record) {
     if (!ops) {
@@ -440,19 +480,26 @@ export async function ensureDbKeyOnSignIn(
       );
     }
 
-    try {
-      const dbKey = ops.unwrap(v2Record.envelope, proof);
+    let dbKey: Uint8Array | undefined;
 
-      if (dbKey.length !== DB_KEY_BYTES) {
+    try {
+      const unwrapped = ops.unwrap(v2Record.envelope, proof);
+
+      if (unwrapped.length !== DB_KEY_BYTES) {
         throw new Error('Wrapped DbKey envelope held the wrong length');
       }
 
-      await set(SESSION_KEY_PREFIX + fingerprint, dbKey);
+      dbKey = unwrapped;
+    } catch (error) {
+      assertActive();
+      console.warn('Discarding v2 DbKey record that failed to unwrap:', error);
+      deletes.push(v2Key);
+    }
 
-      return dbKey;
-    } catch (e) {
-      console.warn('Discarding v2 DbKey record that failed to unwrap:', e);
-      await del(v2Key);
+    if (dbKey) {
+      assertActive();
+
+      return makePlan(dbKey, 'wrapped');
     }
   }
 
@@ -463,63 +510,128 @@ export async function ensureDbKeyOnSignIn(
     );
   }
 
-  // Only v1 needs it, and it needs WebCrypto: derived on demand.
-  const kek = () => deriveKek(credentials.privateKey, agentSubject);
+  const makeWrappedWrite = async (dbKey: Uint8Array): Promise<DbKeyWrite> => {
+    assertActive();
 
-  /** Store the wrapped copy: v2 when possible, v1 only without wasm. */
-  const persistWrapped = async (dbKey: Uint8Array) => {
     if (ops) {
-      await set(v2Key, wrapDbKeyV2(ops, proof, dbKey));
-    } else {
-      await set(v1Key, await wrapDbKey(await kek(), dbKey));
+      return { key: v2Key, value: wrapDbKeyV2(ops, proof, dbKey) };
     }
+
+    const legacyKey = await deriveKek(credentials.privateKey, agentSubject);
+    assertActive();
+
+    return { key: v1Key, value: await wrapDbKey(legacyKey, dbKey) };
   };
 
   const v1Record = (await get(v1Key)) as WrappedDbKeyRecord | undefined;
+  assertActive();
 
   if (v1Record) {
     let dbKey: Uint8Array | undefined;
 
     try {
-      dbKey = await unwrapDbKey(await kek(), v1Record);
-    } catch (e) {
-      console.warn('Discarding v1 DbKey record that failed to unwrap:', e);
-      await del(v1Key);
+      dbKey = await unwrapDbKey(
+        await deriveKek(credentials.privateKey, agentSubject),
+        v1Record,
+      );
+      assertActive();
+    } catch (error) {
+      assertActive();
+      console.warn('Discarding v1 DbKey record that failed to unwrap:', error);
+      deletes.push(v1Key);
     }
 
     if (dbKey) {
-      // Session first: the cache opens even if the rewrap below fails.
-      await set(SESSION_KEY_PREFIX + fingerprint, dbKey);
+      assertActive();
 
       if (ops) {
         try {
-          await set(v2Key, wrapDbKeyV2(ops, proof, dbKey));
-        } catch (e) {
-          // The v1 record still holds the key; the next sign-in retries.
-          console.warn('Failed to rewrap DbKey as v2:', e);
+          writes.push({ key: v2Key, value: wrapDbKeyV2(ops, proof, dbKey) });
+        } catch (error) {
+          assertActive();
+          console.warn('Failed to rewrap DbKey as v2:', error);
         }
       }
 
-      return dbKey;
-    }
-  } else if (!v2Record) {
-    // Pre-feature upgrade: a session key exists from before wrapped records
-    // did. Wrap it now so this agent's cache survives a sign-out.
-    const sessionKey = (await get(SESSION_KEY_PREFIX + fingerprint)) as
-      | Uint8Array
-      | undefined;
-
-    if (sessionKey) {
-      await persistWrapped(sessionKey);
-
-      return sessionKey;
+      return makePlan(dbKey, 'wrapped', writes);
     }
   }
 
-  const dbKey = await getOrCreateSessionDbKey(agentSubject);
-  await persistWrapped(dbKey);
+  if (sessionKey) {
+    if (v1Record || v2Record) throw new DbKeyConflictError();
+    const wrapped = await makeWrappedWrite(sessionKey);
 
-  return dbKey;
+    return makePlan(sessionKey, 'session', [wrapped]);
+  }
+
+  assertActive();
+  const dbKey = generateDbKey();
+  const wrapped = await makeWrappedWrite(dbKey);
+
+  return makePlan(dbKey, 'generated', [wrapped]);
+}
+
+/** Persist a prepared key for callers that initialize the local DB directly. */
+export async function ensureDbKeyOnSignIn(
+  agentSubject: string,
+  credentials: SignInCredentials,
+  loadWrapOps: () => Promise<DbKeyWrapOps> = loadDefaultWrapOps,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const assertActive = () => {
+    if (signal?.aborted) {
+      throw new DOMException(
+        'Identity save was cancelled.',
+        /* @wc-ignore */ 'AbortError',
+      );
+    }
+  };
+
+  let prepared = await prepareDbKeyOnSignIn(
+    agentSubject,
+    credentials,
+    loadWrapOps,
+    signal,
+  );
+
+  while (prepared.source === 'generated') {
+    assertActive();
+    let sessionKey: Uint8Array | undefined;
+    await update<Uint8Array>(prepared.sessionKeyKey, current => {
+      sessionKey = current ?? prepared.dbKey;
+
+      return sessionKey;
+    });
+    assertActive();
+
+    if (
+      sessionKey?.length === prepared.dbKey.length &&
+      sessionKey.every((byte, index) => byte === prepared.dbKey[index])
+    ) {
+      break;
+    }
+
+    prepared = await prepareDbKeyOnSignIn(
+      agentSubject,
+      credentials,
+      loadWrapOps,
+      signal,
+    );
+  }
+
+  for (const key of prepared.deletes) {
+    assertActive();
+    await del(key);
+    assertActive();
+  }
+
+  for (const write of prepared.writes) {
+    assertActive();
+    await set(write.key, write.value);
+    assertActive();
+  }
+
+  return prepared.dbKey;
 }
 
 /**

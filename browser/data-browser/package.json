@@ -5,6 +5,8 @@
     "name": "Joep Meindertsma"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/openai": "^3.0.0",
     "@ai-sdk/react": "^3.0.193",
     "@bugsnag/core": "^8.9.0",
     "@bugsnag/js": "^8.9.0",
@@ -114,6 +116,7 @@
     "@tanstack/router-devtools": "^1.167.0",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.1",
     "@types/prismjs": "^1.26.6",
     "@types/qrcode": "^1.5.5",
     "@types/react": "^19.2.15",

@@ -170,6 +170,31 @@ Installed browser dependencies and the Cargo target cache are reused. Other
 changes, such as documentation alone, skip these checks.
 
 Local Git hooks can be bypassed; CI remains the shared enforcement gate.
+### Fork package CI
+
+The `farrajota/atomic-server` fork's `Fork package CI` workflow runs for pull
+requests, pushes to fork branches, and manual `workflow_dispatch` runs on the
+selected exact ref. It uses a GitHub-hosted Linux runner with read-only
+repository contents permission; it does not publish packages, deploy sites or
+images, or use upstream self-hosted runners, private SaaS, or publishing
+credentials.
+
+The workflow installs the pinned Rust 1.98.1 toolchain and targets, Node 22,
+pnpm 11.10.0, and the frozen browser lockfile. It builds the browser workspace
+including its production WASM output, then runs Rust formatting, workspace
+check, warning-as-error Clippy, native workspace tests, browser/SDK unit tests,
+the separately configured LocalThought Vitest unit suite
+(`browser/node_modules/.bin/vitest run --config
+integrations/localthought/vitest.config.ts`), and the MCP integration unit
+suite. Rust checks and tests exclude the Tauri desktop crate and use the
+repository CI feature set (`light,wasm-plugins`); Flutter, Playwright end-to-end
+tests, release/image builds, documentation publishing, and deployment are not
+included. The server build consumes the actual browser assets and requires the
+plugin runtime rather than a placeholder.
+
+This CI is package validation on a clean hosted runner, not image or deployment
+qualification. It does not replace the upstream release/deployment workflows.
+Manual runs validate the revision selected in GitHub's dispatch UI.
 
 ### Branching
 

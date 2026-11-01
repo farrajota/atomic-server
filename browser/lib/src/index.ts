@@ -93,6 +93,8 @@ export * from './chat-log.js';
 export * from './forks.js';
 export * from './store.js';
 export * from './property-identity.js';
+export { getOrCreateDriveLocation } from './drive-location.js';
+export { readTrashFolder, type IsTrashedOptions } from './trash.js';
 export * from './lens.js';
 export * from './lens-ensure.js';
 export * from './subject.js';
@@ -350,6 +352,14 @@ export {
 export * from './integration-actions.js';
 
 export { taskSchema } from './task-schema.js';
+export {
+  workSchema,
+  contactSchema,
+  pipelineSchema,
+  moneySchema,
+  sharedVocabularyOntologies,
+  sharedVocabularyProperties,
+} from './shared-vocabularies.js';
 
 export { timeTrackingSchema } from './time-tracking-schema.js';
 

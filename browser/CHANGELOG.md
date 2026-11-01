@@ -3,6 +3,35 @@
 This changelog covers all five packages, as they are (for now) updated as a whole
 
 ## UNRELEASED
+- AI chat setup offers OpenAI, Anthropic and OpenAI-compatible endpoints
+  alongside OpenRouter and Ollama. It uses existing browser-local key and model
+  settings, with an optional compatible API key. Refreshed catalogues keep the
+  new fields labeled in production.
+
+- AI tools with intentionally optional, defaulted, or open-ended arguments no
+  longer advertise incompatible strict function schemas to OpenAI-compatible
+  providers. All tools and their runtime argument validation remain available.
+- Native document history displays and restores the saved body and formatting,
+  including formatting-only changes, with labelled before/after content panels.
+- Table quick filters preserve native focus and row values across repeated
+  inline editing sessions, including rows removed and returned by filtering.
+- Table-generated forms preserve required columns, reject unsupported mappings
+  before creating resources, and remain discoverable on their table's drive.
+- Native history orders saved versions by the causal position of each message
+  bucket's final edit, so a later document-body edit remains the latest version
+  even when it reuses an older bucket or shares a wall-clock timestamp.
+- Provisioned Agents without home-drive metadata can open an existing readable
+  shared Drive after sign-in. Signed-in bare-root navigation resolves an
+  accessible Drive instead of a server-root placeholder; explicit requested
+  destinations retain precedence. Discovery does not create Drives or change
+  their access grants.
+- Device identity persistence now fails actionably instead of leaving sign-in
+  pending indefinitely. Identity and cache-key writes commit together;
+  cancellation prevents late writes, and conflicting usable cache keys are
+  preserved rather than replaced. Failed assisted recovery waits for explicit
+  retry, and obsolete attempts cannot change another account's server or route.
+- `@tomic/lib`: server-authoritative collection discovery can query readable
+  membership before WebSocket authentication or optional local indexes are ready.
 
 - `@tomic/lib`: a connected server-backed save keeps waiting for its server
   acknowledgement when an optional local database first attaches during queue
@@ -54,6 +83,13 @@ This changelog covers all five packages, as they are (for now) updated as a whol
 - Opening a resource keeps the current page's query parameters (view, filter, drive) unless the link overrides them.
 - Tables: pressing Enter in a tag cell while no option matches no longer clears the cell. Tag options update as their tag resources load.
 - `@tomic/react`: local file previews (`useFileObjectUrl`) only keep allowlisted media types (raster images, video, audio, PDF); other bytes become `application/octet-stream`, SVG a `data:` URL, so an uploaded HTML or SVG file never opens as a page of the app.
+
+- Login attempts keep ownership across refresh-free identity changes, so obsolete attempts cannot change another account's server or route. Invalid required-form submissions now stop at preflight without creating a partial resource graph. Opening an existing table loads and queries its rows from the table's projected/stamped owning drive even when another navigation workspace remains active; drive changes and remounts rebuild the right collection without switching the active workspace.
+- Native selected-cell filtering kept a complete native search in the filter in local production, but the separate inline-editor-to-filter transition returned focus to the editor, appended the typed search to the cell, and persisted that edit on a later signed read; native full-word filter acceptance therefore remains open. Native history renders and diffs real marked text; both Resource factories initialize default text style on new and cloned Loro text without overriding explicit consumer styles. A real restore retains prior native history, and later body edits persist through save. Deployed new-image qualification, history-label identification, and whole-application/rollout acceptance remain open.
+- Table templates trimmed: Grocery list opens on its List view (no By aisle board, and the Aisle column and per-aisle breakdown are gone), Plant care loses By room, Bookmarks loses By kind and the To read kind, Issue Tracker no longer ships an Issues tab (add it from Add view), Workout log drops Run and Cycle, Time tracker drops the Person column. The Team workspace keeps only Project tasks, and Personal gains a Notes document.
+- Table templates (#2243): the Time tracker, Expenses, Deals, Job applications and Guest list templates bind their generic columns (start/end/project/person/billable, amount, stage, company, email) to shared, embedded `work/v1`, `money/v1`, `pipeline/v1` and `contact/v1` vocabularies, so the same template yields the same property IDs on every drive. Row classes stay in the drive's ontology. Existing tables are not migrated. New exports: `workSchema`, `moneySchema`, `pipelineSchema`, `contactSchema`; `timeTrackingSchema` is deprecated. The Deals value column is now called Amount.
+- Sync: the outbox honours the server's write-load signal. A resource is sent at most once per `max(debounce, pace_ms)` (from `COMMIT_OK`, or `X-Atomic-Pace-Ms` over HTTP), so edits made meanwhile ride in one merged commit. A `BUSY` refusal (and HTTP 429 or 503 with `Retry-After`) makes the entry wait the told delay: it counts as no failure, is never retried over HTTP, and no edit is dropped. `ErrorCode.BUSY (12)`, `retryAfterMsFromMessage`, `LocalOutbox.setServerPace`.
+- AI settings support direct OpenAI and Anthropic API keys with editable model IDs (defaulting to `gpt-4.1-mini` and `claude-sonnet-4-5`) and an OpenAI-compatible Chat Completions endpoint with an explicit browser-reachable HTTP(S) base URL, required exact model ID (initially unset), and optional API key; for example, `https://cliproxyapi.zay.home/v1`. These credentials and endpoint settings are stored in browser-local settings without encryption. Direct requests and compatible endpoints require CORS access from the app origin; Anthropic also requires its explicit browser-client header to be allowed. Consumer/API subscriptions do not automatically provide API keys, and proxy subscription authentication remains external to Atomic. Voice/transcription remains OpenRouter-specific.
 
 ## [v0.41.0-beta.8] - 2026-10-10
 

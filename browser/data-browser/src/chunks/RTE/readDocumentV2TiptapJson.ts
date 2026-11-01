@@ -1,5 +1,6 @@
 import { dataBrowser, type Resource, type Store } from '@tomic/react';
 import type { JSONContent } from '@tiptap/core';
+import type { Schema } from '@tiptap/pm/model';
 import {
   createNodeFromLoroObj,
   type LoroNode,
@@ -19,6 +20,7 @@ export const hasDocumentContent = (resource: Resource): boolean =>
 export function readDocumentV2TiptapJson(
   resource: Resource,
   store: Store,
+  schemaOverride?: Schema,
 ): DocumentV2TiptapJsonResult {
   if (!hasDocumentContent(resource)) {
     return { ok: false, error: 'Resource has no editable document content' };
@@ -39,7 +41,7 @@ export function readDocumentV2TiptapJson(
     };
   }
 
-  const { schema } = getCollaborativeEditorSchema(store);
+  const schema = schemaOverride ?? getCollaborativeEditorSchema(store).schema;
   const mapping: LoroNodeMapping = new Map();
 
   try {

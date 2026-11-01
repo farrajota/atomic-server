@@ -2,18 +2,22 @@
 // @wc-ignore-file
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { StrictMode } from 'react';
+import { StrictMode, useCallback, useMemo, useState } from 'react';
+import userEvent from '@testing-library/user-event';
 import { beforeAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   act,
   cleanup,
+  configure,
   fireEvent,
+  getConfig,
   render,
   screen,
   waitFor,
 } from '@testing-library/react';
 import { ThemeProvider } from 'styled-components';
 import {
+  core,
   Datatype,
   type JSONValue,
   LoroLoader,
@@ -24,7 +28,10 @@ import {
 } from '@tomic/react';
 import { FancyTable } from '@chunks/TableEditor';
 import { buildTheme } from '../../styling';
+import { QuickFilterField } from './QuickFilterField';
+import { TableRow } from './TableRow';
 import { TableCell } from './TableCell';
+import { subjectListCollection, useQuickFilter } from './useQuickFilter';
 
 vi.mock('@chunks/TableEditor/DndWrapper', () => ({
   DndWrapper: ({ children }: { children: React.ReactNode }) => children,
@@ -52,6 +59,86 @@ const dayProperty: Property = {
   shortname: 'day',
   description: '',
 };
+
+const SEARCH_TITLE = '_new:search-title';
+const SEARCH_DESCRIPTION = '_new:search-description';
+const SEARCH_ROW = 'https://example.com/rows/search-regression';
+const SAVED_DESCRIPTION = 'saved description';
+
+const titleProperty: Property = {
+  subject: SEARCH_TITLE,
+  datatype: Datatype.STRING,
+  shortname: 'title',
+  description: '',
+};
+
+const descriptionProperty: Property = {
+  subject: SEARCH_DESCRIPTION,
+  datatype: Datatype.STRING,
+  shortname: 'description',
+  description: '',
+};
+
+const searchColumns = [
+  { property: titleProperty },
+  { property: descriptionProperty },
+];
+
+const searchTableColumns = searchColumns.map(({ property }) => ({
+  key: property.subject,
+  property,
+}));
+
+function QuickFilterTableHarness({ rowSubject }: { rowSubject: string }) {
+  const [query, setQuery] = useState('');
+  const [allRows] = useState(() => [rowSubject]);
+  const collection = useMemo(() => subjectListCollection(allRows), [allRows]);
+  const quickFilter = useQuickFilter(collection, searchColumns, query);
+  const itemCount = quickFilter.active
+    ? quickFilter.matches.length
+    : allRows.length;
+  const quickFilterQuery = query.trim();
+  const renderRow = useCallback(
+    ({ index }: { index: number }) => (
+      <TableRow
+        collection={quickFilter.collection}
+        index={index}
+        columns={searchTableColumns}
+        subject={quickFilter.active ? quickFilter.matches[index] : undefined}
+      />
+    ),
+    [quickFilter.active, quickFilter.collection, quickFilter.matches],
+  );
+  const itemKey = useCallback(
+    (index: number) =>
+      quickFilter.active
+        ? `match-${quickFilter.matches[index] ?? index}`
+        : `member-${index}`,
+    [quickFilter.active, quickFilter.matches],
+  );
+
+  return (
+    <>
+      <QuickFilterField value={query} onChange={setQuery} />
+      {quickFilter.active &&
+        !quickFilter.loading &&
+        quickFilter.matches.length === 0 && (
+          <p role='status'>{`No rows show “${quickFilterQuery}”.`}</p>
+        )}
+      <FancyTable
+        columns={searchTableColumns}
+        itemCount={itemCount}
+        itemKey={itemKey}
+        columnToKey={column => column.key}
+        labelledBy='table-title'
+        HeadingComponent={() => <></>}
+        NewColumnButtonComponent={() => null}
+      >
+        {renderRow}
+      </FancyTable>
+    </>
+  );
+}
 
 beforeAll(async () => {
   // The app's vite config sends every `loro-crdt` import to the `web` build,
@@ -137,6 +224,56 @@ function editedCell(): HTMLElement {
   return cell as HTMLElement;
 }
 
+async function renderSearchableTable() {
+  const store = new Store({ serverUrl: 'https://example.com', connect: false });
+
+  for (const [property, label] of [
+    [titleProperty, 'Title'],
+    [descriptionProperty, 'Description'],
+  ] as const) {
+    const propertyResource = await store.newResource({
+      subject: property.subject,
+      noParent: true,
+    });
+    await propertyResource.set(core.properties.name, label, false);
+  }
+
+  const row = await store.newResource({ subject: SEARCH_ROW, noParent: true });
+  await row.set(SEARCH_TITLE, 'needle', false);
+  await row.set(SEARCH_DESCRIPTION, SAVED_DESCRIPTION, false);
+  const save = vi
+    .spyOn(row, 'save')
+    .mockImplementation(async () => undefined as never);
+
+  render(
+    <StrictMode>
+      <StoreContext value={store}>
+        <ThemeProvider theme={buildTheme(false, '#1b50d8')}>
+          <QuickFilterTableHarness rowSubject={row.subject} />
+        </ThemeProvider>
+      </StoreContext>
+    </StrictMode>,
+  );
+
+  await waitFor(() =>
+    expect(searchDescriptionCell().textContent).toContain(SAVED_DESCRIPTION),
+  );
+
+  return { row, save };
+}
+
+function searchDescriptionCell(): HTMLElement {
+  const cell = document.querySelector(
+    '[aria-rowindex="2"] > [aria-colindex="3"]',
+  );
+
+  if (!cell) {
+    throw new Error('No Description cell rendered');
+  }
+
+  return cell as HTMLElement;
+}
+
 /** Select the cell (not editing yet) and type one character on it. */
 async function typeOnSelectedCell(key: string) {
   fireEvent.mouseDown(editedCell());
@@ -153,6 +290,182 @@ async function typeOnSelectedCell(key: string) {
 async function settle() {
   await act(() => new Promise(resolve => setTimeout(resolve, 300)));
 }
+
+describe('quick-filter keyboard focus', () => {
+  it('keeps native outside focus and both row values after deferred Name editor exit', async () => {
+    const user = userEvent.setup();
+    const { row, save } = await renderSearchableTable();
+    const search = screen.getByRole('textbox', {
+      name: 'Find rows containing text',
+    }) as HTMLInputElement;
+
+    const clickSearch = async () => {
+      // Let this act scope own the complete user click. RTL's normal asyncWrapper
+      // clears the act environment, which would overlap this outer act.
+      const originalAsyncWrapper = getConfig().asyncWrapper;
+      configure({ asyncWrapper: callback => callback() });
+
+      try {
+        await act(async () => {
+          await user.click(search);
+          expect(document.activeElement).toBe(search);
+        });
+      } finally {
+        configure({ asyncWrapper: originalAsyncWrapper });
+      }
+    };
+
+    await user.click(editedCell());
+    await user.keyboard('{Enter}');
+    const editingCell = editedCell();
+    const editor = editingCell.querySelector('input');
+    expect(editor).not.toBeNull();
+    expect(document.activeElement).toBe(editor);
+
+    await clickSearch();
+    expect(editedCell().querySelector('input')).toBeNull();
+    await user.keyboard('description');
+    await settle();
+
+    expect({
+      query: search.value,
+      focused: document.activeElement === search,
+      name: row.get(SEARCH_TITLE),
+      description: row.get(SEARCH_DESCRIPTION),
+      saves: save.mock.calls.length,
+    }).toEqual({
+      query: 'description',
+      focused: true,
+      name: 'needle',
+      description: SAVED_DESCRIPTION,
+      saves: 0,
+    });
+    expect(editedCell().querySelector('input')).toBeNull();
+    await waitFor(() => expect(editedCell()).not.toBe(editingCell));
+
+    const filteredCell = editedCell();
+    await user.click(screen.getByTitle('Clear'));
+    await waitFor(() => expect(search.value).toBe(''));
+    await waitFor(() => expect(editedCell()).not.toBe(filteredCell));
+    expect(document.activeElement).toBe(search);
+    expect(row.get(SEARCH_TITLE)).toBe('needle');
+    expect(row.get(SEARCH_DESCRIPTION)).toBe(SAVED_DESCRIPTION);
+    expect(save).not.toHaveBeenCalled();
+
+    await user.keyboard('no-match');
+    await waitFor(() =>
+      expect(screen.getByRole('status').textContent).toBe(
+        'No rows show “no-match”.',
+      ),
+    );
+    expect(screen.getByRole('grid').getAttribute('aria-rowcount')).toBe('0');
+    expect(document.querySelector('[aria-rowindex="2"]')).toBeNull();
+
+    await user.click(screen.getByTitle('Clear'));
+    await waitFor(() => expect(search.value).toBe(''));
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    await waitFor(() =>
+      expect(searchDescriptionCell().textContent).toContain(SAVED_DESCRIPTION),
+    );
+    expect(document.activeElement).toBe(search);
+    expect(row.get(SEARCH_TITLE)).toBe('needle');
+    expect(row.get(SEARCH_DESCRIPTION)).toBe(SAVED_DESCRIPTION);
+    expect(save).not.toHaveBeenCalled();
+
+    await user.click(editedCell());
+    const repeatedEditingCell = editedCell();
+    const repeatedEditor = repeatedEditingCell.querySelector('input');
+    expect(repeatedEditor).not.toBeNull();
+    expect(document.activeElement).toBe(repeatedEditor);
+
+    await clickSearch();
+    expect(editedCell().querySelector('input')).toBeNull();
+    await user.keyboard('description');
+    await settle();
+
+    expect({
+      query: search.value,
+      focused: document.activeElement === search,
+      name: row.get(SEARCH_TITLE),
+      description: row.get(SEARCH_DESCRIPTION),
+      saves: save.mock.calls.length,
+    }).toEqual({
+      query: 'description',
+      focused: true,
+      name: 'needle',
+      description: SAVED_DESCRIPTION,
+      saves: 0,
+    });
+    expect(editedCell().querySelector('input')).toBeNull();
+    await waitFor(() => expect(editedCell()).not.toBe(repeatedEditingCell));
+
+    const repeatedFilteredCell = editedCell();
+    await user.click(screen.getByTitle('Clear'));
+    await waitFor(() => expect(search.value).toBe(''));
+    await waitFor(() => expect(editedCell()).not.toBe(repeatedFilteredCell));
+    expect(document.activeElement).toBe(search);
+    expect(row.get(SEARCH_TITLE)).toBe('needle');
+    expect(row.get(SEARCH_DESCRIPTION)).toBe(SAVED_DESCRIPTION);
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('keeps the full query and Description intact through a real filter row remount', async () => {
+    const user = userEvent.setup();
+    const { row, save } = await renderSearchableTable();
+    const search = screen.getByRole('textbox', {
+      name: 'Find rows containing text',
+    }) as HTMLInputElement;
+
+    await user.click(searchDescriptionCell());
+    await user.keyboard('{Enter}');
+    expect(searchDescriptionCell().querySelector('input')).not.toBeNull();
+
+    const selectedCell = searchDescriptionCell();
+    await user.click(search);
+    expect(document.activeElement).toBe(search);
+    expect(searchDescriptionCell().querySelector('input')).toBeNull();
+
+    await user.keyboard('n');
+    await waitFor(() => expect(search.value).toBe('n'));
+    await waitFor(() => expect(searchDescriptionCell()).not.toBe(selectedCell));
+
+    await user.keyboard('eedle');
+    await settle();
+
+    expect({
+      query: search.value,
+      focused: document.activeElement === search,
+      description: row.get(SEARCH_DESCRIPTION),
+      saves: save.mock.calls.length,
+    }).toEqual({
+      query: 'needle',
+      focused: true,
+      description: SAVED_DESCRIPTION,
+      saves: 0,
+    });
+
+    const filteredCell = searchDescriptionCell();
+    await user.click(screen.getByTitle('Clear'));
+    await waitFor(() => expect(search.value).toBe(''));
+    await waitFor(() => expect(searchDescriptionCell()).not.toBe(filteredCell));
+    expect(document.activeElement).toBe(search);
+
+    await user.keyboard('needle');
+    await settle();
+
+    expect({
+      query: search.value,
+      focused: document.activeElement === search,
+      description: row.get(SEARCH_DESCRIPTION),
+      saves: save.mock.calls.length,
+    }).toEqual({
+      query: 'needle',
+      focused: true,
+      description: SAVED_DESCRIPTION,
+      saves: 0,
+    });
+  });
+});
 
 describe('typing on a selected date cell (#1822)', () => {
   it('opens the editor with the character and keeps the stored date', async () => {

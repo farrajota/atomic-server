@@ -427,6 +427,39 @@ floor has a lot to reclaim.
 
 Neither applies to the browser (OPFS) store or to a legacy sled store.
 
+
+## Native recovery
+
+Native recovery exports an explicit, revision-fenced selection with its original snapshots and retained signed history, then restores it into a separate offline database. It does not replace the JSON-AD `export` / `import` commands or ordinary sync.
+
+Before exporting, configure the source server with `--envelope-retention all`; the default `latest` policy does not retain enough history for native recovery. Send an authenticated signed-agent `POST /recovery/export` request with an explicit selection, for example:
+
+```json
+{
+  "version": 1,
+  "resources": [
+    { "subject": "did:ad:drive:…", "expected_last_commit": "did:ad:commit:…" },
+    { "subject": "did:ad:resource:…", "expected_last_commit": "did:ad:commit:…" }
+  ],
+  "allowed_drives": ["did:ad:drive:…"]
+}
+```
+
+The version-1 request is limited to 128 KiB and 256 selected resources. Every allowed Drive must itself be selected. Include required schema, property, class, signer, and parent/Drive support resources explicitly; recovery never fetches missing dependencies. The endpoint returns an authenticated version-2 native bundle (maximum 16 MiB), not a JSON-AD import file. Selected File/blob payloads and incomplete history are refused. A resource's `expected_last_commit` must match the current revision.
+
+Each version-2 bundle carries an Ed25519 source proof over its format and scope metadata, payload and snapshot hashes, exact retained-envelope inventory, original client/server attribution spans, and derived `lastCommit` revisions. The proof is signed by the source node's default Agent and verified against `--trusted-source-agent`, that Agent's native DID containing its public key, obtained independently of the bundle. Obtain the DID from a separately authenticated source-node/operator channel; never accept the bundle's declared signer as its own trust anchor.
+
+The source proof attests what that source reports about its selected inventory, original attribution, and revision. It does not independently prove that the source was honest or included every relevant resource or historical change: trust in the pinned source's completeness is a dependency. Separately, every native commit envelope is checked using its own author signature and the recovery path verifies its original signed operations, causal materialization, and attributed coverage. The source proof never replaces native-author verification.
+
+Version-1 unsigned bundles are intentionally incompatible with version 2 and are rejected without fallback; the export request remains version 1. This optional selective-recovery feature is not required for ordinary Atomic operations or whole-installation backups.
+
+Restore only into a new disposable directory, using the server executable without starting the configured server store:
+
+```sh
+atomic-server recovery restore --bundle ./recovery.bundle --target-dir ./recovered-data --trusted-source-agent "$TRUSTED_SOURCE_AGENT"
+```
+
+The bundle is validated before the target is created. The target must not already exist or be a symlink and must be outside configured data, config, and cache paths and existing active database directories. The command initializes a separate Redb store, preserves the original snapshots and signed envelopes without re-signing, then verifies the restored history before reporting success. A failure after target creation leaves that isolated directory in place for inspection; it never reports a partial restore as successful.
 ## AtomicServer CLI options / ENV vars
 
 (run `atomic-server --help` to see the latest options)
@@ -505,6 +538,18 @@ Options:
 
           [env: ATOMIC_ANONYMOUS_WRITE_RATE_LIMIT=]
           [default: 60]
+
+      --commit-soft-limit <COMMIT_SOFT_LIMIT>
+          How many commits may be in flight (being applied or queued for the single redb writer) before the node starts telling clients to commit less often. Up to this many the `pace_ms` hint is 0. Clients that advertise `commit-pace` (WebSocket) or read `X-Atomic-Pace-Ms` (HTTP) then stretch their commit interval, so each commit carries more edits. The hint rises linearly to 10 s at `--commit-hard-limit`. See `docs/src/websockets.md`
+
+          [env: ATOMIC_COMMIT_SOFT_LIMIT=]
+          [default: 32]
+
+      --commit-hard-limit <COMMIT_HARD_LIMIT>
+          How many commits may be in flight before new ones are refused up front with `BUSY` (WebSocket error code 12) or `503` with `Retry-After` (HTTP). Nothing is lost: the client keeps the edit and retries after the jittered delay. `0` disables both the pace hint and the refusal
+
+          [env: ATOMIC_COMMIT_HARD_LIMIT=]
+          [default: 256]
 
       --domain <DOMAIN>
           The origin domain where the app is hosted, without the port and schema values

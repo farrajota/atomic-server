@@ -25,9 +25,11 @@ mod metrics;
 mod node_key;
 pub mod plugins;
 mod rate_limit;
+mod recovery_cli;
 mod routes;
 pub mod serve;
 pub mod vector_search;
+mod write_load;
 // #[cfg(feature = "search")]
 #[cfg(test)]
 mod tests;
@@ -35,7 +37,11 @@ mod trace;
 
 #[actix_web::main]
 async fn main() -> () {
-    if let Err(e) = main_wrapped().await {
+    let result = match recovery_cli::run_if_requested().await {
+        Some(result) => result,
+        None => main_wrapped().await,
+    };
+    if let Err(e) = result {
         use colored::Colorize;
         eprintln!("{}: {}", "Error".red(), e.message);
         std::process::exit(1);
@@ -140,6 +146,52 @@ async fn main_wrapped() -> errors::AtomicServerResult<()> {
             );
             Ok(())
         }
+        Some(config::Command::GcBlobs(gc)) => {
+            let grace = blob_storage::parse_duration(&config.opts.blob_gc_grace)
+                .map_err(|e| format!("ATOMIC_BLOB_GC_GRACE: {e}"))?;
+            let appstate = appstate::AppState::init(config.clone()).await?;
+            let report = blob_storage::run_gc(
+                &appstate.store,
+                grace,
+                gc.dry_run,
+                config.opts.blob_gc_s3_exclusive,
+            )
+            .await?;
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            println!(
+                "{} blobs ({:.1} MiB) in storage; {} referenced, {} younger than the grace period ({}s), {} without a recorded age.",
+                report.scanned,
+                mib(report.scanned_bytes),
+                report.referenced,
+                report.in_grace,
+                grace.as_secs(),
+                report.unstamped,
+            );
+            if gc.dry_run {
+                for blob in &report.candidates {
+                    println!("{}  {} bytes", hex::encode(&blob.key), blob.size);
+                }
+                println!(
+                    "Dry run: {} unreferenced blobs ({:.1} MiB) would be deleted. Nothing was changed.",
+                    report.candidates.len(),
+                    mib(report.candidate_bytes),
+                );
+            } else {
+                println!(
+                    "Deleted {} unreferenced blobs, freeing {:.1} MiB. {} failed.",
+                    report.deleted,
+                    mib(report.deleted_bytes),
+                    report.failed,
+                );
+                if report.unstamped > 0 {
+                    println!(
+                        "{} older blobs had no recorded age; their grace period starts now.",
+                        report.unstamped
+                    );
+                }
+            }
+            Ok(())
+        }
         Some(config::Command::Reset) => {
             if dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt(
@@ -204,6 +256,9 @@ async fn main_wrapped() -> errors::AtomicServerResult<()> {
 
             println!("Successfully created {}", pathstr);
             Ok(())
+        }
+        Some(config::Command::Recovery(_)) => {
+            Err("Recovery must be dispatched before server initialization".into())
         }
         None => serve::serve(config).await,
     }

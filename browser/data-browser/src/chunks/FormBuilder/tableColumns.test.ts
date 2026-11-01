@@ -1,10 +1,19 @@
-import { describe, it, expect } from 'vitest';
-import { core, dataBrowser, Datatype, Resource, Store } from '@tomic/react';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import {
+  core,
+  dataBrowser,
+  Datatype,
+  Resource,
+  Store,
+  CollectionBuilder,
+} from '@tomic/react';
+import { formTestFixture } from './formTestFixture';
 import {
   compatibleFieldTypes,
   classColumns,
   columnLabel,
   createMappedField,
+  preflightMappedFields,
 } from './tableColumns';
 
 function property(datatype: string, extra: Record<string, unknown> = {}) {
@@ -166,4 +175,35 @@ it('creates only a FormField when mapping a required existing column', async () 
     created?.propVals?.['https://atomicdata.dev/properties/required'],
   ).toBe(true);
   expect(created?.propVals?.[core.properties.name]).toBe('Age');
+});
+
+afterEach(() => vi.restoreAllMocks());
+
+it('rejects a relation mapping with no target table during preflight', async () => {
+  const fixture = formTestFixture();
+  const relation = fixture.make(
+    {
+      [core.properties.name]: 'Tags',
+      [core.properties.datatype]: Datatype.RESOURCEARRAY,
+      [core.properties.classtype]: 'https://example.com/classes/Tag',
+    },
+    'https://example.com/properties/tags',
+  );
+  const dataClass = fixture.make(
+    { [core.properties.requires]: [relation.subject] },
+    'https://example.com/classes/Article',
+  );
+  Object.assign(fixture.store, {
+    getDrive: () => undefined,
+    getServerUrl: () => 'https://example.com',
+    resources: { get: (subject: string) => fixture.resources.get(subject) },
+  });
+  vi.spyOn(CollectionBuilder.prototype, 'buildAndFetch').mockResolvedValue({
+    [Symbol.asyncIterator]: async function* () {},
+  } as never);
+
+  await expect(
+    preflightMappedFields(fixture.store, dataClass, [relation]),
+  ).rejects.toThrow('No table found for this relation column');
+  expect(fixture.store.newResource).not.toHaveBeenCalled();
 });

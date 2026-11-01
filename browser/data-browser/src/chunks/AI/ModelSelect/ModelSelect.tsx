@@ -7,6 +7,7 @@ import { OpenRouterModelSelector } from './OpenRouterModelSelector';
 import { OllamaModelSelector } from './OllamaModelSelector';
 import { Link } from '@tanstack/react-router';
 import { useAISettings } from '@components/AI/AISettingsContext';
+import { InputStyled } from '@components/forms/InputStyles';
 import { Button } from '@components/Button';
 
 interface ModelSelectProps {
@@ -16,34 +17,96 @@ interface ModelSelectProps {
 }
 
 const PROVIDERS = [
-  {
-    label: 'OpenRouter',
-    value: AIProvider.OpenRouter,
-  },
-  {
-    label: 'Ollama',
-    value: AIProvider.Ollama,
-  },
+  { label: 'OpenRouter', value: AIProvider.OpenRouter },
+  { label: 'Ollama', value: AIProvider.Ollama },
+  { label: 'OpenAI', value: AIProvider.OpenAI },
+  { label: 'Anthropic', value: AIProvider.Anthropic },
+  { label: 'OpenAI-compatible', value: AIProvider.OpenAICompatible },
 ];
+
+const getModelId = (
+  provider: AIProvider,
+  defaultModel: AIModelIdentifier,
+  openAIModelId: string,
+  anthropicModelId: string,
+  openAICompatibleModelId: string,
+) => {
+  const configuredModelId =
+    provider === AIProvider.OpenAI
+      ? openAIModelId
+      : provider === AIProvider.Anthropic
+        ? anthropicModelId
+        : provider === AIProvider.OpenAICompatible
+          ? openAICompatibleModelId
+          : '';
+
+  return defaultModel.provider === provider
+    ? defaultModel.id
+    : configuredModelId;
+};
 
 export const ModelSelect = ({
   onSelect,
   defaultModel,
   enforceToolSupport = false,
 }: ModelSelectProps) => {
-  const { openRouterApiKey, ollamaUrl, hostedAI } = useAISettings();
+  const {
+    openRouterApiKey,
+    ollamaUrl,
+    hostedAI,
+    openAIModelId,
+    anthropicModelId,
+    openAICompatibleModelId,
+    isProviderAvailable,
+  } = useAISettings();
 
   const [provider, setProvider] = useState(defaultModel.provider);
-  const providers = hostedAI?.enabled
-    ? [{ label: 'Included AI', value: AIProvider.Hosted }, ...PROVIDERS]
-    : PROVIDERS;
+  const providers = [
+    ...(hostedAI?.enabled
+      ? [{ label: 'Included AI', value: AIProvider.Hosted }]
+      : []),
+    ...PROVIDERS.filter(
+      option =>
+        option.value === AIProvider.OpenRouter ||
+        option.value === AIProvider.Ollama ||
+        isProviderAvailable(option.value) ||
+        option.value === defaultModel.provider,
+    ),
+  ];
+  const modelId = getModelId(
+    provider,
+    defaultModel,
+    openAIModelId,
+    anthropicModelId,
+    openAICompatibleModelId,
+  );
 
   return (
     <Column gap='0.75rem'>
       <BasicSelect
         aria-label='Provider'
         value={provider}
-        onChange={event => setProvider(event.target.value as AIProvider)}
+        onChange={event => {
+          const selectedProvider = event.target.value as AIProvider;
+          setProvider(selectedProvider);
+
+          if (
+            selectedProvider === AIProvider.OpenAI ||
+            selectedProvider === AIProvider.Anthropic ||
+            selectedProvider === AIProvider.OpenAICompatible
+          ) {
+            onSelect?.({
+              id: getModelId(
+                selectedProvider,
+                defaultModel,
+                openAIModelId,
+                anthropicModelId,
+                openAICompatibleModelId,
+              ),
+              provider: selectedProvider,
+            });
+          }
+        }}
       >
         {providers.map(option => (
           <option key={option.value} value={option.value}>
@@ -74,7 +137,11 @@ export const ModelSelect = ({
               onSelect={model => {
                 onSelect?.(model);
               }}
-              defaultModel={defaultModel.id}
+              defaultModel={
+                defaultModel.provider === AIProvider.OpenRouter
+                  ? defaultModel.id
+                  : ''
+              }
             />
           ) : (
             <Column>
@@ -93,7 +160,11 @@ export const ModelSelect = ({
               onSelect={model => {
                 onSelect?.(model);
               }}
-              selectedModel={defaultModel}
+              selectedModel={
+                defaultModel.provider === AIProvider.Ollama
+                  ? defaultModel
+                  : { provider: AIProvider.Ollama, id: '' }
+              }
             />
           ) : (
             <Column>
@@ -104,6 +175,25 @@ export const ModelSelect = ({
             </Column>
           )}
         </>
+      )}
+      {(provider === AIProvider.OpenAI ||
+        provider === AIProvider.Anthropic ||
+        provider === AIProvider.OpenAICompatible) && (
+        <Column gap='0.5rem'>
+          {!isProviderAvailable(provider) && (
+            <span>
+              {provider === AIProvider.OpenAICompatible
+                ? 'Configure a valid HTTP(S) endpoint and model ID in AI Settings. An API key is optional.'
+                : 'Configure this provider API key and model ID in AI Settings.'}
+            </span>
+          )}
+          <label htmlFor='configured-provider-model'>Model ID</label>
+          <InputStyled
+            id='configured-provider-model'
+            value={modelId}
+            onChange={event => onSelect?.({ id: event.target.value, provider })}
+          />
+        </Column>
       )}
     </Column>
   );

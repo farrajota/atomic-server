@@ -22,7 +22,7 @@ import { isDev } from '../config';
 import { getLocalServerOrigin, isRunningInTauri } from '../helpers/tauri';
 import { fetchPrivateDriveSubject } from '../helpers/privateDrive';
 import { constructOpenURL } from '../helpers/navigation';
-import { deviceHasDriveData } from '../helpers/driveData';
+import { deviceHasDriveData, findAccessibleDrives } from '../helpers/driveData';
 import { fetchManagedInfo } from '../helpers/managedServer';
 import { withDeadline } from '../helpers/withDeadline';
 import { getHomeDrive } from '../helpers/homeDrive';
@@ -98,6 +98,19 @@ export function RequireAgent({
   return signedIn ? <>{children}</> : null;
 }
 
+/** Render the children after the first screen has had its time. */
+const AfterFirstPaint: React.FC<React.PropsWithChildren> = ({ children }) => {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    const id = setTimeout(() => setReady(true), 1500);
+
+    return () => clearTimeout(id);
+  }, []);
+
+  return ready ? children : null;
+};
+
 export const rootRoute = createRootRoute({
   component: () => (
     <Providers>
@@ -115,18 +128,38 @@ export const rootRoute = createRootRoute({
         {/* Keeps the device-lock heartbeat alive and enforces idle policies
             while the app is open (no-op unless a policy is set). */}
         <DeviceLockWatcher />
-        {/* Enrols the personal drive in Cloud Vault and backs it up after
-            edits (no-op without an account session). */}
-        <CloudVaultWatcher />
-        <BrowserPeerWatcher />
-        {/* Lets others start an encrypted conversation with this agent. */}
-        <EncryptionKeyPublisher />
+        {/* These three have nothing to do for the first screen; mounting them
+            after the first paint keeps their work out of it. */}
+        <AfterFirstPaint>
+          {/* Enrols the personal drive in Cloud Vault and backs it up after
+              edits (no-op without an account session). */}
+          <CloudVaultWatcher />
+          <BrowserPeerWatcher />
+          {/* Lets others start an encrypted conversation with this agent. */}
+          <EncryptionKeyPublisher />
+        </AfterFirstPaint>
       </PairingFlowProvider>
       {/* Uncomment to get Tanstack Router Devtools */}
       {/* <TanStackRouterDevtools position='bottom-right' /> */}
     </Providers>
   ),
 });
+
+function isServerRootSubject(subject: string, baseURL: string): boolean {
+  try {
+    const target = new URL(subject);
+    const serverOrigin = new URL(baseURL).origin;
+
+    return (
+      target.origin === serverOrigin &&
+      target.pathname === '/' &&
+      !target.search &&
+      !target.hash
+    );
+  } catch {
+    return false;
+  }
+}
 
 const TopRouteComponent: React.FC = () => {
   const { pathname } = useLocation();
@@ -137,9 +170,10 @@ const TopRouteComponent: React.FC = () => {
   // When the URL is the bare root, we shouldn't assume the server root IS a
   // drive — often it isn't, or the user isn't authorized to see it. Prefer:
   //   0. server declares a home drive → open it, for everyone
-  //   1. signed-in agent with a personal drive → open that drive
-  //   2. no agent → go to the welcome / sign-in flow
-  //   3. otherwise → fall through to whatever lives at `/`
+  //   1. signed-in Agent's readable last-used or private drive
+  //   2. one of the existing Drives readable by that Agent
+  //   3. no agent → go to the welcome / sign-in flow
+  //   4. otherwise → fall through to whatever lives at `/`
   //
   // Step 0 is deliberately first and deliberately ignores the Agent: the
   // operator has said "this Drive is my front page", and a front page is the
@@ -200,15 +234,6 @@ const TopRouteComponent: React.FC = () => {
       return;
     }
 
-    // Fast path: user's last-used drive (persisted by AppSettings). Skip it
-    // when it's still the initial default that equals the server root, since
-    // that's the subject we're specifically trying to avoid landing on.
-    if (drive && drive !== baseURL) {
-      navigate({ to: constructOpenURL(drive), replace: true });
-
-      return;
-    }
-
     let cancelled = false;
 
     void (async () => {
@@ -225,14 +250,50 @@ const TopRouteComponent: React.FC = () => {
 
       if (cancelled) return;
 
-      if (resolved && resolved !== baseURL) {
-        if (acceptsNewDrives || (await deviceHasDriveData(store, resolved))) {
-          if (!cancelled) {
-            navigate({ to: constructOpenURL(resolved), replace: true });
-          }
-        } else {
-          setResolvingRoot(false);
+      if (drive && !isServerRootSubject(drive, baseURL)) {
+        const lastUsedIsReadable = await withDeadline(
+          deviceHasDriveData(store, drive, { refresh: true }),
+          8_000,
+          false,
+        );
+        if (cancelled) return;
+
+        if (lastUsedIsReadable) {
+          navigate({ to: constructOpenURL(drive), replace: true });
+
+          return;
         }
+      }
+
+      if (resolved && !isServerRootSubject(resolved, baseURL)) {
+        const privateDriveIsReadable = await withDeadline(
+          deviceHasDriveData(store, resolved, { refresh: true }),
+          8_000,
+          false,
+        );
+        if (cancelled) return;
+
+        if (privateDriveIsReadable || acceptsNewDrives) {
+          navigate({ to: constructOpenURL(resolved), replace: true });
+
+          return;
+        }
+      }
+
+      const accessible = await withDeadline(
+        findAccessibleDrives(store),
+        8_000,
+        [] as string[],
+      );
+      if (cancelled) return;
+
+      const target = accessible.find(
+        subject => !isServerRootSubject(subject, baseURL),
+      );
+
+      if (target) {
+        setDrive(target);
+        navigate({ to: constructOpenURL(target), replace: true });
       } else {
         setResolvingRoot(false);
       }

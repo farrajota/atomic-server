@@ -5,6 +5,7 @@ import {
   selectGenerativeFeaturesModel,
 } from './useGenerativeData';
 import { AIProvider } from '@components/AI/aiContstants';
+import { redactProviderError } from './providerModel';
 
 describe('optionalGeneratedData', () => {
   afterEach(() => {
@@ -30,6 +31,31 @@ describe('optionalGeneratedData', () => {
     ).resolves.toBeUndefined();
 
     expect(warn).toHaveBeenCalledWith('AI chat title generation failed', error);
+  });
+
+  it('redacts the trimmed transmitted key before logging generation failures', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const error = new Error(
+      'Provider echoed transmitted-secret in its response.',
+    );
+
+    await expect(
+      optionalGeneratedData(
+        'AI chat title generation failed',
+        undefined,
+        () => Promise.reject(error),
+        failure => redactProviderError(failure, ['  transmitted-secret  ']),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledWith(
+      'AI chat title generation failed',
+      'Provider echoed [redacted] in its response.',
+    );
+    expect(warn).not.toHaveBeenCalledWith(
+      'AI chat title generation failed',
+      error,
+    );
   });
 });
 
@@ -79,6 +105,22 @@ describe('selectGenerativeFeaturesModel', () => {
     ).toBe(ollamaModel);
   });
 
+  it.each([
+    AIProvider.OpenAI,
+    AIProvider.Anthropic,
+    AIProvider.OpenAICompatible,
+  ])(
+    'does not fall back to Hosted for an unavailable %s generation provider',
+    provider => {
+      expect(
+        selectGenerativeFeaturesModel(
+          { id: 'configured-model', provider },
+          { id: 'hosted-model', provider: AIProvider.Hosted },
+          availableProvider => availableProvider === AIProvider.Hosted,
+        ),
+      ).toBeUndefined();
+    },
+  );
   it('returns undefined when neither provider is available', () => {
     expect(
       selectGenerativeFeaturesModel(openRouterModel, ollamaModel, () => false),

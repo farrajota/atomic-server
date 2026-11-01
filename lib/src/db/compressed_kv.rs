@@ -27,10 +27,150 @@
 use crate::errors::AtomicResult;
 
 use super::{
-    kv_store::{KvIter, KvPair, KvStore},
+    kv_store::{KvIter, KvPair, KvReadView, KvStore},
     trees::{Method, Operation, Tree},
 };
 use std::sync::Arc;
+
+struct CompressedReadView {
+    inner: Arc<dyn KvReadView>,
+}
+
+impl CompressedReadView {
+    fn decode(&self, tree: Tree, key: &[u8], value: Vec<u8>) -> AtomicResult<Vec<u8>> {
+        if tree != Tree::LoroSnapshots
+            || value.get(..2) != Some(&[MARKER, CODEC_SNAPSHOT_DELTA][..])
+        {
+            return if is_compressed_tree(tree) {
+                decode(value)
+            } else {
+                Ok(value)
+            };
+        }
+        let delta = miniz_oxide::inflate::decompress_to_vec(&value[2..])
+            .map_err(|e| format!("Could not decompress a stored snapshot: {e:?}"))?;
+        let commit_key =
+            genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
+        let row = self
+            .inner
+            .get(Tree::Resources, &commit_key)?
+            .ok_or_else(|| {
+                format!(
+                    "The genesis commit a snapshot is stored against is missing for {}",
+                    String::from_utf8_lossy(key)
+                )
+            })?;
+        let base = base_from_row(&row).ok_or_else(|| {
+            format!(
+                "Could not decode the genesis commit for {}",
+                String::from_utf8_lossy(key)
+            )
+        })?;
+        rebuild_snapshot(&base, &delta)
+    }
+
+    fn decode_bounded(
+        &self,
+        tree: Tree,
+        key: &[u8],
+        value: Vec<u8>,
+        max_bytes: usize,
+    ) -> AtomicResult<Vec<u8>> {
+        if tree != Tree::LoroSnapshots
+            || value.get(..2) != Some(&[MARKER, CODEC_SNAPSHOT_DELTA][..])
+        {
+            let decoded = if is_compressed_tree(tree) {
+                decode_bounded(value, max_bytes)?
+            } else {
+                value
+            };
+            if decoded.len() > max_bytes {
+                return Err(format!("Read-view value exceeded byte limit {max_bytes}").into());
+            }
+            return Ok(decoded);
+        }
+
+        let delta = miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
+            .map_err(|e| format!("Could not decompress bounded snapshot delta: {e:?}"))?;
+        let commit_key =
+            genesis_commit_key(key).ok_or_else(|| "Invalid compressed snapshot key".to_string())?;
+        let row = self
+            .inner
+            .get_bounded(Tree::Resources, &commit_key, max_bytes)?
+            .ok_or_else(|| {
+                format!(
+                    "The genesis commit a snapshot is stored against is missing for {}",
+                    String::from_utf8_lossy(key)
+                )
+            })?;
+        let base = base_from_row_bounded(&row, max_bytes)?;
+        let snapshot = rebuild_snapshot(&base, &delta)?;
+        if snapshot.len() > max_bytes {
+            return Err(format!("Read-view value exceeded byte limit {max_bytes}").into());
+        }
+        Ok(snapshot)
+    }
+}
+
+impl KvReadView for CompressedReadView {
+    fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>> {
+        self.inner
+            .get(tree, key)?
+            .map(|value| self.decode(tree, key, value))
+            .transpose()
+    }
+
+    fn get_bounded(
+        &self,
+        tree: Tree,
+        key: &[u8],
+        max_bytes: usize,
+    ) -> AtomicResult<Option<Vec<u8>>> {
+        self.inner
+            .get_bounded(tree, key, max_bytes)?
+            .map(|value| self.decode_bounded(tree, key, value, max_bytes))
+            .transpose()
+    }
+
+    fn scan_prefix(&self, tree: Tree, prefix: &[u8], limit: usize) -> AtomicResult<Vec<KvPair>> {
+        self.inner
+            .scan_prefix(tree, prefix, limit)?
+            .into_iter()
+            .map(|(key, value)| {
+                let decoded = self.decode(tree, &key, value)?;
+                Ok((key, decoded))
+            })
+            .collect()
+    }
+
+    fn scan_prefix_bounded(
+        &self,
+        tree: Tree,
+        prefix: &[u8],
+        row_limit: usize,
+        max_bytes: usize,
+    ) -> AtomicResult<Vec<KvPair>> {
+        let rows = self
+            .inner
+            .scan_prefix_bounded(tree, prefix, row_limit, max_bytes)?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut bytes_used = 0usize;
+        for (key, value) in rows {
+            let remaining = max_bytes
+                .checked_sub(bytes_used)
+                .and_then(|n| n.checked_sub(key.len()))
+                .ok_or_else(|| format!("Read-view prefix scan exceeded byte limit {max_bytes}"))?;
+            let decoded = self.decode_bounded(tree, &key, value, remaining)?;
+            bytes_used = bytes_used
+                .checked_add(key.len())
+                .and_then(|n| n.checked_add(decoded.len()))
+                .filter(|n| *n <= max_bytes)
+                .ok_or_else(|| format!("Read-view prefix scan exceeded byte limit {max_bytes}"))?;
+            out.push((key, decoded));
+        }
+        Ok(out)
+    }
+}
 
 const MARKER: u8 = 0;
 const CODEC_RAW: u8 = 0;
@@ -85,6 +225,26 @@ fn decode(value: Vec<u8>) -> AtomicResult<Vec<u8>> {
     }
 }
 
+fn decode_bounded(value: Vec<u8>, max_bytes: usize) -> AtomicResult<Vec<u8>> {
+    if value.first() != Some(&MARKER) {
+        return if value.len() <= max_bytes {
+            Ok(value)
+        } else {
+            Err(format!("Read-view value exceeded byte limit {max_bytes}").into())
+        };
+    }
+    match value.get(1) {
+        Some(&CODEC_RAW) if value.len().saturating_sub(2) <= max_bytes => Ok(value[2..].to_vec()),
+        Some(&CODEC_RAW) => Err(format!("Read-view value exceeded byte limit {max_bytes}").into()),
+        Some(&CODEC_DEFLATE) => {
+            miniz_oxide::inflate::decompress_to_vec_with_limit(&value[2..], max_bytes)
+                .map_err(|e| format!("Could not decompress bounded value: {e:?}").into())
+        }
+        Some(&CODEC_SNAPSHOT_DELTA) => Err("A snapshot delta can only be read with its key".into()),
+        other => Err(format!("Unknown storage codec {other:?}").into()),
+    }
+}
+
 /// The resource-tree key of the genesis commit of the resource a snapshot
 /// key names, when its id was derived from that commit's signature.
 fn genesis_commit_key(snapshot_key: &[u8]) -> Option<Vec<u8>> {
@@ -105,6 +265,20 @@ fn base_from_row(row: &[u8]) -> Option<Vec<u8>> {
     {
         crate::Value::LoroDoc(bytes) if !bytes.is_empty() => Some(bytes),
         _ => None,
+    }
+}
+
+fn base_from_row_bounded(row: &[u8], max_bytes: usize) -> AtomicResult<Vec<u8>> {
+    let row = decode_bounded(row.to_vec(), max_bytes)?;
+    let mut propvals = super::encoding::decode_propvals(&row)?;
+    match propvals.remove(crate::urls::LORO_UPDATE) {
+        Some(crate::Value::LoroDoc(bytes)) if !bytes.is_empty() && bytes.len() <= max_bytes => {
+            Ok(bytes)
+        }
+        Some(crate::Value::LoroDoc(_)) => {
+            Err(format!("Read-view genesis snapshot exceeded byte limit {max_bytes}").into())
+        }
+        _ => Err("The genesis commit has no stored Loro snapshot".into()),
     }
 }
 
@@ -226,6 +400,12 @@ impl CompressedKv {
 }
 
 impl KvStore for CompressedKv {
+    fn read_view(&self) -> AtomicResult<Arc<dyn KvReadView>> {
+        Ok(Arc::new(CompressedReadView {
+            inner: self.inner.read_view()?,
+        }))
+    }
+
     fn get(&self, tree: Tree, key: &[u8]) -> AtomicResult<Option<Vec<u8>>> {
         let found = self.inner.get(tree, key)?;
         match found {
@@ -243,6 +423,11 @@ impl KvStore for CompressedKv {
         } else {
             self.inner.insert(tree, key, val)
         }
+    }
+
+    fn write_recovery_snapshot(&self, key: &[u8], snapshot: &[u8]) -> AtomicResult<()> {
+        self.inner
+            .insert(Tree::LoroSnapshots, key, &encode(snapshot))
     }
 
     fn remove(&self, tree: Tree, key: &[u8]) -> AtomicResult<()> {
@@ -279,6 +464,24 @@ impl KvStore for CompressedKv {
         } else {
             Ok(page)
         }
+    }
+
+    fn range_value_sizes(
+        &self,
+        tree: Tree,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: usize,
+    ) -> AtomicResult<Vec<(Vec<u8>, u64)>> {
+        if is_compressed_tree(tree) {
+            // Stored length is not the logical length: decode.
+            return Ok(self
+                .range_page(tree, start, end, limit)?
+                .into_iter()
+                .map(|(key, value)| (key, value.len() as u64))
+                .collect());
+        }
+        self.inner.range_value_sizes(tree, start, end, limit)
     }
 
     fn iter_tree(&self, tree: Tree) -> KvIter {
@@ -364,5 +567,21 @@ mod tests {
         assert_eq!(encode(b"{}"), b"{}".to_vec());
         let odd = vec![0u8, 1, 2];
         assert_eq!(decode(encode(&odd)).unwrap(), odd);
+    }
+    #[test]
+    fn immutable_view_prefix_scan_decodes_compressed_rows_before_returning_keys() {
+        let inner = Arc::new(crate::db::redb_store::RedbStore::new_memory().unwrap());
+        let store = CompressedKv::new(inner);
+        let before = br#"{"subject":"before"}"#.repeat(16);
+        let after = br#"{"subject":"after"}"#.repeat(16);
+        store.insert(Tree::Resources, b"resource", &before).unwrap();
+
+        let view = store.read_view().unwrap();
+        store.insert(Tree::Resources, b"resource", &after).unwrap();
+
+        assert_eq!(
+            view.scan_prefix(Tree::Resources, b"resource", 1).unwrap(),
+            vec![(b"resource".to_vec(), before)]
+        );
     }
 }
