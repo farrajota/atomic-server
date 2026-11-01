@@ -495,7 +495,8 @@ mod tests {
     /// batch of throwaway resources is written between the rounds and
     /// deleted at the end. Their pages are freed mid-file, where redb's own
     /// tail truncation cannot reach them, so the file keeps its high-water
-    /// size. Returns the file's `(length, bytes on disk)` after a clean close.
+    /// size. Returns `(length, bytes on disk)` after a clean close and one
+    /// ordinary disabled-policy reopen, which normalizes startup tail trimming.
     /// Text that deflate cannot shrink: stored values are compressed, and a
     /// repeated string would leave no dead space to reclaim.
     fn noise(seed: usize, len: usize) -> String {
@@ -547,6 +548,11 @@ mod tests {
                 .await
                 .unwrap();
         }
+        store.flush().unwrap();
+        drop(store);
+        // Establish the disabled-policy startup baseline before either branch
+        // is copied or tested: an ordinary open may trim redb's free tail.
+        let store = open(dir, &CompactionPolicy::disabled()).await;
         store.flush().unwrap();
         drop(store);
         file_sizes(&dir.join("atomic.redb"))
