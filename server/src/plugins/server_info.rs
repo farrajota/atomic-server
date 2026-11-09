@@ -171,6 +171,8 @@ fn handle_get(
         let can_create_drives = match context.for_agent {
             atomic_lib::agents::ForAgent::Sudo => true,
             atomic_lib::agents::ForAgent::Public => !info.host_mode.is_owner_mode(),
+            // A token cannot sign the genesis a new drive needs.
+            atomic_lib::agents::ForAgent::Token(_) => false,
             atomic_lib::agents::ForAgent::AgentSubject(agent) => {
                 !info.host_mode.is_owner_mode() || info.host_mode.is_owner(agent.as_str())
             }

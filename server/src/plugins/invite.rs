@@ -136,6 +136,12 @@ pub fn handle_invite_post<'a>(
             atomic_lib::agents::ForAgent::Public => {
                 return Err("Accepting invite requires an authenticated agent.".into());
             }
+            // Accepting an invite grants rights; a token may not widen them.
+            atomic_lib::agents::ForAgent::Token(_) => {
+                return Err(
+                    "An access token cannot accept invites; sign with the agent's key.".into(),
+                );
+            }
         };
 
         // Check and record under one lock, so two people opening a one-use link

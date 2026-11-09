@@ -562,6 +562,9 @@ impl WebSocketConnection {
                         self.write_rate_limiter.check(&subject.to_string(), false)
                     }
                     ForAgent::Public => self.write_rate_limiter.check(&self.peer_ip, true),
+                    ForAgent::Token(grant) => self
+                        .write_rate_limiter
+                        .check(&grant.agent.to_string(), false),
                 };
                 if let Err(limited) = limited {
                     let msg = limited.to_string();

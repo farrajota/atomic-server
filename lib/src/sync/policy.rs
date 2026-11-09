@@ -410,6 +410,9 @@ impl SyncPolicy for OwnerPolicy {
             // left to fall out of the comparison, because this is the case the
             // whole policy exists for.
             crate::agents::ForAgent::Public => false,
+            // An access token is a narrowed, read-oriented credential; it
+            // never brings a new drive onto the node.
+            crate::agents::ForAgent::Token(_) => false,
         }
     }
 

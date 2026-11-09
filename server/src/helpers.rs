@@ -402,6 +402,10 @@ pub fn enforce_write_rate_limit(
             .write_rate_limiter
             .check(&subject.to_string(), false),
         ForAgent::Public => appstate.write_rate_limiter.check(&peer_ip(req), true),
+        // The same budget as the agent's own signed writes.
+        ForAgent::Token(grant) => appstate
+            .write_rate_limiter
+            .check(&grant.agent.to_string(), false),
     };
     result.map_err(|limited| AtomicServerError {
         message: limited.to_string(),
