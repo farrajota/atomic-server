@@ -460,7 +460,7 @@ impl WebSocketConnection {
                                 .commit_monitor_addr
                                 .do_send(crate::actor_messages::RebindAgent {
                                     addr: ctx.address(),
-                                    agent: agent.to_string(),
+                                    agent: agent.clone(),
                                 });
                         }
                         actor.agent = agent;
@@ -532,7 +532,7 @@ impl WebSocketConnection {
                                 .do_send(crate::actor_messages::Subscribe {
                                     addr: ctx.address(),
                                     subject,
-                                    agent: actor.agent.to_string(),
+                                    agent: actor.agent.clone(),
                                     source_id: actor.connection_id.clone(),
                                     canonical_scheme: actor.client_capabilities.iter().any(|c| {
                                         c == atomic_lib::identifiers::CAP_CANONICAL_SCHEME

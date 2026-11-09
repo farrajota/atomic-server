@@ -27,10 +27,11 @@ pub struct Subscriber {
     /// echoed back to it (see [`skip_same_source`]); its own commits are,
     /// because the echo carries the server's stamp on top of them.
     source_id: String,
-    /// The identity the subscription was admitted under, as a subject
-    /// string. Kept so [`Handler<RebindAgent>`] can re-evaluate the
-    /// registration when the connection's `AUTH` changes it.
-    agent: String,
+    /// The identity the subscription was admitted under. Kept so
+    /// [`Handler<RebindAgent>`] can re-evaluate the registration when the
+    /// connection's `AUTH` changes it, and so a parent subscriber is
+    /// re-checked with the same narrowing (an access token's scopes).
+    agent: ForAgent,
     /// Whether this connection listed `canonical-scheme` in HELLO. Fan-out
     /// encodes `atomic:` for those peers and `did:ad:` for everyone else.
     canonical_scheme: bool,
@@ -264,12 +265,8 @@ impl Handler<Subscribe> for CommitMonitor {
                         return None;
                     }
                 };
-                if let Err(e) = atomic_lib::hierarchy::check_read(
-                    &store,
-                    &resource,
-                    &ForAgent::from(msg.agent.clone()),
-                )
-                .await
+                if let Err(e) =
+                    atomic_lib::hierarchy::check_read(&store, &resource, &msg.agent).await
                 {
                     tracing::debug!("Subscribe: {} cannot read {subject}: {e}", msg.agent);
                     crate::actor_messages::refuse_subscription(
@@ -509,7 +506,7 @@ fn rebind_one<K: std::hash::Hash + Eq>(
     map: &mut HashMap<K, Subscribers>,
     key: &K,
     addr: &Addr<WebSocketConnection>,
-    agent: &str,
+    agent: &ForAgent,
     readable: bool,
 ) -> bool {
     let Some(subs) = map.get_mut(key) else {
@@ -517,7 +514,7 @@ fn rebind_one<K: std::hash::Hash + Eq>(
     };
     if readable {
         if let Some(sub) = subs.get_mut(addr) {
-            sub.agent = agent.to_string();
+            sub.agent = agent.clone();
         }
         return false;
     }
@@ -566,7 +563,7 @@ impl Handler<RebindAgent> for CommitMonitor {
         let addr = msg.addr;
         Box::pin(
             async move {
-                let for_agent = ForAgent::from(agent.clone());
+                let for_agent = agent.clone();
                 let mut verdicts = Vec::with_capacity(checks.len());
                 for (held, target) in checks {
                     let readable = match store.get_resource(&target).await {
@@ -724,8 +721,7 @@ impl Handler<CommitMessage> for CommitMonitor {
                     };
                     let mut allowed = Vec::new();
                     for (connection, subscriber) in parent_subscribers {
-                        let agent = ForAgent::from(subscriber.agent.clone());
-                        if atomic_lib::hierarchy::check_read(&store, resource, &agent)
+                        if atomic_lib::hierarchy::check_read(&store, resource, &subscriber.agent)
                             .await
                             .is_ok()
                         {
