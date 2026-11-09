@@ -34,6 +34,7 @@ pub struct SledStore {
     envelopes: sled::Tree,
     envelope_spans: sled::Tree,
     outbox: sled::Tree,
+    access_tokens: sled::Tree,
 }
 
 impl SledStore {
@@ -67,6 +68,7 @@ impl SledStore {
         let envelopes = db.open_tree(Tree::Envelopes)?;
         let envelope_spans = db.open_tree(Tree::EnvelopeSpans)?;
         let outbox = db.open_tree(Tree::Outbox)?;
+        let access_tokens = db.open_tree(Tree::AccessTokens)?;
 
         Ok(SledStore {
             db,
@@ -90,6 +92,7 @@ impl SledStore {
             envelopes,
             envelope_spans,
             outbox,
+            access_tokens,
         })
     }
 
@@ -120,6 +123,7 @@ impl SledStore {
             Tree::Envelopes => &self.envelopes,
             Tree::EnvelopeSpans => &self.envelope_spans,
             Tree::Outbox => &self.outbox,
+            Tree::AccessTokens => &self.access_tokens,
         }
     }
 }
@@ -209,6 +213,7 @@ impl KvStore for SledStore {
         let mut batch_envelopes = sled::Batch::default();
         let mut batch_envelope_spans = sled::Batch::default();
         let mut batch_outbox = sled::Batch::default();
+        let mut batch_access_tokens = sled::Batch::default();
 
         for op in operations {
             let batch = match op.tree {
@@ -232,6 +237,7 @@ impl KvStore for SledStore {
                 Tree::Envelopes => &mut batch_envelopes,
                 Tree::EnvelopeSpans => &mut batch_envelope_spans,
                 Tree::Outbox => &mut batch_outbox,
+                Tree::AccessTokens => &mut batch_access_tokens,
             };
             match op.method {
                 Method::Insert => {
@@ -318,6 +324,9 @@ impl KvStore for SledStore {
         self.outbox
             .apply_batch(batch_outbox)
             .map_err(|e| format!("Failed to apply outbox batch: {}", e))?;
+        self.access_tokens
+            .apply_batch(batch_access_tokens)
+            .map_err(|e| format!("Failed to apply access tokens batch: {}", e))?;
 
         Ok(())
     }
