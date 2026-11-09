@@ -101,6 +101,7 @@
   - [Agents](agents.md)
   - [Hierarchy and authorization](hierarchy.md)
   - [Authentication](authentication.md)
+    - [Access tokens](access-tokens.md)
   - [Invitations and sharing](invitations.md)
   - [Atomic Sync](sync.md)
     - [Wire protocol: WebSocket and Iroh](websockets.md)

@@ -2,6 +2,7 @@ use atomic_lib::{agents::ForAgent, Storelike};
 use atomic_server_lib::config::Opts;
 use std::{fs::File, io::Write};
 
+mod access_tokens;
 mod actor_messages;
 mod appstate;
 mod blob_storage;

@@ -89,6 +89,18 @@ pub fn get_auth_headers_for_request(
                 .to_str()
                 .map_err(|_e| "Only string headers allowed in authorization header")?
                 .trim_start_matches("Bearer ");
+            // Access tokens are accepted only where a handler asks for them
+            // (`get_client_agent_or_access_token`, `/tokens`, WebSocket AUTH).
+            // Everywhere else they must not pass as a signed proof.
+            if bearer
+                .trim()
+                .starts_with(crate::access_tokens::TOKEN_PREFIX)
+            {
+                return Err(AtomicError::unauthorized(
+                    "This endpoint does not accept access tokens; sign the request with the agent's key".into(),
+                )
+                .into());
+            }
             let auth_vals = get_auth_from_base64(bearer, requested_subject)?;
             return Ok(Some(auth_vals));
         }
@@ -254,6 +266,26 @@ pub async fn get_client_agent(
     requested_subject: &str,
 ) -> AtomicServerResult<ForAgent> {
     get_client_agent_checked(headers, None, appstate, requested_subject).await
+}
+
+/// [get_client_agent], also accepting an access token
+/// (`Authorization: Bearer atk_...`). Only for handlers whose every check is a
+/// rights check, so the token's narrowing applies (resource reads and the
+/// endpoints served through them, like `/query`). An unknown, revoked or
+/// expired token is a 401, never the public agent.
+pub async fn get_client_agent_or_access_token(
+    headers: &HeaderMap,
+    appstate: &AppState,
+    requested_subject: &str,
+) -> AtomicServerResult<ForAgent> {
+    if let Some(token) = crate::access_tokens::bearer_token(headers) {
+        if appstate.config.opts.public_mode {
+            return Ok(ForAgent::Public);
+        }
+        let record = crate::access_tokens::resolve(&appstate.store, token)?;
+        return Ok(crate::access_tokens::grant_of(&record));
+    }
+    get_client_agent(headers, appstate, requested_subject).await
 }
 
 /// The caller must be allowed to write the plugin: that is what makes it their

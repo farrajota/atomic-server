@@ -5,6 +5,7 @@ Most of the logic for routing and handling resides in [atomic_lib::Storelike::ge
 However, some features reside in atomic-server.
 */
 
+pub mod access_tokens;
 pub mod app_agent;
 #[cfg(all(test, feature = "wasm-plugins"))]
 mod app_endpoints_test;

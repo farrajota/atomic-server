@@ -368,6 +368,12 @@ the same frame changes nothing. Over WebSocket the socket stays open and the
 client may retry. On an Iroh stream the responder writes the error, finishes
 its half, and closes.
 
+**Access tokens (WebSocket only).** Instead of a signed proof, the payload may
+be `{"accessToken": "atk_..."}`. The session then acts as the token's agent,
+narrowed to its scopes, and is read-only. It closes with code 1008 when the
+token is revoked or expires. See [Access tokens](access-tokens.md). Iroh does
+not accept tokens.
+
 **Late AUTH.** `AUTH` is not restricted to the start of a connection. The
 WebSocket handler writes the proven identity back onto the connection actor
 and, when the identity changed, has the commit monitor re-evaluate every

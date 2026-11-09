@@ -3,6 +3,7 @@ Atomic-Server is mostly desgigned to run as a binary, but it can be embedded in 
 It is currently used as an embedded server in the Tauri distribution of Atomic Server.
 See https://github.com/atomicdata-dev/atomic-server/tree/master/src-tauri
 */
+pub mod access_tokens;
 mod actor_messages;
 pub mod appstate;
 pub mod blob_storage;
@@ -31,6 +32,8 @@ pub mod serve;
 pub mod vector_search;
 pub mod write_load;
 // #[cfg(feature = "search")]
+#[cfg(test)]
+mod access_token_vectors_test;
 #[cfg(test)]
 pub mod recovery_cli;
 #[cfg(test)]

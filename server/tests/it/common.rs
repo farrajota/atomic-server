@@ -109,3 +109,88 @@ pub async fn wait_for_server(port: u16) {
 
     panic!("Server did not start within 60 seconds");
 }
+
+/// An `atomic-server` child process on its own directories, for suites that
+/// check what survives a restart. Killed on drop.
+pub struct ServerProcess {
+    pub port: u16,
+    dirs: [String; 3],
+    extra_args: Vec<String>,
+    child: std::process::Child,
+}
+
+impl ServerProcess {
+    pub async fn start(name: &str, extra_args: &[&str]) -> Self {
+        let unique = format!("{}_{}", name, atomic_lib::utils::random_string(10));
+        let dirs = [
+            format!("./.temp/{unique}/db"),
+            format!("./.temp/{unique}/config"),
+            format!("./.temp/{unique}/cache"),
+        ];
+        let extra_args = extra_args.iter().map(|s| s.to_string()).collect();
+        Self::spawn(dirs, extra_args, true).await
+    }
+
+    /// Kill the process, then start a new one on the same directories.
+    pub async fn restart(mut self) -> Self {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let dirs = std::mem::take(&mut self.dirs);
+        let extra_args = std::mem::take(&mut self.extra_args);
+        Self::spawn(dirs, extra_args, false).await
+    }
+
+    async fn spawn(dirs: [String; 3], extra_args: Vec<String>, initialize: bool) -> Self {
+        // redb's lock can outlive a killed process briefly, and the new one
+        // then exits with "Database already open": retry until one answers
+        // HTTP (AGENTS.md, "When you restart an atomic-server").
+        for _ in 0..30 {
+            let port = pick_port();
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_atomic-server"));
+            if initialize {
+                cmd.arg("--initialize");
+            }
+            cmd.args(["--ip", "127.0.0.1", "--port", &port.to_string()])
+                .args([
+                    "--data-dir",
+                    &dirs[0],
+                    "--config-dir",
+                    &dirs[1],
+                    "--cache-dir",
+                    &dirs[2],
+                ])
+                .args(&extra_args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut child = cmd.spawn().expect("spawn atomic-server");
+            for _ in 0..600 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                if reqwest::get(format!("http://localhost:{port}"))
+                    .await
+                    .is_ok()
+                {
+                    return Self {
+                        port,
+                        dirs,
+                        extra_args,
+                        child,
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        panic!("atomic-server did not come up on {}", dirs[0]);
+    }
+}
+
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

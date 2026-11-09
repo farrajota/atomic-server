@@ -48,6 +48,9 @@ pub struct AppState {
     /// In-flight commit counter and load signal, shared by `POST /commit`
     /// and the WebSocket `COMMIT` frame. See `crate::write_load`.
     pub write_load: Arc<crate::write_load::WriteLoad>,
+    /// WebSocket sessions opened with an access token, so revoking the token
+    /// closes them. See `crate::access_tokens`.
+    pub token_sessions: Arc<crate::access_tokens::TokenSessions>,
 }
 
 impl AppState {
@@ -295,6 +298,7 @@ impl AppState {
             managed: server_info.managed,
             managed_dashboard_url: server_info.managed_dashboard_url,
             view_tokens: Arc::new(Default::default()),
+            token_sessions: Arc::new(Default::default()),
         })
     }
 

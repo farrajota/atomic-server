@@ -223,6 +223,20 @@ fn configure_mcp_routes(app: &mut actix_web::web::ServiceConfig) {
     );
 }
 
+/// Self-issued access tokens; see `crate::access_tokens`. `/tokens/self` is
+/// registered before `/tokens/{id}` so it is never read as an id.
+fn configure_access_token_routes(app: &mut actix_web::web::ServiceConfig) {
+    use handlers::access_tokens as tokens;
+    app.service(
+        web::resource("/tokens")
+            .app_data(web::PayloadConfig::new(64 * 1024))
+            .route(web::post().to(tokens::mint))
+            .route(web::get().to(tokens::list)),
+    )
+    .service(web::resource("/tokens/self").route(web::get().to(tokens::introspect)))
+    .service(web::resource("/tokens/{id}").route(web::delete().to(tokens::revoke)));
+}
+
 /// Registers single-handler routes (`post "/path" => handler`) one per line.
 /// Statement order is registration order, so it keeps the same precedence as
 /// chained `.service` calls.
@@ -391,6 +405,7 @@ pub fn config_routes(app: &mut actix_web::web::ServiceConfig) {
     )
     .service(web::resource("/iroh-sync").route(web::post().to(iroh_sync_handler)))
     .configure(configure_mcp_routes)
+    .configure(configure_access_token_routes)
     .service(web::resource("/export").to(handlers::export::handle_export))
     .configure(configure_wasm_plugin_routes)
     .service(

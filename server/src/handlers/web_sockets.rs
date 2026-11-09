@@ -98,6 +98,8 @@ pub async fn web_socket_handler(
             peer_ip: crate::helpers::peer_ip(&req),
             index_status_subscribed: std::collections::HashSet::new(),
             sync_frames: Arc::default(),
+            token: None,
+            token_sessions: appstate.token_sessions.clone(),
         },
         &req,
         stream,
@@ -163,7 +165,53 @@ pub struct WebSocketConnection {
     /// connection's reconcile frames still run one at a time, in the order
     /// they arrived. The lock queues its waiters first come, first served.
     sync_frames: Arc<tokio::sync::Mutex<()>>,
+    /// Set while the session is authenticated with an access token rather
+    /// than a signed proof. Such a session is read-only and closes when the
+    /// token is revoked or expires.
+    token: Option<TokenSession>,
+    /// Where revokes find this session (`crate::access_tokens`).
+    token_sessions: Arc<crate::access_tokens::TokenSessions>,
 }
+
+/// The access token a WebSocket session was opened with.
+struct TokenSession {
+    token_id: String,
+    expires_at: i64,
+}
+
+/// The `AUTH` payload that carries an access token instead of a signed
+/// proof: `{"accessToken": "atk_..."}`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenAuth {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+}
+
+/// Frames a token session may send: authentication, reads, subscriptions and
+/// connection upkeep. Everything else writes, carries the agent's identity
+/// to other people (presence, cursors) or reconciles whole drives.
+fn token_session_allows(tag: u8) -> bool {
+    matches!(
+        tag,
+        ws_v2::tag::AUTH
+            | ws_v2::tag::GET
+            | ws_v2::tag::GET_MANY
+            | ws_v2::tag::SUB
+            | ws_v2::tag::UNSUB
+            | ws_v2::tag::KEEPALIVE
+            | ws_v2::tag::HELLO
+    )
+}
+
+/// Text frames a token session may send (none of them reads or writes data).
+const TOKEN_SESSION_TEXT: [&str; 5] = [
+    "SUBSCRIBE_INDEX_STATUS ",
+    "UNSUBSCRIBE_INDEX_STATUS ",
+    "LORO_SYNC_UNSUBSCRIBE ",
+    "PRESENCE_UNSUBSCRIBE ",
+    "RBSR_FP ",
+];
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -229,6 +277,14 @@ impl Actor for WebSocketConnection {
             &self.auth_nonce,
         ));
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
+            // Belt and braces next to the revoke notification and the expiry
+            // timer: a token session re-reads its token on every heartbeat.
+            if let Some(token) = &act.token {
+                if !crate::access_tokens::is_live(&act.store, &token.token_id) {
+                    act.close_token_session(ctx, "access token is no longer valid");
+                    return;
+                }
+            }
             if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
                 tracing::info!("Websocket heartbeat failed, disconnecting");
                 ctx.stop();
@@ -246,6 +302,9 @@ impl Actor for WebSocketConnection {
         // which every subsequent fanout iterates over (do_send to a
         // stopped actor silently no-ops).
         let addr = ctx.address();
+        if let Some(token) = self.token.take() {
+            self.token_sessions.deregister(&token.token_id, &addr);
+        }
         self.commit_monitor_addr
             .do_send(crate::actor_messages::UnsubscribeAll { addr });
     }
@@ -391,9 +450,94 @@ impl WebSocketConnection {
         false
     }
 
+    /// `AUTH` with an access token: the session becomes the token's narrowed
+    /// agent, read-only, until the token is revoked or expires.
+    fn authenticate_token(&mut self, token: &str, ctx: &mut ws::WebsocketContext<Self>) {
+        let record = match crate::access_tokens::resolve(&self.store, token) {
+            Ok(record) => record,
+            Err(e) => {
+                ctx.binary(ws_v2::encode_error(
+                    0,
+                    ws_v2::error_code::AUTH_FAILED,
+                    &format!("Auth failed: {}", e.message),
+                ));
+                return;
+            }
+        };
+        self.end_token_session(ctx);
+        let agent = crate::access_tokens::grant_of(&record);
+        if self.agent != agent {
+            self.commit_monitor_addr
+                .do_send(crate::actor_messages::RebindAgent {
+                    addr: ctx.address(),
+                    agent: agent.clone(),
+                });
+        }
+        self.agent = agent;
+        self.token_sessions
+            .register(&record.token_id, ctx.address());
+        self.token = Some(TokenSession {
+            token_id: record.token_id.clone(),
+            expires_at: record.expires_at,
+        });
+        // A revoke that landed between the lookup and the registration found
+        // no session to close; look once more now that it would.
+        if !crate::access_tokens::is_live(&self.store, &record.token_id) {
+            self.close_token_session(ctx, "access token is no longer valid");
+            return;
+        }
+        let remaining = (record.expires_at - atomic_lib::utils::now()).max(0) as u64;
+        let token_id = record.token_id;
+        ctx.run_later(Duration::from_millis(remaining), move |act, ctx| {
+            if act.token.as_ref().is_some_and(|t| t.token_id == token_id) {
+                act.close_token_session(ctx, "access token expired");
+            }
+        });
+        ctx.binary(atomic_lib::sync::protocol::encode_auth_ok());
+    }
+
+    /// Forget the token this session was opened with (a later signed `AUTH`
+    /// replaced it).
+    fn end_token_session(&mut self, ctx: &mut ws::WebsocketContext<Self>) {
+        if let Some(token) = self.token.take() {
+            self.token_sessions
+                .deregister(&token.token_id, &ctx.address());
+        }
+    }
+
+    /// Close the socket because its token may no longer be used. Its
+    /// subscriptions go with it (`stopped`).
+    fn close_token_session(&mut self, ctx: &mut ws::WebsocketContext<Self>, reason: &str) {
+        tracing::debug!("ws {}: closing token session: {reason}", self.connection_id);
+        self.end_token_session(ctx);
+        self.agent = ForAgent::Public;
+        ctx.close(Some(ws::CloseReason {
+            code: ws::CloseCode::Policy,
+            description: Some(reason.to_string()),
+        }));
+        ctx.stop();
+    }
+
     /// Handle a binary v2 frame.
     fn handle_binary(&mut self, bin: &[u8], ctx: &mut ws::WebsocketContext<Self>) {
         if bin.is_empty() {
+            return;
+        }
+
+        if self.token.is_some() && !token_session_allows(bin[0]) {
+            let request_id = if bin[0] == ws_v2::tag::COMMIT {
+                ws_v2::decode_commit(&bin[1..]).map_or(0, |c| c.request_id)
+            } else {
+                0
+            };
+            ctx.binary(ws_v2::encode_error(
+                request_id,
+                ws_v2::error_code::UNAUTHORIZED_WRITE,
+                &format!(
+                    "An access token session is read-only: frame 0x{:02x} is refused. Writes need the agent's own key.",
+                    bin[0]
+                ),
+            ));
             return;
         }
 
@@ -415,6 +559,10 @@ impl WebSocketConnection {
             // a cloned agent handed to `handle_frame` would otherwise drop the
             // identity the AUTH just proved.
             ws_v2::tag::AUTH => {
+                if let Ok(TokenAuth { access_token }) = serde_json::from_slice(&bin[1..]) {
+                    self.authenticate_token(&access_token, ctx);
+                    return;
+                }
                 let store = self.store.clone();
                 let mut agent = self.agent.clone();
                 let bin_vec = bin.to_vec();
@@ -462,6 +610,10 @@ impl WebSocketConnection {
                                     addr: ctx.address(),
                                     agent: agent.clone(),
                                 });
+                        }
+                        if !matches!(agent, ForAgent::Token(_)) && actor.token.is_some() {
+                            // A signed AUTH replaced the token session.
+                            actor.end_token_session(ctx);
                         }
                         actor.agent = agent;
                         for response in responses {
@@ -744,6 +896,15 @@ impl WebSocketConnection {
     /// Handle the remaining text messages (Loro and presence subscriptions,
     /// the drive inventory, index status).
     fn handle_text(&mut self, text: &str, ctx: &mut ws::WebsocketContext<Self>) {
+        if self.token.is_some() && !TOKEN_SESSION_TEXT.iter().any(|p| text.starts_with(p)) {
+            let frame = text.split(' ').next().unwrap_or_default();
+            ctx.binary(ws_v2::encode_error(
+                0,
+                ws_v2::error_code::UNAUTHORIZED_READ,
+                &format!("An access token session cannot send {frame}"),
+            ));
+            return;
+        }
         if let Some(json) = text.strip_prefix("SUBSCRIBE_INDEX_STATUS ") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
                 if let Some(drive) = v.get("drive").and_then(|d| d.as_str()) {
@@ -899,7 +1060,36 @@ impl Handler<SendFrame> for WebSocketConnection {
     /// the `Arc<[u8]>` to `Bytes::from_owner` so actix shares ownership
     /// without copying the bytes.
     fn handle(&mut self, msg: SendFrame, ctx: &mut ws::WebsocketContext<Self>) {
+        // Nothing reaches a token session once its token has expired, even if
+        // the expiry timer has not fired yet.
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|t| atomic_lib::utils::now() >= t.expires_at)
+        {
+            self.close_token_session(ctx, "access token expired");
+            return;
+        }
         ctx.binary(actix_web::web::Bytes::from_owner(msg.frame));
+    }
+}
+
+impl Handler<crate::access_tokens::CloseTokenSession> for WebSocketConnection {
+    type Result = ();
+
+    /// The token this session was opened with was revoked.
+    fn handle(
+        &mut self,
+        msg: crate::access_tokens::CloseTokenSession,
+        ctx: &mut ws::WebsocketContext<Self>,
+    ) {
+        if self
+            .token
+            .as_ref()
+            .is_some_and(|t| t.token_id == msg.token_id)
+        {
+            self.close_token_session(ctx, &msg.reason);
+        }
     }
 }
 
