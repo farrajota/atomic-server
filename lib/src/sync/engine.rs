@@ -603,6 +603,15 @@ pub async fn handle_frame_full_for_caps(
             }
         }
 
+        // An access token is a read-only credential: it never stores bytes,
+        // even ones a request of this node asked for.
+        protocol::tag::BLOB_RESPONSE if matches!(agent, crate::agents::ForAgent::Token(_)) => {
+            vec![protocol::encode_error(
+                0,
+                protocol::error_code::UNAUTHORIZED_WRITE,
+                "An access token cannot answer BLOB_REQUEST",
+            )]
+        }
         protocol::tag::BLOB_RESPONSE => {
             if let Some(resp) = protocol::decode_blob_response(payload) {
                 // F4 (planning/unified-sync.md): a `BLOB_RESPONSE` with no
@@ -1712,6 +1721,11 @@ pub(crate) async fn may_accept_drive_write(
     for_agent: &crate::agents::ForAgent,
     trust_owned: bool,
 ) -> bool {
+    // An access token never writes, whatever its scopes, and does not get
+    // the owner's trust either: the session that holds it did not prove a key.
+    if matches!(for_agent, crate::agents::ForAgent::Token(_)) {
+        return false;
+    }
     if crate::hierarchy::check_write(store, drive_resource, for_agent)
         .await
         .is_ok()
@@ -1888,7 +1902,10 @@ pub(crate) fn admit_unknown_drive(
     drive_subject: &str,
     agent: &crate::agents::ForAgent,
 ) -> bool {
-    if matches!(agent, crate::agents::ForAgent::Public) {
+    if matches!(
+        agent,
+        crate::agents::ForAgent::Public | crate::agents::ForAgent::Token(_)
+    ) {
         return false;
     }
     let policy = store.sync_policy();
@@ -1922,6 +1939,12 @@ pub async fn import_sync_push(
     for_agent: &crate::agents::ForAgent,
     trust_owned: bool,
 ) -> Result<(usize, Vec<Vec<u8>>), SyncPushRejected> {
+    if matches!(for_agent, crate::agents::ForAgent::Token(_)) {
+        return Err(SyncPushRejected {
+            drive: push.drive.clone(),
+            reason: "an access token is read-only; sign in with the agent's key to push".into(),
+        });
+    }
     let drive_subject = crate::Subject::from_raw(&push.drive, store.get_base_domain().as_deref());
     let policy = store.sync_policy();
 
@@ -3900,5 +3923,108 @@ mod bootstrap_and_sub_tests {
         let out = handle_frame_full(&frame, &db, &mut agent).await;
         assert!(out.frames.is_empty());
         assert_eq!(out.unsubscribe.as_deref(), Some("did:ad:whatever"));
+    }
+}
+
+/// Access tokens are read-only credentials: no sync write path accepts one,
+/// whatever its scopes and whatever its agent may write. The WebSocket
+/// handler gates these frames too; these checks hold if that gate is ever
+/// bypassed (a session whose identity changed under it).
+#[cfg(test)]
+mod access_token_write_refusals {
+    use crate::agents::{ForAgent, TokenGrant, TokenScope};
+    use crate::db::trees::Tree;
+    use crate::loro::AtomicLoroDoc;
+    use crate::sync::{engine, policy::SyncPolicy, protocol};
+    use crate::Db;
+
+    fn token(agent: &crate::agents::Agent, drive: &str) -> ForAgent {
+        ForAgent::Token(TokenGrant {
+            token_id: "test-token".into(),
+            agent: agent.subject.clone(),
+            // The widest scope there is, on a drive the agent may write.
+            scopes: vec![TokenScope {
+                target: drive.to_string(),
+                right: crate::hierarchy::Right::Write,
+            }],
+            expires_at: i64::MAX,
+        })
+    }
+
+    #[tokio::test]
+    async fn import_sync_push_refuses_an_access_token() {
+        let db = Db::init_temp("token_sync_push").await.unwrap();
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let subject = "atomic:token-written-resource";
+        let doc = AtomicLoroDoc::new();
+        doc.set_property(crate::urls::NAME, &crate::Value::String("x".into()))
+            .unwrap();
+        let frame = protocol::encode_sync_push(&drive, &[(subject, &doc.export_snapshot())], true);
+        let push = protocol::decode_sync_push(&frame[1..]).unwrap();
+
+        for trust_owned in [false, true] {
+            assert!(
+                engine::import_sync_push(&push, &db, &token(&alice, &drive), trust_owned)
+                    .await
+                    .is_err(),
+                "trust_owned={trust_owned}"
+            );
+        }
+        assert!(db
+            .kv
+            .get(Tree::LoroSnapshots, subject.as_bytes())
+            .unwrap()
+            .is_none());
+        // The same push by the agent itself is admitted: the refusal is
+        // about the token, not the data.
+        assert!(
+            engine::import_sync_push(&push, &db, &ForAgent::from(alice.clone()), false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_access_token_never_writes_a_drive_or_brings_one_in() {
+        let db = Db::init_temp("token_drive_admission").await.unwrap();
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let resource = crate::Storelike::get_resource(&db, &drive.as_str().into())
+            .await
+            .unwrap();
+        for trust_owned in [false, true] {
+            assert!(
+                !engine::may_accept_drive_write(
+                    &db,
+                    &resource,
+                    &token(&alice, &drive),
+                    trust_owned
+                )
+                .await
+            );
+        }
+        assert!(!engine::admit_unknown_drive(
+            &db,
+            "atomic:never-seen-drive",
+            &token(&alice, &drive)
+        ));
+        assert!(!crate::sync::policy::OpenPolicy
+            .may_enroll_drive("atomic:never-seen-drive", &token(&alice, &drive)));
+    }
+
+    #[tokio::test]
+    async fn a_blob_response_on_a_token_session_is_refused() {
+        let db = Db::init_temp("token_blob_response").await.unwrap();
+        let (alice, drive) = db.setup("Alice").await.unwrap();
+        let content = b"bytes a token holder wants stored";
+        let hash = blake3::hash(content);
+        db.note_pending_blob_request(*hash.as_bytes(), drive.clone());
+
+        let frame = protocol::encode_blob_response(hash.as_bytes(), content);
+        let mut agent = token(&alice, &drive);
+        let out = engine::handle_frame(&frame, &db, &mut agent).await;
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0], protocol::tag::ERROR);
+        assert!(db.kv.get(Tree::Blobs, hash.as_bytes()).unwrap().is_none());
     }
 }

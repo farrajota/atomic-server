@@ -744,3 +744,65 @@ async fn tokens_survive_a_restart() {
     .unwrap();
     assert_eq!(again.status(), StatusCode::CONFLICT);
 }
+
+/// Signed `AUTH`s run asynchronously. One that was spawned before a token
+/// `AUTH` and finishes after it must not leave the session with the token's
+/// identity but without the token's limits: here `AUTH {}` (fails), a token
+/// `AUTH`, and `AUTH {}` again, back to back. The session must stay a
+/// read-only token session that closes when the token is revoked.
+#[tokio::test]
+async fn racing_auth_frames_cannot_strip_a_token_sessions_limits() {
+    let f = fixture(start_server("tokens_ws_race")).await;
+    let minted = mint(&f, &[(&f.drive, "read")], 600, "n1").await;
+    let ws_url = f.base.replace("http://", "ws://") + "/ws";
+    let ws = WsClient::connect(&ws_url).await.unwrap();
+    let mut rx = ws.subscribe();
+
+    let failing_auth = vec![protocol::tag::AUTH, b'{', b'}'];
+    ws.send_binary(failing_auth.clone()).await.unwrap();
+    ws.send_binary(token_auth_frame(&token_of(&minted)))
+        .await
+        .unwrap();
+    ws.send_binary(failing_auth).await.unwrap();
+
+    // Two refusals and one AUTH_OK, in whatever order they complete.
+    let (mut errors, mut oks) = (0, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while errors < 2 || oks < 1 {
+            match rx.recv().await {
+                Ok(WsMessage::Error { .. }) => errors += 1,
+                Ok(WsMessage::Authenticated) => oks += 1,
+                Ok(_) => continue,
+                Err(e) => panic!("closed early: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("all three AUTH frames answered");
+
+    // Still a token session: a write frame hits the read-only gate.
+    ws.send_binary(protocol::encode_sync_push(
+        &f.drive,
+        &[(&f.doc_a, b"not a real snapshot".as_slice())],
+        true,
+    ))
+    .await
+    .unwrap();
+    let err = next_error(&mut rx).await;
+    assert!(err.contains("read-only"), "{err}");
+
+    let revoked = signed_v2(
+        reqwest::Method::DELETE,
+        &f.base,
+        &format!("/tokens/{}", id_of(&minted)),
+        b"",
+        &f.alice,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(3), ws.wait_closed())
+        .await
+        .expect("the session still closes when its token is revoked");
+}

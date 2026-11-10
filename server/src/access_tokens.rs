@@ -108,6 +108,7 @@ pub fn grant_of(record: &AccessTokenRecord) -> ForAgent {
                 })
             })
             .collect(),
+        expires_at: record.expires_at,
     })
 }
 

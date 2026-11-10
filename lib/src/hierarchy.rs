@@ -1507,6 +1507,7 @@ mod test {
                         right: *right,
                     })
                     .collect(),
+                expires_at: i64::MAX,
             })
         }
 

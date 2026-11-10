@@ -120,7 +120,11 @@ impl SyncPolicy for OpenPolicy {
     /// onto an open node; AUTH-before-SYNC closed the wire, and this closes
     /// the library path.
     fn may_enroll_drive(&self, _drive_subject: &str, agent: &crate::agents::ForAgent) -> bool {
-        !matches!(agent, crate::agents::ForAgent::Public)
+        // Nor does an access token, which is read-only.
+        !matches!(
+            agent,
+            crate::agents::ForAgent::Public | crate::agents::ForAgent::Token(_)
+        )
     }
 }
 

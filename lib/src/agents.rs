@@ -42,6 +42,9 @@ pub struct TokenGrant {
     /// The agent the token was minted for.
     pub agent: crate::Subject,
     pub scopes: Vec<TokenScope>,
+    /// Unix ms from which the token is refused. Carried here so whoever
+    /// holds the identity (a WebSocket session) holds its end too.
+    pub expires_at: i64,
 }
 
 /// One scope of an access token: `right` on `target` and its descendants.
