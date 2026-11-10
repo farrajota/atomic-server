@@ -285,17 +285,17 @@ async fn a_tampered_body_does_not_mint() {
 
 #[tokio::test]
 async fn mint_requests_are_validated() {
-    let port = start_server_with_args("tokens_validate", &["--access-token-max-ttl", "120"]);
+    let port = start_server_with_args("tokens_validate", &["--access-token-max-ttl", "300"]);
     let f = fixture(port).await;
     let post = |body: Vec<u8>| {
         signed_v2(reqwest::Method::POST, &f.base, "/tokens", &body, &f.alice).send()
     };
 
-    let over_cap = post(mint_body(&[(&f.drive, "read")], 121, "n1"))
+    let over_cap = post(mint_body(&[(&f.drive, "read")], 301, "n1"))
         .await
         .unwrap();
     assert_eq!(over_cap.status(), StatusCode::BAD_REQUEST);
-    assert!(over_cap.text().await.unwrap().contains("120"));
+    assert!(over_cap.text().await.unwrap().contains("300"));
 
     let no_scopes = post(mint_body(&[], 60, "n2")).await.unwrap();
     assert_eq!(no_scopes.status(), StatusCode::BAD_REQUEST);
@@ -313,7 +313,7 @@ async fn mint_requests_are_validated() {
         .unwrap();
     assert_eq!(bad_right.status(), StatusCode::BAD_REQUEST);
 
-    let at_cap = post(mint_body(&[(&f.drive, "read")], 120, "n4"))
+    let at_cap = post(mint_body(&[(&f.drive, "read")], 300, "n4"))
         .await
         .unwrap();
     assert_eq!(at_cap.status(), StatusCode::CREATED);
@@ -346,7 +346,16 @@ async fn listing_shows_label_and_nonce_and_never_a_token() {
     let minted = mint(&f, &[(&f.drive, "read")], 600, "list-nonce").await;
     let token = token_of(&minted);
 
-    let resp = signed_v1(reqwest::Method::GET, &f.base, "/tokens", &f.alice)
+    let v1 = signed_v1(reqwest::Method::GET, &f.base, "/tokens", &f.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        v1.status(),
+        StatusCode::UNAUTHORIZED,
+        "listing needs a v2 signature"
+    );
+    let resp = signed_v2(reqwest::Method::GET, &f.base, "/tokens", b"", &f.alice)
         .send()
         .await
         .unwrap();
@@ -379,7 +388,7 @@ async fn listing_shows_label_and_nonce_and_never_a_token() {
         .new_agent("Bob")
         .await
         .unwrap();
-    let as_bob: Vec<Json> = signed_v1(reqwest::Method::GET, &f.base, "/tokens", &bob)
+    let as_bob: Vec<Json> = signed_v2(reqwest::Method::GET, &f.base, "/tokens", b"", &bob)
         .send()
         .await
         .unwrap()
@@ -813,4 +822,145 @@ async fn racing_auth_frames_cannot_strip_a_token_sessions_limits() {
     tokio::time::timeout(Duration::from_secs(3), ws.wait_closed())
         .await
         .expect("the session still closes when its token is revoked");
+}
+
+/// A token only narrows: its agent must already read every target it names
+/// when the token is minted. Otherwise any keypair could make the node store
+/// tokens for subjects it has nothing to do with.
+#[tokio::test]
+async fn minting_needs_read_on_every_target() {
+    let f = fixture(start_server("tokens_mint_read")).await;
+    let bob = Client::new(&f.base)
+        .await
+        .unwrap()
+        .new_agent("Bob")
+        .await
+        .unwrap();
+    let post = |agent: &Agent, scopes: &[(&str, &str)], nonce: &str| {
+        signed_v2(
+            reqwest::Method::POST,
+            &f.base,
+            "/tokens",
+            &mint_body(scopes, 60, nonce),
+            agent,
+        )
+        .send()
+    };
+
+    let foreign = post(&bob, &[(&f.drive, "read")], "n1").await.unwrap();
+    assert_eq!(
+        foreign.status(),
+        StatusCode::FORBIDDEN,
+        "Bob cannot read Alice's drive"
+    );
+    let mixed = post(
+        &f.alice,
+        &[(&f.drive, "read"), ("atomic:no-such-resource", "read")],
+        "n2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mixed.status(),
+        StatusCode::FORBIDDEN,
+        "one unknown target refuses all"
+    );
+    let own = post(&f.alice, &[(&f.folder_a, "read")], "n3")
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::CREATED);
+}
+
+/// Every signed `/tokens` request is good once. A captured request that was
+/// refused (here 403, as it would be for 429 or 5xx) cannot be sent again
+/// later to mint after all; the client signs a new one instead.
+#[tokio::test]
+async fn a_signed_tokens_request_is_accepted_once() {
+    let f = fixture(start_server("tokens_proof_once")).await;
+    let bob_client = Client::new(&f.base).await.unwrap();
+    let bob = bob_client.new_agent("Bob").await.unwrap();
+    let body = mint_body(&[(&f.drive, "read")], 60, "n1");
+    let url = format!("{}/tokens", f.base);
+    let headers = get_authentication_headers_v2("POST", &url, &body, &bob).unwrap();
+    let send = || {
+        let mut req = http().post(&url).body(body.clone());
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+        req.send()
+    };
+
+    assert_eq!(send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    let mut drive = f.client.get_resource(&f.drive).await.unwrap();
+    drive
+        .set_unsafe(
+            urls::READ.into(),
+            Value::ResourceArray(vec![
+                f.alice.subject.to_string().into(),
+                bob.subject.to_string().into(),
+            ]),
+        )
+        .unwrap();
+    drive.save_remote(f.client.store()).await.unwrap();
+
+    let replayed = send().await.unwrap();
+    assert_eq!(
+        replayed.status(),
+        StatusCode::UNAUTHORIZED,
+        "the same proof again"
+    );
+    let fresh = signed_v2(reqwest::Method::POST, &f.base, "/tokens", &body, &bob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.status(),
+        StatusCode::CREATED,
+        "a freshly signed request"
+    );
+}
+
+/// The mint budget belongs to the agent, not to how its subject is spelled:
+/// `did:ad:agent:` and `atomic:agent:` are one key.
+#[tokio::test]
+async fn both_spellings_of_an_agent_share_one_mint_budget() {
+    let port = start_server_with_args("tokens_rate_spelling", &["--write-rate-limit", "2"]);
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let bob = Client::new(&base)
+        .await
+        .unwrap()
+        .new_agent("Bob")
+        .await
+        .unwrap();
+    let canonical = bob.subject.to_string().replace("did:ad:", "atomic:");
+    let legacy = canonical.replace("atomic:", "did:ad:");
+    let mint_as = |spelling: &str, nonce: &str| {
+        // Bob's own agent resource: anyone may read it.
+        let body = mint_body(&[(&canonical, "read")], 60, nonce);
+        let url = format!("{base}/tokens");
+        let mut req = http().post(&url).body(body.clone());
+        for (k, v) in get_authentication_headers_v2("POST", &url, &body, &bob).unwrap() {
+            let v = if k == "x-atomic-agent" {
+                spelling.to_string()
+            } else {
+                v
+            };
+            req = req.header(k, v);
+        }
+        req.send()
+    };
+
+    assert_eq!(
+        mint_as(&legacy, "n1").await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        mint_as(&legacy, "n2").await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        mint_as(&canonical, "n3").await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }

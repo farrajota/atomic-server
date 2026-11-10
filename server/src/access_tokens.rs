@@ -40,16 +40,47 @@ pub const TOKEN_PREFIX: &str = "atk_";
 /// longest lease the OpenBao plugin hands out.
 pub const DEFAULT_MAX_TTL_SECONDS: u64 = 25 * 60 * 60;
 
-/// Bounds on what a mint request may carry.
+/// The smallest `--access-token-max-ttl` a node accepts: as long as a signed
+/// request stays acceptable (`AUTH_MAX_AGE_MS`), so records and their nonces
+/// are never dropped while the request that minted them could still verify.
+pub const MIN_MAX_TTL_SECONDS: u64 = 300;
+
+/// Bounds on what a mint request may carry. Together they bound one record
+/// to a few kilobytes.
 const MAX_SCOPES: usize = 32;
-const MAX_TARGET_LEN: usize = 2048;
+const MAX_TARGET_LEN: usize = 512;
 const MAX_LABEL_LEN: usize = 256;
 const MAX_NONCE_LEN: usize = 128;
 
-/// Serializes mints and revokes, so two requests with the same nonce cannot
-/// both pass the duplicate check. One process owns the store, so a process
-/// lock is enough.
+/// How many records one agent may have retained at once: live, revoked or
+/// expired but still kept for its nonce. Bounds what one key can make this
+/// node store. A plugin minting one token per lease keeps every token for the
+/// retention window (the TTL cap), so this allows a busy day of leases.
+pub const MAX_TOKENS_PER_AGENT: usize = 200;
+
+/// How far ahead of this server's clock a signed request's timestamp may be
+/// (`atomic_lib::authentication` accepts 10 s).
+const PROOF_CLOCK_SKEW_MS: i64 = 10_000;
+
+/// Serializes mints, revokes and used-proof records, so two requests with the
+/// same nonce or the same signature cannot both pass their check. One process
+/// owns the store, so a process lock is enough. Only taken off the actix
+/// workers (`web::block` in the handlers).
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// How long a record, and with it its nonce, is kept after it was minted: the
+/// TTL cap, and never less than a signed request stays acceptable.
+pub fn retention_ms(max_ttl_seconds: u64) -> i64 {
+    (max_ttl_seconds as i64)
+        .saturating_mul(1000)
+        .max(atomic_lib::authentication::AUTH_MAX_AGE_MS + PROOF_CLOCK_SKEW_MS)
+}
+
+fn lock() -> AtomicServerResult<std::sync::MutexGuard<'static, ()>> {
+    WRITE_LOCK
+        .lock()
+        .map_err(|_| "access token lock poisoned".to_string().into())
+}
 
 /// Lower-case hex SHA-256 of the whole token string. A token is 256 random
 /// bits, so a plain hash is enough; there is nothing to brute-force.
@@ -87,7 +118,7 @@ fn parse_right(right: &str) -> Option<Right> {
 
 /// The canonical spelling of an agent subject: `atomic:agent:…`, also for a
 /// legacy `did:ad:agent:` or `https://host/agents/…` subject.
-fn canonical_agent(agent: &Subject) -> String {
+pub fn canonical_agent(agent: &Subject) -> String {
     atomic_lib::identifiers::canonicalize_scheme(&atomic_lib::agents::migrate_legacy_agent_subject(
         agent.as_str(),
     ))
@@ -201,7 +232,7 @@ pub enum MintOutcome {
     Duplicate(AccessTokenRecord),
 }
 
-fn validate(request: &MintRequest, max_ttl_seconds: u64) -> AtomicServerResult<()> {
+pub fn validate(request: &MintRequest, max_ttl_seconds: u64) -> AtomicServerResult<()> {
     let bad = |m: String| Err(AtomicServerError::bad_request(m));
     if request.ttl_seconds < 1 {
         return bad("ttl_seconds must be at least 1".into());
@@ -239,12 +270,16 @@ fn validate(request: &MintRequest, max_ttl_seconds: u64) -> AtomicServerResult<(
     if request.nonce.is_empty() || request.nonce.len() > MAX_NONCE_LEN {
         return bad(format!("nonce must be 1 to {MAX_NONCE_LEN} bytes"));
     }
+    if request.nonce.chars().any(char::is_control) {
+        return bad("nonce must not contain control characters".into());
+    }
     Ok(())
 }
 
 /// Mint a token for `agent`, or find the one this agent already minted with
-/// the same nonce within the TTL cap. Also drops records nobody can use or
-/// match a nonce against any more.
+/// the same nonce while it is retained. Drops what is past its retention
+/// first. Blocks on the store: call it off the actix workers. The caller has
+/// checked that `agent` may read every target.
 pub fn mint(
     store: &Db,
     agent: &Subject,
@@ -254,26 +289,21 @@ pub fn mint(
     validate(request, max_ttl_seconds)?;
     let agent = canonical_agent(agent);
     let now = atomic_lib::utils::now();
-    let cap_ms = (max_ttl_seconds as i64).saturating_mul(1000);
 
-    let _guard = WRITE_LOCK
-        .lock()
-        .map_err(|_| "access token lock poisoned")?;
-    let mut duplicate = None;
-    for record in store.all_access_tokens()? {
-        // Kept until the cap has passed since it was minted, so a retried
-        // mint with the same nonce is recognised for as long as the token it
-        // made could have lived.
-        if now >= record.expires_at && now >= record.created_at.saturating_add(cap_ms) {
-            store.remove_access_token(&record)?;
-            continue;
-        }
-        if record.agent == agent && record.nonce == request.nonce {
-            duplicate = Some(record);
-        }
-    }
-    if let Some(record) = duplicate {
+    let _guard = lock()?;
+    store.prune_access_tokens(now)?;
+    if let Some(record) = store.get_access_token_by_nonce(&agent, &request.nonce)? {
         return Ok(MintOutcome::Duplicate(record));
+    }
+    let held = store.access_tokens_of(&agent)?.len();
+    if held >= MAX_TOKENS_PER_AGENT {
+        return Err(AtomicServerError {
+            message: format!(
+                "{agent} already holds {held} access token records (live, or kept for their nonce); at most {MAX_TOKENS_PER_AGENT}. Revoked and expired ones are dropped when their retention ends."
+            ),
+            error_type: crate::errors::AppErrorType::TooManyRequests,
+            error_resource: None,
+        });
     }
 
     let token = format!(
@@ -297,31 +327,49 @@ pub fn mint(
         created_at: now,
         expires_at: now.saturating_add(request.ttl_seconds.saturating_mul(1000)),
         revoked_at: None,
+        retain_until: now.saturating_add(retention_ms(max_ttl_seconds)),
     };
+    // One batch: the record, its hash and its nonce land together or not at
+    // all, so a retried request never finds half a mint.
     store.put_access_token(&record)?;
     Ok(MintOutcome::Created { record, token })
 }
 
-/// The live tokens of `agent`, oldest first.
+/// Use up a signed `/tokens` request: the same signature is refused for as
+/// long as it could still verify, whatever happened to the request the first
+/// time (minted, refused, rate limited, failed). Blocks on the store.
+pub fn consume_proof(store: &Db, signature: &str, timestamp: i64) -> AtomicServerResult<()> {
+    let _guard = lock()?;
+    store.prune_access_tokens(atomic_lib::utils::now())?;
+    let retain_until =
+        timestamp.saturating_add(atomic_lib::authentication::AUTH_MAX_AGE_MS + PROOF_CLOCK_SKEW_MS);
+    if store.consume_access_token_proof(&hash_token(signature), retain_until)? {
+        Ok(())
+    } else {
+        Err(AtomicError::unauthorized(
+            "This signed request was already used; sign a new one".to_string(),
+        )
+        .into())
+    }
+}
+
+/// The live tokens of `agent`, oldest first. Blocks on the store.
 pub fn list(store: &Db, agent: &Subject) -> AtomicServerResult<Vec<AccessTokenRecord>> {
-    let agent = canonical_agent(agent);
     let now = atomic_lib::utils::now();
     let mut records: Vec<_> = store
-        .all_access_tokens()?
+        .access_tokens_of(&canonical_agent(agent))?
         .into_iter()
-        .filter(|r| r.agent == agent && r.is_live(now))
+        .filter(|r| r.is_live(now))
         .collect();
     records.sort_by(|a, b| (a.created_at, &a.token_id).cmp(&(b.created_at, &b.token_id)));
     Ok(records)
 }
 
 /// Revoke the live token `token_id` of `agent`. `false` when there is none:
-/// unknown, someone else's, already revoked or expired.
+/// unknown, someone else's, already revoked or expired. Blocks on the store.
 pub fn revoke(store: &Db, agent: &Subject, token_id: &str) -> AtomicServerResult<bool> {
     let agent = canonical_agent(agent);
-    let _guard = WRITE_LOCK
-        .lock()
-        .map_err(|_| "access token lock poisoned")?;
+    let _guard = lock()?;
     let now = atomic_lib::utils::now();
     match store.get_access_token(token_id)? {
         Some(mut record) if record.agent == agent && record.is_live(now) => {
@@ -538,11 +586,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_past_the_cap_are_dropped_on_the_next_mint() {
+    async fn records_past_their_retention_are_pruned_on_the_next_mint() {
         let store = store("prune").await;
         let (mut old, _) = created(mint(&store, &agent(), &request("old", 60), 3600).unwrap());
+        // Rewritten in place: the record moves to an earlier retention.
+        store.remove_access_token(&old).unwrap();
         old.created_at -= 3_600_001;
         old.expires_at = old.created_at + 60_000;
+        old.retain_until = old.created_at + 3_600_000;
         store.put_access_token(&old).unwrap();
 
         created(mint(&store, &agent(), &request("new", 60), 3600).unwrap());
@@ -552,6 +603,81 @@ mod tests {
             mint(&store, &agent(), &request("old", 60), 3600).unwrap(),
             MintOutcome::Created { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn records_are_kept_for_the_cap_and_at_least_the_proof_window() {
+        let store = store("retention").await;
+        let (record, _) = created(mint(&store, &agent(), &request("n1", 60), 3600).unwrap());
+        assert_eq!(record.retain_until, record.created_at + 3_600_000);
+        // A cap shorter than a signed proof lives would let a proof outlive
+        // the nonce it minted; retention never goes below the proof window.
+        let window = atomic_lib::authentication::AUTH_MAX_AGE_MS;
+        assert!(retention_ms(MIN_MAX_TTL_SECONDS) > window);
+        assert!(retention_ms(1) > window);
+    }
+
+    #[tokio::test]
+    async fn a_target_longer_than_512_bytes_is_refused() {
+        let store = store("long_target").await;
+        let mut r = request("n1", 60);
+        r.scopes[0].target = format!("atomic:{}", "a".repeat(506));
+        assert_eq!(r.scopes[0].target.len(), 513);
+        assert!(mint(&store, &agent(), &r, 3600).is_err());
+        r.scopes[0].target.pop();
+        assert!(mint(&store, &agent(), &r, 3600).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_nonce_with_control_characters_is_refused() {
+        let store = store("nonce_ctrl").await;
+        assert!(mint(&store, &agent(), &request("a\0b", 60), 3600).is_err());
+        assert!(mint(&store, &agent(), &request("a\nb", 60), 3600).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_agent_holds_a_bounded_number_of_tokens() {
+        let store = store("per_agent_cap").await;
+        for n in 0..MAX_TOKENS_PER_AGENT {
+            created(mint(&store, &agent(), &request(&format!("n{n}"), 60), 3600).unwrap());
+        }
+        let err = mint(&store, &agent(), &request("one-more", 60), 3600)
+            .err()
+            .expect("over the per-agent cap");
+        assert!(
+            matches!(err.error_type, crate::errors::AppErrorType::TooManyRequests),
+            "{}",
+            err.message
+        );
+        // Revoked tokens still count until they are pruned: revoking is not
+        // a way around the bound on what one key makes this node store.
+        let first = store.access_tokens_of(&canonical_agent(&agent())).unwrap()[0].clone();
+        assert!(revoke(&store, &agent(), &first.token_id).unwrap());
+        assert!(mint(&store, &agent(), &request("still-over", 60), 3600).is_err());
+        // Another agent is not affected.
+        let other: Subject = "atomic:agent:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert!(mint(&store, &other, &request("n0", 60), 3600).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_signed_request_is_accepted_once() {
+        let store = store("proof_once").await;
+        let now = atomic_lib::utils::now();
+        consume_proof(&store, "signature-a", now).unwrap();
+        let err = consume_proof(&store, "signature-a", now).expect_err("a replayed proof");
+        assert!(err.message.contains("already used"), "{}", err.message);
+        consume_proof(&store, "signature-b", now).unwrap();
+    }
+
+    #[test]
+    fn the_max_ttl_option_cannot_be_below_the_proof_window() {
+        use clap::Parser;
+        let parse = |ttl: &str| {
+            crate::config::Opts::try_parse_from(["atomic-server", "--access-token-max-ttl", ttl])
+        };
+        assert!(parse("299").is_err());
+        assert!(parse("300").is_ok());
+        assert_eq!(MIN_MAX_TTL_SECONDS, 300);
     }
 
     #[test]

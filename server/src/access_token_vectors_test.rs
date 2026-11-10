@@ -112,12 +112,90 @@ async fn the_server_rebuilds_the_signed_url_behind_forwarded_headers() {
             .insert_header(("X-Forwarded-Host", "atomic.zay.home"))
             .insert_header(("X-Forwarded-Proto", "https"))
             .to_http_request();
-        let context = crate::context::RequestContext::new(&req, &appstate);
         assert_eq!(
-            context.signed_subject(&req).unwrap(),
+            crate::handlers::access_tokens::signed_url(&req, &appstate).unwrap(),
             vector.url,
             "{}",
             vector.name
         );
     }
+}
+
+/// On `/tokens` the signed URL is bound to the host this node is configured
+/// for. Loopback names are trusted elsewhere (`host_is_served_here`), so a
+/// mint signed for `http://localhost:9883/tokens` on a laptop could otherwise
+/// be replayed to a production node of the same agent.
+#[actix_rt::test]
+async fn a_tokens_request_signed_for_another_host_is_refused() {
+    use actix_web::{test, web::Data, App};
+    use atomic_lib::Storelike;
+
+    let appstate = crate::tests::init_test_appstate(&["--domain", "atomic.zay.home"]).await;
+    atomic_lib::test_utils::setup_test_env(&appstate.store)
+        .await
+        .unwrap();
+    let signer = appstate.store.get_default_agent().unwrap();
+    let drive = appstate
+        .store
+        .get_drive_did("localhost")
+        .await
+        .unwrap()
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(Data::new(appstate.clone()))
+            .configure(crate::routes::config_routes),
+    )
+    .await;
+    let body = |nonce: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "ttl_seconds": 60,
+            "scopes": [{"target": drive.to_string(), "right": "read"}],
+            "nonce": nonce,
+        }))
+        .unwrap()
+    };
+    let request = |signed_url: &str, host: &str, forwarded: bool, body: Vec<u8>| {
+        let mut req = test::TestRequest::post()
+            .uri("/tokens")
+            .insert_header(("Host", host))
+            .set_payload(body.clone());
+        if forwarded {
+            req = req
+                .insert_header(("X-Forwarded-Host", "atomic.zay.home"))
+                .insert_header(("X-Forwarded-Proto", "https"));
+        }
+        for header in atomic_lib::client::helpers::get_authentication_headers_v2(
+            "POST", signed_url, &body, &signer,
+        )
+        .unwrap()
+        {
+            req = req.insert_header(header);
+        }
+        req.to_request()
+    };
+
+    let replayed = test::call_service(
+        &app,
+        request(
+            "http://localhost:9883/tokens",
+            "localhost:9883",
+            false,
+            body("n1"),
+        ),
+    )
+    .await;
+    assert_eq!(replayed.status(), 401, "signed for another host");
+
+    let configured = test::call_service(
+        &app,
+        request(
+            "https://atomic.zay.home/tokens",
+            "atomic-server.home-lab.svc.cluster.local:9883",
+            true,
+            body("n2"),
+        ),
+    )
+    .await;
+    assert_eq!(configured.status(), 201, "signed for this node's own host");
 }

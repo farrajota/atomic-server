@@ -17,6 +17,8 @@ pub enum AppErrorType {
     BadRequest,
     /// Current state conflicts with the requested revision; rendered as 409.
     Conflict,
+    /// The caller is known and may not do this; rendered as 403.
+    Forbidden,
     /// A write refused by `crate::rate_limit`; rendered as `429` with `Retry-After`.
     TooManyRequests,
     /// The node is over its hard commit limit; rendered as `503` with
@@ -81,6 +83,7 @@ impl ResponseError for AtomicServerError {
             AppErrorType::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             AppErrorType::BadRequest => StatusCode::BAD_REQUEST,
             AppErrorType::Conflict => StatusCode::CONFLICT,
+            AppErrorType::Forbidden => StatusCode::FORBIDDEN,
             AppErrorType::Other => StatusCode::INTERNAL_SERVER_ERROR,
             AppErrorType::Unauthorized => StatusCode::UNAUTHORIZED,
             AppErrorType::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,

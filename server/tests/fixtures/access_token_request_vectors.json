@@ -8,7 +8,7 @@
     "x-atomic-agent": "agent",
     "x-atomic-timestamp": "timestamp",
     "x-atomic-signature": "signature",
-    "x-atomic-signature-version": "2 for version 2 vectors, absent for version 1"
+    "x-atomic-signature-version": "2 (every /tokens request must be version 2)"
   },
   "vectors": [
     {
@@ -34,15 +34,15 @@
       "signature": "G4EeN1YIV2IBcLvvQ89TUcXSICthuU8ZfLhXjL58Ryj4R7rWdrwFOupsZyjEtyNMK_Hq1B3WHqaidcdKfTjBDA"
     },
     {
-      "name": "list_get_v1",
-      "version": 1,
+      "name": "list_get_v2",
+      "version": 2,
       "method": "GET",
       "url": "https://atomic.zay.home/tokens",
       "timestamp": 1794000000000,
       "body": "",
       "body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "message": "https://atomic.zay.home/tokens 1794000000000",
-      "signature": "O40t3Y2NZwh6WWRmxh_XyaGA-bgwSmw2ZWguOeblpReAnMBiUmXH45Vi5pBsoTOk5nVFitABwcZx2h80uK-qDA"
+      "message": "atomic-request-v2\nGET\nhttps://atomic.zay.home/tokens\n1794000000000\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "tKpyuKkpYebcXEJK9wTPpcUUzMQx1YE8TTg7gbMEq6owaZM71rX78rbTffzYqvt9APlu6GcVWxL7jhxOjhVZAg"
     }
   ]
 }

@@ -41,11 +41,31 @@ The `atk_` prefix tells the two apart.
 
 All bodies are JSON. Times are Unix milliseconds.
 
+### Signed requests
+
+`POST /tokens`, `GET /tokens` and a key-signed `DELETE /tokens/{id}` must be
+signed by the agent's own key with a **version 2** request signature
+(`x-atomic-signature-version: 2`), which covers the method and the body.
+Version 1 proofs, cookies and bearer tokens are refused with 401. On top of the
+usual checks:
+
+- **Bound to this node's host.** The URL the signature must cover uses the host
+  the node is configured for (`--domain`, or the host of `--server-url`), with
+  the port and scheme of the request (`X-Forwarded-Proto` honoured). Behind a
+  proxy, send `X-Forwarded-Host` with that host. A request for any other host,
+  including `localhost` and served-domain-suffix names that other endpoints
+  accept, is checked against the configured origin and fails. So a request
+  signed for a laptop's `http://localhost:9883/tokens` cannot be replayed to a
+  production node of the same agent.
+- **Good once.** The server records each accepted signature until it could no
+  longer verify (its timestamp plus 5 minutes and 10 seconds). The same signed
+  request sent again gets 401 ("already used"), whatever happened to it the
+  first time: minted, refused, rate limited or failed. Sign a new request to
+  retry.
+
 ### `POST /tokens`: mint
 
-The request must be signed by the agent's own key with a **version 2** request
-signature (`x-atomic-signature-version: 2`), which covers the method and the
-body. Version 1, cookies and bearer tokens are refused with 401.
+Signed as above.
 
 ```json
 {
@@ -57,12 +77,22 @@ body. Version 1, cookies and bearer tokens are refused with 401.
 ```
 
 - `ttl_seconds`: from 1 up to the server maximum (`--access-token-max-ttl`,
-  env `ATOMIC_ACCESS_TOKEN_MAX_TTL`, default 90000 = 25 h). A larger value is
-  refused with 400. It is not shortened.
+  env `ATOMIC_ACCESS_TOKEN_MAX_TTL`, default 90000 = 25 h, at least 300). A
+  larger value is refused with 400. It is not shortened.
 - `scopes`: 1 to 32 entries. `right` must be `read`; `write`, `append` or
-  anything else is refused with 400. An empty list is refused with 400. Targets are stored with the `atomic:` scheme.
+  anything else is refused with 400. An empty list is refused with 400. A
+  target is at most 512 bytes. Targets are stored with the `atomic:` scheme.
 - `label`: optional, up to 256 bytes.
-- `nonce`: required, 1 to 128 bytes.
+- `nonce`: required, 1 to 128 bytes, no control characters.
+
+**403 Forbidden** unless the agent can read every target now. A token only
+narrows rights its agent holds, so a target it cannot read, one that does not
+exist on this node, or one hosted elsewhere refuses the whole request.
+
+**429 Too Many Requests** when the agent already has 200 retained token records
+(live, or revoked and expired ones still kept for their nonce, see below), or
+when the agent's write rate budget is spent. The budget is keyed on the agent's
+canonical spelling, so `did:ad:agent:…` and `atomic:agent:…` share it.
 
 **201 Created**:
 
@@ -83,8 +113,10 @@ This is the only time the token value is ever returned. `expires_at` is
 `created_at + ttl_seconds * 1000`. From that instant on the token is refused.
 
 **409 Conflict**: the agent already minted a token with this `nonce`. A token
-counts here until the TTL cap has passed since it was minted, whether it is
-still live, revoked or expired. The body is the earlier token's view (as for
+counts here for as long as it is retained (`created_at` plus the TTL cap, and
+never less than 5 minutes and 10 seconds), whether it is still live, revoked
+or expired. The nonce is written in the same batch as the token, so a mint
+either happened with its nonce or not at all. The body is the earlier token's view (as for
 `GET /tokens/self`) plus an `error` string. It never includes the token value,
 which is not stored. So a retried mint cannot create a second token.
 
@@ -96,7 +128,7 @@ which is not stored. So a retried mint cannot create a second token.
 
 ### `GET /tokens`: list
 
-Signed by the agent's key, with version 1 or 2. A bearer token gets 401.
+Signed as above. A bearer token gets 401.
 **200** with an array of the agent's **live** tokens, oldest first. Each entry is
 the same view as `/tokens/self`. Token values are never included. Revoked and
 expired tokens are not listed.
@@ -105,7 +137,7 @@ expired tokens are not listed.
 
 Either:
 
-- signed by the token's agent with a version 2 signature (empty body), or
+- signed by the token's agent as above (empty body), or
 - `Authorization: Bearer` with the token itself. A token can only revoke
   itself.
 
@@ -161,5 +193,27 @@ export (`POST /recovery/export`, a bundle of selected resources and their Loro
 state): a token is not a resource. An agent that
 needs tokens on a restored node mints new ones.
 
-Records are dropped when the TTL cap has passed since they were minted and they
-have expired. That happens on the next mint.
+A record is kept until `created_at` plus the TTL cap (at least 5 minutes and
+10 seconds), then dropped by the next mint or signed request, which read only
+the expired part of an expiry-ordered index. Mints, revokes and used-signature
+records are serialized by one lock and run on actix's blocking pool, not on
+the workers that serve requests.
+
+## Known costs and limits
+
+- **Uncached rights walks.** A rights check through a token runs the agent's
+  check and the scope walk without the per-request rights cache (the cache
+  holds one agent's verdicts, and this check asks as two). A large `/query`
+  through a token walks more parents than the same query signed by the key.
+- **What other code sees.** A token's identity displays as
+  `urn:atomic-access-token:<token_id>`, not as its agent. Code that reads the
+  agent as a string sees that pseudo-subject, for example WASM class
+  extenders. It is in no ACL, so such code grants it nothing.
+- **Earlier registrations on a reused socket.** A token `AUTH` on a socket
+  that already registered Loro-sync or presence subscriptions as a key-signed
+  agent re-checks its commit subscriptions (`SUB`) against the token, but keeps
+  those earlier Loro-sync and presence registrations. Open a new socket for a
+  token session.
+- **`/tokens` paths.** `/tokens`, `/tokens/self` and `/tokens/{id}` are routed
+  to these endpoints before resources, so a resource stored at one of those
+  paths can no longer be read by its path.
