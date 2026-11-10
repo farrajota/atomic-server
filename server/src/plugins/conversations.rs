@@ -55,6 +55,9 @@ fn handle_conversations_request<'a>(
 
         let agent = match for_agent {
             ForAgent::AgentSubject(agent) => agent.clone(),
+            // The token's agent; the query below runs as the token, so only
+            // conversations inside its scopes are listed.
+            ForAgent::Token(grant) => grant.agent.clone(),
             // Nobody is a member of anything when signed out.
             ForAgent::Public | ForAgent::Sudo => {
                 resource

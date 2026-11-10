@@ -74,6 +74,8 @@ Authorization: Bearer {base64 serialized Authentication Resource}
 
 In Data Browser, you can find the `token` tab in `/app/token` to create a token.
 
+A bearer value that starts with `atk_` is not such a proof but a server-issued [access token](access-tokens.md): narrowed, with an expiry, and accepted only for reads.
+
 ## Authenticating Websockets
 
 WebSockets use the binary-first protocol version 2 for authentication:

@@ -1,6 +1,7 @@
 //! Persistent, ACID compliant, threadsafe to-disk store.
 //! Powered by redb (sled only to migrate old stores).
 
+pub mod access_tokens;
 mod ai_chat_migration;
 #[cfg(test)]
 mod ai_chat_migration_test;

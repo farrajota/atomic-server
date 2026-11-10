@@ -37,6 +37,8 @@ fn is_node_admin(appstate: &AppState, for_agent: &ForAgent) -> bool {
     match for_agent {
         ForAgent::Sudo => true,
         ForAgent::Public => false,
+        // An access token is never the node's administrator.
+        ForAgent::Token(_) => false,
         ForAgent::AgentSubject(subject) => {
             let store = &appstate.store;
             let agent = store.normalize_subject(subject);

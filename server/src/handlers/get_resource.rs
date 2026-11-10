@@ -3,7 +3,7 @@ use crate::{
     content_types::get_accept,
     content_types::ContentType,
     errors::AtomicServerResult,
-    helpers::{get_client_agent, try_extension},
+    helpers::{get_client_agent_or_access_token, try_extension},
 };
 use actix_web::{web, HttpResponse};
 use atomic_lib::db::ResolvedTarget;
@@ -66,7 +66,7 @@ pub async fn handle_get_resource(
     } else {
         format!("{}/{}", origin, subject_string)
     };
-    let for_agent = get_client_agent(headers, &appstate, &full_url).await?;
+    let for_agent = get_client_agent_or_access_token(headers, &appstate, &full_url).await?;
     timer.add("get_agent");
 
     let resolved: ResolvedTarget = appstate

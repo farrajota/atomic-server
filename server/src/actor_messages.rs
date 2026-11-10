@@ -14,8 +14,9 @@ use std::sync::Arc;
 #[rtype(result = "()")]
 pub struct RebindAgent {
     pub addr: Addr<crate::handlers::web_sockets::WebSocketConnection>,
-    /// The new identity as a subject string (`ForAgent`'s `Display`).
-    pub agent: String,
+    /// The new identity. Kept whole, not as a string: an access token's
+    /// scopes would not survive the round trip.
+    pub agent: atomic_lib::agents::ForAgent,
 }
 
 /// A message containing a Resource, which should be sent to subscribers
@@ -139,7 +140,7 @@ pub struct Subscribe {
     /// The subject as it came off the wire (HTTP URL or DID). Drive
     /// fan-out is keyed by this raw string, so `UNSUB` must send the same.
     pub subject: String,
-    pub agent: String,
+    pub agent: atomic_lib::agents::ForAgent,
     /// Identifier of the originating WS connection. The commit monitor
     /// stores this alongside the subscriber address and skips broadcasts
     /// to subscribers whose `source_id` matches an event's `source_id`,

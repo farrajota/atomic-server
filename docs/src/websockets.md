@@ -368,6 +368,12 @@ the same frame changes nothing. Over WebSocket the socket stays open and the
 client may retry. On an Iroh stream the responder writes the error, finishes
 its half, and closes.
 
+**Access tokens (WebSocket only).** Instead of a signed proof, the payload may
+be `{"accessToken": "atk_..."}`. The session then acts as the token's agent,
+narrowed to its scopes, and is read-only. It closes with code 1008 when the
+token is revoked or expires. See [Access tokens](access-tokens.md). Iroh does
+not accept tokens.
+
 **Late AUTH.** `AUTH` is not restricted to the start of a connection. The
 WebSocket handler writes the proven identity back onto the connection actor
 and, when the identity changed, has the commit monitor re-evaluate every
@@ -376,6 +382,12 @@ subscription the connection holds against it (see
 agent that a mid-session `AUTH` upgrades, invalidating the per-connection
 drive-verdict cache so a `Public` verdict cached before the upgrade does not
 stick.
+
+On a WebSocket, a signed `AUTH` is verified off the connection actor, and the
+last `AUTH` sent decides the identity. A signed `AUTH` that verifies after a
+later `AUTH` (signed or access token) has arrived is not applied: it is
+answered with `ERROR` `AUTH_FAILED` and the message `Auth superseded by a
+later AUTH on this connection`. Send one `AUTH` and wait for its answer.
 
 **Iroh mutual auth.** After a successful `AUTH` the accept side writes, in
 order: `AUTH_OK`, its own `HELLO`, then an `AUTH` of its own back to the

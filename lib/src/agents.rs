@@ -27,7 +27,35 @@ pub enum ForAgent {
     /// Public Agent, most strict.
     /// See [urls::PUBLIC_AGENT]
     Public,
+    /// An agent acting through a server-issued access token, narrowed to the
+    /// token's scopes. See [TokenGrant] and `hierarchy::check_rights`.
+    Token(TokenGrant),
 }
+
+/// What an access token lets its bearer do: act as `agent`, but only within
+/// `scopes`. Rights are the intersection of the agent's current rights and
+/// the scopes, plus whatever the public agent may do anyway.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenGrant {
+    /// The server-side id of the token (not the secret).
+    pub token_id: String,
+    /// The agent the token was minted for.
+    pub agent: crate::Subject,
+    pub scopes: Vec<TokenScope>,
+    /// Unix ms from which the token is refused. Carried here so whoever
+    /// holds the identity (a WebSocket session) holds its end too.
+    pub expires_at: i64,
+}
+
+/// One scope of an access token: `right` on `target` and its descendants.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenScope {
+    pub target: String,
+    pub right: crate::hierarchy::Right,
+}
+
+/// The prefix of the pseudo-subject a [ForAgent::Token] displays as.
+pub const TOKEN_PSEUDO_SUBJECT_PREFIX: &str = "urn:atomic-access-token:";
 
 impl std::fmt::Display for ForAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +63,14 @@ impl std::fmt::Display for ForAgent {
             ForAgent::AgentSubject(subject) => write!(f, "{}", subject),
             ForAgent::Sudo => write!(f, "{}", urls::SUDO_AGENT),
             ForAgent::Public => write!(f, "{}", urls::PUBLIC_AGENT),
+            // Deliberately not the agent's subject. Code that turns an agent
+            // into a string and back (`ForAgent::from`) would otherwise
+            // rebuild the agent without its scopes, silently widening the
+            // token to everything the agent may do. This pseudo-subject is in
+            // no ACL, so such a round trip fails closed instead.
+            ForAgent::Token(grant) => {
+                write!(f, "{}{}", TOKEN_PSEUDO_SUBJECT_PREFIX, grant.token_id)
+            }
         }
     }
 }

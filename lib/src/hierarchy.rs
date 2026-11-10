@@ -11,7 +11,7 @@ type AsyncResult<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> 
 #[cfg(not(target_arch = "wasm32"))]
 type AsyncResult<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Right {
     /// Full read access to the resource and its children.
     /// [urls::READ]
@@ -518,6 +518,115 @@ fn check_agent_self_creation(
     )))
 }
 
+/// Rights of an access token ([ForAgent::Token]): its agent's current rights,
+/// but only where one of the token's scopes reaches, plus whatever the public
+/// agent may do anyway (the bearer could simply ask without the token).
+///
+/// Neither inner check gets the caller's [RightsCache]: that memo is keyed by
+/// subject only and must hold one agent's verdicts, and this check asks as
+/// two different agents.
+async fn check_token_rights<S: Storelike>(
+    store: &S,
+    resource: &Resource,
+    grant: &crate::agents::TokenGrant,
+    right: Right,
+) -> AtomicResult<String> {
+    // Access tokens are read-only (decision D17): no write or append through
+    // a token, whatever its scopes, its agent or the resource's own ACL say
+    // (a resource anyone may write included).
+    if right != Right::Read {
+        return Err(crate::errors::AtomicError::unauthorized(format!(
+            "Access token {} is read-only; {} needs the agent's own key",
+            grant.token_id, right
+        )));
+    }
+    if token_scopes_cover(store, resource, grant, right).await {
+        let agent = ForAgent::AgentSubject(grant.agent.clone());
+        if let Ok(reason) = check_rights_impl(store, resource, &agent, right, None).await {
+            return Ok(format!(
+                "{reason} (through access token {})",
+                grant.token_id
+            ));
+        }
+    }
+    check_rights_impl(store, resource, &ForAgent::Public, right, None)
+        .await
+        .map_err(|_| {
+            crate::errors::AtomicError::unauthorized(format!(
+                "Access token {} of {} has no {} right on {}: it is outside the token's scopes, or the agent itself lacks the right",
+                grant.token_id,
+                grant.agent,
+                right,
+                resource.get_subject()
+            ))
+        })
+}
+
+/// How far up the parent chain a scope check looks before giving up. Real
+/// trees are far shallower; the bound only stops a malformed cycle.
+const MAX_SCOPE_WALK: usize = 256;
+
+/// A subject in the one spelling scope matching compares: resolved against
+/// the store, query stripped, `atomic:` scheme.
+fn scope_key(store: &impl Storelike, raw: &str) -> String {
+    crate::identifiers::canonicalize_scheme(&store.normalize_subject(&raw.into()).pure_id())
+}
+
+/// Whether a scope that allows `needed` covers it: `write` covers every
+/// right (as a `write` ACL entry does), `read` and `append` only themselves.
+fn scope_allows(scope: Right, needed: Right) -> bool {
+    scope == Right::Write || scope == needed
+}
+
+/// Whether one of the token's scopes allowing `right` names `resource` or an
+/// ancestor of it, by the same `drive` stamp and `parent` walk as
+/// [check_rights_impl]. A Commit is covered where its target is.
+async fn token_scopes_cover<S: Storelike>(
+    store: &S,
+    resource: &Resource,
+    grant: &crate::agents::TokenGrant,
+    right: Right,
+) -> bool {
+    let targets: std::collections::HashSet<String> = grant
+        .scopes
+        .iter()
+        .filter(|scope| scope_allows(scope.right, right))
+        .map(|scope| scope_key(store, &scope.target))
+        .collect();
+    if targets.is_empty() {
+        return false;
+    }
+    let covers_here = |r: &Resource| {
+        targets.contains(&scope_key(store, r.get_subject().as_str()))
+            || r.get(urls::DRIVE_PROP)
+                .is_ok_and(|drive| targets.contains(&scope_key(store, &drive.to_string())))
+    };
+    let mut next = if let Ok(target) = resource.get(urls::SUBJECT) {
+        // A Commit: readable where its target is (see check_rights_impl).
+        Some(crate::Subject::from(target.to_string()))
+    } else if covers_here(resource) {
+        return true;
+    } else {
+        parent_of(resource)
+    };
+    for _ in 0..MAX_SCOPE_WALK {
+        let Some(subject) = next else { return false };
+        let Ok(current) = fetch_for_rights(store, &subject).await else {
+            return false;
+        };
+        if covers_here(&current) {
+            return true;
+        }
+        next = parent_of(&current);
+    }
+    false
+}
+
+fn parent_of(resource: &Resource) -> Option<crate::Subject> {
+    let parent = crate::Subject::from(resource.get(urls::PARENT).ok()?.to_string());
+    (&parent != resource.get_subject()).then_some(parent)
+}
+
 /// Recursively checks a Resource and its Parents for rights.
 /// Throws if not allowed.
 /// Returns string with explanation if allowed.
@@ -541,6 +650,9 @@ fn check_rights_impl<'a, S: Storelike>(
     Box::pin(async move {
         if for_agent_enum == &ForAgent::Sudo {
             return Ok("Sudo has root access, and can edit anything.".into());
+        }
+        if let ForAgent::Token(grant) = for_agent_enum {
+            return check_token_rights(store, resource, grant, right).await;
         }
         let for_agent = for_agent_enum.to_string();
         // Translated on this side too, so both operands of every comparison
@@ -1303,5 +1415,258 @@ mod test {
                 .contains(&super::MAX_BLOB_REFERENCES_CHECKED.to_string()),
             "the refusal says where it stopped: {err}"
         );
+    }
+
+    /// Access tokens (`ForAgent::Token`): the token acts as its agent, but
+    /// only within its scopes, and never beyond the agent's current rights.
+    mod access_token_narrowing {
+        use crate::agents::{ForAgent, TokenGrant, TokenScope};
+        use crate::hierarchy::{check_read, check_write, Right};
+        use crate::{Resource, Storelike, Subject, Value};
+
+        struct Fixture {
+            store: crate::Store,
+            drive: Subject,
+            folder_a: Subject,
+            doc_a: Subject,
+            doc_b: Subject,
+            public_doc: Subject,
+            reader: Subject,
+        }
+
+        async fn child(store: &crate::Store, parent: &Subject, public: bool) -> Subject {
+            let mut res = Resource::new("did:ad:placeholder".into());
+            res.set(
+                crate::urls::PARENT.into(),
+                Value::AtomicUrl(parent.clone()),
+                store,
+            )
+            .await
+            .unwrap();
+            if public {
+                res.set(
+                    crate::urls::READ.into(),
+                    Value::ResourceArray(vec![crate::urls::PUBLIC_AGENT.into()]),
+                    store,
+                )
+                .await
+                .unwrap();
+            }
+            res.save_as_genesis(store)
+                .await
+                .unwrap()
+                .resource_new
+                .unwrap()
+                .get_subject()
+                .clone()
+        }
+
+        /// A private drive owned by the node's agent, with folders A and B,
+        /// one document in each, and one public document in B. `reader` is
+        /// granted `rights` on the drive itself.
+        async fn fixture(rights: &str) -> Fixture {
+            let store = crate::Store::init().await.unwrap();
+            store.populate().await.unwrap();
+            let owner = store.create_agent(Some("owner")).await.unwrap();
+            store.set_default_agent(owner);
+            let drive = crate::test_utils::create_test_drive(&store).await.unwrap();
+            let folder_a = child(&store, &drive, false).await;
+            let folder_b = child(&store, &drive, false).await;
+            let doc_a = child(&store, &folder_a, false).await;
+            let doc_b = child(&store, &folder_b, false).await;
+            let public_doc = child(&store, &folder_b, true).await;
+            let reader = store.create_agent(Some("reader")).await.unwrap().subject;
+            set_drive_acl(&store, &drive, rights, vec![reader.clone()]).await;
+            Fixture {
+                store,
+                drive,
+                folder_a,
+                doc_a,
+                doc_b,
+                public_doc,
+                reader,
+            }
+        }
+
+        async fn set_drive_acl(
+            store: &crate::Store,
+            drive: &Subject,
+            right: &str,
+            agents: Vec<Subject>,
+        ) {
+            let mut res = store.get_resource(drive).await.unwrap();
+            res.set(
+                right.into(),
+                Value::ResourceArray(agents.into_iter().map(Into::into).collect()),
+                store,
+            )
+            .await
+            .unwrap();
+            res.save_locally(store).await.unwrap();
+        }
+
+        fn token(agent: &Subject, scopes: &[(&Subject, Right)]) -> ForAgent {
+            ForAgent::Token(TokenGrant {
+                token_id: "test-token".into(),
+                agent: agent.clone(),
+                scopes: scopes
+                    .iter()
+                    .map(|(target, right)| TokenScope {
+                        target: target.to_string(),
+                        right: *right,
+                    })
+                    .collect(),
+                expires_at: i64::MAX,
+            })
+        }
+
+        async fn can_read(f: &Fixture, subject: &Subject, agent: &ForAgent) -> bool {
+            let res = f.store.get_resource(subject).await.unwrap();
+            check_read(&f.store, &res, agent).await.is_ok()
+        }
+
+        async fn can_write(f: &Fixture, subject: &Subject, agent: &ForAgent) -> bool {
+            let res = f.store.get_resource(subject).await.unwrap();
+            check_write(&f.store, &res, agent).await.is_ok()
+        }
+
+        #[tokio::test]
+        async fn a_token_reads_its_scope_and_its_descendants() {
+            let f = fixture(crate::urls::READ).await;
+            let t = token(&f.reader, &[(&f.folder_a, Right::Read)]);
+            assert!(
+                can_read(&f, &f.folder_a, &t).await,
+                "the scope target itself"
+            );
+            assert!(
+                can_read(&f, &f.doc_a, &t).await,
+                "a child of the scope target"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_token_does_not_read_outside_its_scope_even_where_its_agent_may() {
+            let f = fixture(crate::urls::READ).await;
+            let agent = ForAgent::AgentSubject(f.reader.clone());
+            assert!(
+                can_read(&f, &f.doc_b, &agent).await,
+                "precondition: the agent may"
+            );
+            let t = token(&f.reader, &[(&f.folder_a, Right::Read)]);
+            assert!(
+                !can_read(&f, &f.doc_b, &t).await,
+                "a sibling folder's document"
+            );
+            assert!(
+                !can_read(&f, &f.drive, &t).await,
+                "the scope's own ancestor"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_scope_never_adds_a_right_the_agent_lacks() {
+            let f = fixture(crate::urls::READ).await;
+            let stranger = f
+                .store
+                .create_agent(Some("stranger"))
+                .await
+                .unwrap()
+                .subject;
+            let t = token(&stranger, &[(&f.drive, Right::Write)]);
+            assert!(!can_read(&f, &f.doc_a, &t).await);
+            assert!(!can_write(&f, &f.doc_a, &t).await);
+            // The reader may read but not write: a write scope does not make
+            // the token a writer.
+            let t = token(&f.reader, &[(&f.drive, Right::Write)]);
+            assert!(
+                can_read(&f, &f.doc_a, &t).await,
+                "a write scope covers read"
+            );
+            assert!(!can_write(&f, &f.doc_a, &t).await);
+        }
+
+        #[tokio::test]
+        async fn a_token_never_writes_whatever_its_scope() {
+            let f = fixture(crate::urls::WRITE).await;
+            let agent = ForAgent::AgentSubject(f.reader.clone());
+            assert!(
+                can_write(&f, &f.doc_a, &agent).await,
+                "precondition: the agent may"
+            );
+            let t = token(&f.reader, &[(&f.drive, Right::Read)]);
+            assert!(can_read(&f, &f.doc_a, &t).await);
+            assert!(!can_write(&f, &f.doc_a, &t).await);
+            // D17: tokens are read-only. Even a write scope held by a writer
+            // grants neither write nor append.
+            let t = token(&f.reader, &[(&f.drive, Right::Write)]);
+            assert!(!can_write(&f, &f.doc_a, &t).await);
+            let doc = f.store.get_resource(&f.doc_a).await.unwrap();
+            assert!(
+                crate::hierarchy::check_rights(&f.store, &doc, &t, Right::Append)
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn removing_the_agents_acl_right_removes_it_from_a_live_token() {
+            let f = fixture(crate::urls::READ).await;
+            let t = token(&f.reader, &[(&f.drive, Right::Read)]);
+            assert!(can_read(&f, &f.doc_a, &t).await);
+            set_drive_acl(&f.store, &f.drive, crate::urls::READ, vec![]).await;
+            assert!(!can_read(&f, &f.doc_a, &t).await);
+        }
+
+        #[tokio::test]
+        async fn a_token_reads_what_anyone_may_read() {
+            // The bearer could drop the token and ask anonymously, so refusing
+            // this would protect nothing.
+            let f = fixture(crate::urls::READ).await;
+            let t = token(&f.reader, &[(&f.folder_a, Right::Read)]);
+            assert!(can_read(&f, &f.public_doc, &t).await);
+            let empty = token(&f.reader, &[]);
+            assert!(
+                !can_read(&f, &f.doc_a, &empty).await,
+                "no scope, no private reads"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_publicly_writable_resource_is_not_writable_through_a_token() {
+            let f = fixture(crate::urls::READ).await;
+            let mut doc = f.store.get_resource(&f.public_doc).await.unwrap();
+            doc.set(
+                crate::urls::WRITE.into(),
+                Value::ResourceArray(vec![crate::urls::PUBLIC_AGENT.into()]),
+                &f.store,
+            )
+            .await
+            .unwrap();
+            doc.save_locally(&f.store).await.unwrap();
+            assert!(
+                can_write(&f, &f.public_doc, &ForAgent::Public).await,
+                "precondition: anyone may write it"
+            );
+            let t = token(&f.reader, &[(&f.drive, Right::Write)]);
+            assert!(!can_write(&f, &f.public_doc, &t).await);
+        }
+
+        #[tokio::test]
+        async fn a_token_turned_into_a_string_and_back_has_no_rights() {
+            let f = fixture(crate::urls::READ).await;
+            let t = token(&f.reader, &[(&f.drive, Right::Read)]);
+            let text = t.to_string();
+            assert!(!text.contains(f.reader.as_str()), "{text}");
+            let round_tripped = ForAgent::from(text);
+            assert!(!can_read(&f, &f.doc_a, &round_tripped).await);
+        }
+
+        #[tokio::test]
+        async fn a_scope_matches_either_identifier_spelling() {
+            let f = fixture(crate::urls::READ).await;
+            let legacy = Subject::from(crate::identifiers::to_legacy_scheme(f.folder_a.as_str()));
+            let t = token(&f.reader, &[(&legacy, Right::Read)]);
+            assert!(can_read(&f, &f.doc_a, &t).await);
+        }
     }
 }

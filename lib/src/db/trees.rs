@@ -58,6 +58,9 @@ pub enum Tree {
     /// subject_pure_id`, value a JSON [`crate::sync::outbox::OutboxEntry`].
     /// See `crate::sync::outbox`.
     Outbox,
+    /// Self-issued access tokens: hashed records and a hash-to-id index.
+    /// See `crate::db::access_tokens`.
+    AccessTokens,
 }
 
 const RESOURCES: &str = "resources_v3";
@@ -90,10 +93,11 @@ const SEARCH_TRIGRAMS: &str = "search_trigrams_v2";
 const ENVELOPES: &str = "envelopes_v1";
 const ENVELOPE_SPANS: &str = "envelope_spans_v1";
 const OUTBOX: &str = "outbox_v1";
+const ACCESS_TOKENS: &str = "access_tokens_v1";
 
 impl Tree {
     /// Every tree, in the order backends create them.
-    pub const ALL: [Tree; 20] = [
+    pub const ALL: [Tree; 21] = [
         Tree::Resources,
         Tree::WatchedQueries,
         Tree::PropValSub,
@@ -114,6 +118,7 @@ impl Tree {
         Tree::Envelopes,
         Tree::EnvelopeSpans,
         Tree::Outbox,
+        Tree::AccessTokens,
     ];
 
     /// The on-disk name of this tree. Every backend (sled tree, redb table)
@@ -141,6 +146,7 @@ impl Tree {
             Tree::Envelopes => ENVELOPES,
             Tree::EnvelopeSpans => ENVELOPE_SPANS,
             Tree::Outbox => OUTBOX,
+            Tree::AccessTokens => ACCESS_TOKENS,
         }
     }
 }

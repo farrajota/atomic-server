@@ -6,6 +6,7 @@
 
 mod common;
 
+mod access_tokens;
 mod blob_gc;
 mod blob_sync;
 mod commit_pacing;
