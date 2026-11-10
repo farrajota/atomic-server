@@ -134,6 +134,13 @@ pub struct Opts {
     #[clap(long, default_value_t = crate::access_tokens::DEFAULT_MAX_TTL_SECONDS, value_parser = clap::value_parser!(u64).range(crate::access_tokens::MIN_MAX_TTL_SECONDS..), env = "ATOMIC_ACCESS_TOKEN_MAX_TTL")]
     pub access_token_max_ttl: u64,
 
+    /// Send `GET /search` timing (`Server-Timing`: per-step durations and how
+    /// many index candidates matched) to every caller. For profiling only:
+    /// the counts are taken before the rights filter, so they tell anyone how
+    /// many resources match a query, private ones included. Off by default.
+    #[clap(long, env = "ATOMIC_DEBUG_SEARCH_TIMING")]
+    pub debug_search_timing: bool,
+
     /// The origin domain where the app is hosted, without the port and schema values.
     #[clap(long, default_value = "localhost", env = "ATOMIC_DOMAIN")]
     pub domain: String,

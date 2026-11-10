@@ -30,13 +30,20 @@ Tokens are accepted only in these places:
   served through them, such as `/query`. Pass the token as
   `Authorization: Bearer atk_…`.
 - **Full-text search**: `GET /search?q=…` (with `parents`, `filters`,
-  `limit`, `include`). The index's candidates are read-checked one by one as
-  the token, so only hits it may read are listed or included. The
-  `Server-Timing` header leaves out the index's candidate counts for a token,
-  since they are counted before that check.
+  `limit`, `include`). A token searches under its scopes only: without
+  `parents` it searches its scope targets; a requested parent is kept if it
+  lies inside a scope, replaced by the scope targets that lie inside it, and
+  dropped otherwise (a request whose parents are all outside the scopes finds
+  nothing). Public data outside the scopes is not searched through a token;
+  ask anonymously for that. Every candidate is then read-checked as the token,
+  so only hits it may read are listed or included. A token's `limit` is at
+  most 100 (each candidate costs an uncached rights walk); page with
+  `parents` for more.
 - **History**: `GET /history-attribution?subject=…`, answered only when the
   token may read `subject` (401 otherwise, as for a resource read). The answer
   describes that subject's own commits: their signers, times and signatures.
+  Its `retention` may come from a policy set on an ancestor outside the
+  token's scopes: the same value any reader of the subject sees.
 - **WebSocket `AUTH`**: see below.
 - **`/tokens/self`** and **self-revoke**.
 

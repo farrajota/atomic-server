@@ -801,6 +801,18 @@ mod tests {
     }
 
     #[test]
+    fn a_tokens_search_limit_is_capped() {
+        use crate::handlers::search::{effective_limit, TOKEN_SEARCH_MAX_LIMIT};
+        assert_eq!(effective_limit(Some(500), true), TOKEN_SEARCH_MAX_LIMIT);
+        assert_eq!(effective_limit(Some(5), true), 5);
+        assert!(
+            effective_limit(Some(500), false) > TOKEN_SEARCH_MAX_LIMIT,
+            "signed callers keep theirs"
+        );
+        assert!(effective_limit(None, true) <= TOKEN_SEARCH_MAX_LIMIT);
+    }
+
+    #[test]
     fn only_atk_bearer_values_are_tokens() {
         let mut headers = HeaderMap::new();
         headers.insert(
