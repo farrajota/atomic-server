@@ -264,7 +264,11 @@ pub async fn vector_search_query(
     result_vec.push(results_resource);
 
     let mut builder = HttpResponse::Ok();
-    builder.append_header(("Server-Timing", timer.header_value()));
+    // Step durations grow with the number of candidates found before the
+    // rights filter, so they are for profiling only, as on `/search`.
+    if appstate.config.opts.debug_search_timing {
+        builder.append_header(("Server-Timing", timer.header_value()));
+    }
 
     Ok(builder.body(Resource::vec_to_json_ad(&result_vec, None)?))
 }

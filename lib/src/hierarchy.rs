@@ -593,6 +593,28 @@ async fn token_scopes_cover<S: Storelike>(
         .filter(|scope| scope_allows(scope.right, right))
         .map(|scope| scope_key(store, &scope.target))
         .collect();
+    covered_by(store, resource, &targets).await
+}
+
+/// Whether `resource` is one of `ancestors` or lies below one, by the same
+/// `drive` stamp and `parent` walk an access token's scope uses. A Commit
+/// counts where its target does.
+pub async fn is_within_any<S: Storelike>(
+    store: &S,
+    resource: &Resource,
+    ancestors: &[&str],
+) -> bool {
+    let targets = ancestors.iter().map(|a| scope_key(store, a)).collect();
+    covered_by(store, resource, &targets).await
+}
+
+/// The walk behind [`token_scopes_cover`] and [`is_within_any`]: `targets`
+/// are [`scope_key`]s.
+async fn covered_by<S: Storelike>(
+    store: &S,
+    resource: &Resource,
+    targets: &std::collections::HashSet<String>,
+) -> bool {
     if targets.is_empty() {
         return false;
     }
@@ -1649,6 +1671,23 @@ mod test {
             );
             let t = token(&f.reader, &[(&f.drive, Right::Write)]);
             assert!(!can_write(&f, &f.public_doc, &t).await);
+        }
+
+        #[tokio::test]
+        async fn within_follows_the_same_walk_as_a_scope() {
+            let f = fixture(crate::urls::READ).await;
+            let doc_a = f.store.get_resource(&f.doc_a).await.unwrap();
+            let folder = f.folder_a.to_string();
+            let drive = f.drive.to_string();
+            assert!(crate::hierarchy::is_within_any(&f.store, &doc_a, &[folder.as_str()]).await);
+            assert!(crate::hierarchy::is_within_any(&f.store, &doc_a, &[drive.as_str()]).await);
+            let doc_b = f.store.get_resource(&f.doc_b).await.unwrap();
+            assert!(!crate::hierarchy::is_within_any(&f.store, &doc_b, &[folder.as_str()]).await);
+            let folder_res = f.store.get_resource(&f.folder_a).await.unwrap();
+            assert!(
+                !crate::hierarchy::is_within_any(&f.store, &folder_res, &[f.doc_a.as_str()]).await,
+                "an ancestor is not within its descendant"
+            );
         }
 
         #[tokio::test]

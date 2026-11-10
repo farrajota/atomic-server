@@ -545,7 +545,6 @@ async fn a_token_is_refused_by_endpoints_that_do_not_take_one() {
     let doc = urlencoding::encode(&f.doc_a).into_owned();
     let drive = urlencoding::encode(&f.drive).into_owned();
     for path in [
-        "/search?q=Doc".to_string(),
         format!("/export?subject={doc}&format=csv"),
         format!("/app-agent?drive={drive}&app={doc}"),
         format!("/drive-usage?subject={drive}"),
@@ -1065,4 +1064,360 @@ async fn a_retried_mint_reports_its_duplicate_even_after_read_was_lost() {
     assert_eq!(mint().await.unwrap().status(), StatusCode::CREATED);
     set_readers(&client, &drive, &[&alice]).await;
     assert_eq!(mint().await.unwrap().status(), StatusCode::CONFLICT);
+}
+
+/// Alice holds two private drives, A and B, and a public one; each has one
+/// document named with `word` and its letter. A token scoped to A.
+struct SearchFixture {
+    base: String,
+    alice: Agent,
+    drive_b: String,
+    doc_a: String,
+    doc_b: String,
+    doc_public: String,
+    token: String,
+    token_id: String,
+}
+
+async fn search_fixture(name: &str) -> SearchFixture {
+    let port = start_server(name);
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let client = Client::new(&base).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive_a = client.new_drive(&alice, "Drive A").await.unwrap();
+    let drive_b = client.new_drive(&alice, "Drive B").await.unwrap();
+    let public = client.new_public_drive(&alice, "Public").await.unwrap();
+    let doc_a = child(&client, &drive_a, "zebranest alpha").await;
+    let doc_b = child(&client, &drive_b, "zebranest bravo").await;
+    let doc_public = child(&client, &public, "zebranest public").await;
+    let resp = signed_v2(
+        reqwest::Method::POST,
+        &base,
+        "/tokens",
+        &mint_body(&[(&drive_a, "read")], 600, "search"),
+        &alice,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let minted: Json = resp.json().await.unwrap();
+    SearchFixture {
+        base,
+        alice,
+        drive_b,
+        doc_a,
+        doc_b,
+        doc_public,
+        token: token_of(&minted),
+        token_id: id_of(&minted),
+    }
+}
+
+/// What a caller gets back from `path`: status, the `Server-Timing` header
+/// and the body.
+async fn get_as(
+    base: &str,
+    path: &str,
+    bearer: Option<&str>,
+    agent: Option<&Agent>,
+) -> (StatusCode, String, String) {
+    let url = format!("{base}{path}");
+    let mut req = http().get(&url).header("Accept", "application/ad+json");
+    if let Some(token) = bearer {
+        req = req.bearer_auth(token);
+    }
+    if let Some(agent) = agent {
+        for (k, v) in get_authentication_headers(&url, agent).unwrap() {
+            req = req.header(k, v);
+        }
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    let timing = resp
+        .headers()
+        .get("Server-Timing")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, timing, resp.text().await.unwrap())
+}
+
+/// A token's search answers what the token may read, the way a resource GET
+/// does: hits in its scope and public hits, never a hit the agent could read
+/// outside the scope, not by subject, title or count.
+#[tokio::test]
+async fn search_through_a_token_finds_only_what_it_may_read() {
+    let f = search_fixture("tokens_search").await;
+    for path in [
+        "/search?q=zebranest".to_string(),
+        "/search?q=zebranest&include=true".to_string(),
+        format!(
+            "/search?q=zebranest&parents={}",
+            urlencoding::encode(&f.drive_b)
+        ),
+    ] {
+        let (status, timing, body) = get_as(&f.base, &path, Some(&f.token), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(
+            !body.contains(&f.doc_b),
+            "{path}: B's subject leaked: {body}"
+        );
+        assert!(!body.contains("bravo"), "{path}: B's title leaked: {body}");
+        assert!(timing.is_empty(), "{path}: no Server-Timing: {timing}");
+    }
+    let (_, _, body) = get_as(&f.base, "/search?q=zebranest", Some(&f.token), None).await;
+    assert!(body.contains(&f.doc_a), "in scope: {body}");
+    // A token searches its scopes only: public data elsewhere is found
+    // anonymously, not through the token.
+    assert!(!body.contains(&f.doc_public), "outside the scopes: {body}");
+
+    // Anonymous: only the public document.
+    let (status, _, body) = get_as(&f.base, "/search?q=zebranest", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&f.doc_public) && !body.contains(&f.doc_a) && !body.contains(&f.doc_b));
+
+    // The agent's own signed search still finds all three.
+    let (status, _, body) = get_as(&f.base, "/search?q=zebranest", None, Some(&f.alice)).await;
+    assert_eq!(status, StatusCode::OK);
+    for doc in [&f.doc_a, &f.doc_b, &f.doc_public] {
+        assert!(body.contains(doc.as_str()), "{doc}: {body}");
+    }
+}
+
+/// `/search` used to send every caller, anonymous included, a
+/// `Server-Timing` header with the index's candidate counts (taken before
+/// the rights filter) and per-step durations that track them. That counted
+/// private matches for anyone. Nobody gets it now unless the operator turns
+/// on `--debug-search-timing`.
+#[tokio::test]
+async fn search_timing_is_not_sent_unless_the_operator_asks_for_it() {
+    let f = search_fixture("tokens_search_timing").await;
+    let private = format!(
+        "/search?q=zebranest&parents={}",
+        urlencoding::encode(&f.drive_b)
+    );
+    for (who, bearer, agent) in [
+        ("anonymous", None, None),
+        ("signed agent", None, Some(&f.alice)),
+        ("token", Some(f.token.as_str()), None),
+    ] {
+        for path in ["/search?q=zebranest", private.as_str()] {
+            let (status, timing, _) = get_as(&f.base, path, bearer, agent).await;
+            assert_eq!(status, StatusCode::OK, "{who} {path}");
+            assert!(timing.is_empty(), "{who} {path}: {timing}");
+        }
+    }
+
+    let port = start_server_with_args("tokens_search_timing_debug", &["--debug-search-timing"]);
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let (status, timing, _) = get_as(&base, "/search?q=anything", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        timing.contains("candidates") && timing.contains("score;dur"),
+        "the operator's debug flag keeps the full header: {timing}"
+    );
+}
+
+/// The subjects a `/search` answer lists as its results.
+fn search_results(body: &str) -> Vec<String> {
+    let parsed: Json = serde_json::from_str(body).unwrap();
+    let resources = parsed.as_array().cloned().unwrap_or_else(|| vec![parsed]);
+    resources
+        .iter()
+        .find_map(|r| r.get("https://atomicdata.dev/properties/endpoint/results"))
+        .and_then(Json::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        // An empty list may be left out of the JSON.
+        .unwrap_or_default()
+}
+
+/// A token's search runs under its scopes: without `parents` it searches the
+/// scope targets, so matches it may not read cannot fill the result window;
+/// requested `parents` are narrowed to what lies inside a scope, and a parent
+/// outside every scope finds nothing.
+#[tokio::test]
+async fn a_tokens_search_runs_under_its_scopes() {
+    let port = start_server("tokens_search_scoped");
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let client = Client::new(&base).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive_a = client.new_drive(&alice, "Drive A").await.unwrap();
+    let drive_b = client.new_drive(&alice, "Drive B").await.unwrap();
+    let folder = child(&client, &drive_a, "Scoped folder").await;
+    let in_scope = child(
+        &client,
+        &folder,
+        "quokkaword inside the scoped folder of drive a",
+    )
+    .await;
+    let beside = child(&client, &drive_a, "quokkaword beside").await;
+    // Shorter names that rank above the one in scope.
+    for n in 0..8 {
+        child(&client, &drive_b, &format!("quokkaword {n}")).await;
+    }
+    let resp = signed_v2(
+        reqwest::Method::POST,
+        &base,
+        "/tokens",
+        &mint_body(&[(&folder, "read")], 600, "scoped"),
+        &alice,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let token = token_of(&resp.json().await.unwrap());
+    let search = |query: String| {
+        let base = base.clone();
+        let token = token.clone();
+        async move {
+            get_as(
+                &base,
+                &format!("/search?q=quokkaword&{query}"),
+                Some(&token),
+                None,
+            )
+            .await
+        }
+    };
+
+    let (status, _, body) = search("limit=1".into()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&in_scope),
+        "found despite better-ranked matches elsewhere: {body}"
+    );
+
+    let (_, _, body) = search(format!("parents={}", urlencoding::encode(&drive_a))).await;
+    assert!(
+        body.contains(&in_scope),
+        "a requested ancestor is narrowed to the scope: {body}"
+    );
+    assert!(!body.contains(&beside), "{body}");
+
+    let (status, _, body) = search(format!("parents={}", urlencoding::encode(&drive_b))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        search_results(&body).is_empty(),
+        "a parent outside every scope finds nothing: {body}"
+    );
+
+    let (_, _, body) = search(format!(
+        "parents={},{}",
+        urlencoding::encode(&drive_b),
+        urlencoding::encode(&folder)
+    ))
+    .await;
+    assert!(
+        body.contains(&in_scope),
+        "the parent inside a scope stays: {body}"
+    );
+}
+
+/// `/history-attribution` through a token: the history of what it may read,
+/// a 401 for anything else, exactly as a resource read would answer.
+#[tokio::test]
+async fn history_through_a_token_is_limited_to_what_it_may_read() {
+    let f = search_fixture("tokens_history").await;
+    let history = |subject: &str| {
+        format!(
+            "/history-attribution?subject={}",
+            urlencoding::encode(subject)
+        )
+    };
+
+    let (status, _, body) = get_as(&f.base, &history(&f.doc_a), Some(&f.token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let report: Json = serde_json::from_str(&body).unwrap();
+    assert!(report["attributions"].is_array(), "{report}");
+
+    let (status, _, body) = get_as(&f.base, &history(&f.doc_b), Some(&f.token), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "outside the scope: {body}"
+    );
+    assert!(!body.contains("attributions"), "{body}");
+
+    let (status, _, _) = get_as(&f.base, &history(&f.doc_public), Some(&f.token), None).await;
+    assert_eq!(status, StatusCode::OK, "public, as for anonymous");
+    let (status, _, _) = get_as(&f.base, &history(&f.doc_public), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The agent itself, signed, still reads B's history.
+    let (status, _, _) = get_as(&f.base, &history(&f.doc_b), None, Some(&f.alice)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A revoked token gets 401 on both endpoints, like everywhere else.
+#[tokio::test]
+async fn search_and_history_refuse_a_revoked_token() {
+    let f = search_fixture("tokens_search_revoked").await;
+    let revoked = signed_v2(
+        reqwest::Method::DELETE,
+        &f.base,
+        &format!("/tokens/{}", f.token_id),
+        b"",
+        &f.alice,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    for path in [
+        "/search?q=zebranest".to_string(),
+        format!(
+            "/history-attribution?subject={}",
+            urlencoding::encode(&f.doc_a)
+        ),
+    ] {
+        let (status, _, body) = get_as(&f.base, &path, Some(&f.token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert!(body.contains("revoked"), "{path}: {body}");
+    }
+}
+
+/// A token's search walks each requested parent against its scopes, so the
+/// list is bounded: more than 32 parents is a 400.
+#[tokio::test]
+async fn a_tokens_search_takes_a_bounded_number_of_parents() {
+    let f = search_fixture("tokens_search_parent_cap").await;
+    let parents = |n: usize| {
+        (0..n)
+            .map(|i| format!("atomic:not-a-parent-{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (status, _, body) = get_as(
+        &f.base,
+        &format!(
+            "/search?q=zebranest&parents={}",
+            urlencoding::encode(&parents(32))
+        ),
+        Some(&f.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(search_results(&body).is_empty(), "{body}");
+    let (status, _, body) = get_as(
+        &f.base,
+        &format!(
+            "/search?q=zebranest&parents={}",
+            urlencoding::encode(&parents(33))
+        ),
+        Some(&f.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }

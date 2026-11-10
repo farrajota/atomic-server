@@ -29,11 +29,26 @@ Tokens are accepted only in these places:
 - **Resource reads**: `GET /resource?subject=…`, path subjects, and the endpoints
   served through them, such as `/query`. Pass the token as
   `Authorization: Bearer atk_…`.
+- **Full-text search**: `GET /search?q=…` (with `parents`, `filters`,
+  `limit`, `include`). A token searches under its scopes only: without
+  `parents` it searches its scope targets; a requested parent is kept if it
+  lies inside a scope, replaced by the scope targets that lie inside it, and
+  dropped otherwise (a request whose parents are all outside the scopes finds
+  nothing). Public data outside the scopes is not searched through a token;
+  ask anonymously for that. Every candidate is then read-checked as the token,
+  so only hits it may read are listed or included. A token's `limit` is at
+  most 100 (each candidate costs an uncached rights walk), and it names at
+  most 32 `parents` (400 beyond); page with `parents` for more.
+- **History**: `GET /history-attribution?subject=…`, answered only when the
+  token may read `subject` (401 otherwise, as for a resource read). The answer
+  describes that subject's own commits: their signers, times and signatures.
+  Its `retention` may come from a policy set on an ancestor outside the
+  token's scopes: the same value any reader of the subject sees.
 - **WebSocket `AUTH`**: see below.
 - **`/tokens/self`** and **self-revoke**.
 
-Every other endpoint answers 401 to an access token (for example `/search`,
-`/export`, `/commit` and the plugin endpoints). The older
+Every other endpoint answers 401 to an access token (for example `/export`,
+`/commit`, `/vector_search` and the plugin endpoints). The older
 `Authorization: Bearer <base64 auth proof>` keeps working where it worked before.
 The `atk_` prefix tells the two apart.
 
@@ -228,6 +243,11 @@ requests. Used signatures are kept in memory, not in the store.
 
 ## Known costs and limits
 
+- **Search response time.** `/search` sends no timing unless the operator sets
+  `--debug-search-timing`, but the total response time still grows with the
+  number of index matches found before the rights filter, so a caller timing
+  many requests could roughly estimate how many resources match a query. This
+  holds for any caller, not only tokens.
 - **Uncached rights walks.** A rights check through a token runs the agent's
   check and the scope walk without the per-request rights cache (the cache
   holds one agent's verdicts, and this check asks as two). A large `/query`
