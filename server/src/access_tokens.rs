@@ -224,9 +224,11 @@ fn validate(request: &MintRequest, max_ttl_seconds: u64) -> AtomicServerResult<(
                 "a scope target must be a subject of 1 to {MAX_TARGET_LEN} characters"
             ));
         }
-        if parse_right(&scope.right).is_none() {
+        // Tokens are read-only (D17): a write or append scope would promise
+        // something the rights check never grants.
+        if scope.right != "read" {
             return bad(format!(
-                "scope right {:?} is not one of read, write, append",
+                "scope right {:?} is not allowed: access tokens are read-only, so the only right is \"read\"",
                 scope.right
             ));
         }
@@ -452,6 +454,20 @@ mod tests {
         let mut r = request("n1", 60);
         r.scopes.clear();
         assert!(mint(&store, &agent(), &r, 3600).is_err());
+    }
+
+    #[tokio::test]
+    async fn write_and_append_scopes_are_refused() {
+        let store = store("write_scope").await;
+        for right in ["write", "append"] {
+            let mut r = request(right, 60);
+            r.scopes[0].right = right.into();
+            let err = mint(&store, &agent(), &r, 3600)
+                .err()
+                .expect("tokens are read-only");
+            assert!(err.message.contains("read"), "{}", err.message);
+        }
+        assert!(store.all_access_tokens().unwrap().is_empty());
     }
 
     #[tokio::test]

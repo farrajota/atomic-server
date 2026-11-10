@@ -18,8 +18,9 @@ anyway (the bearer could simply ask anonymously):
 - A scope `{target, right}` covers `target` and its descendants. It uses the
   same `drive` and `parent` walk as the rights check
   ([Hierarchy](hierarchy.md)). A Commit is covered where its target is.
-- `write` covers read, write and append, as a `write` ACL entry does. `read` and
-  `append` cover only themselves.
+- Tokens are **read-only**. A scope's `right` must be `read`, and the rights
+  check refuses every write and append through a token, even on a resource
+  whose ACL lets anyone write.
 - A scope never adds a right the agent lacks. Removing the agent from an ACL
   also removes the right from its live tokens.
 
@@ -58,8 +59,8 @@ body. Version 1, cookies and bearer tokens are refused with 401.
 - `ttl_seconds`: from 1 up to the server maximum (`--access-token-max-ttl`,
   env `ATOMIC_ACCESS_TOKEN_MAX_TTL`, default 90000 = 25 h). A larger value is
   refused with 400. It is not shortened.
-- `scopes`: 1 to 32 entries. `right` is `read`, `write` or `append`. An empty
-  list is refused with 400. Targets are stored with the `atomic:` scheme.
+- `scopes`: 1 to 32 entries. `right` must be `read`; `write`, `append` or
+  anything else is refused with 400. An empty list is refused with 400. Targets are stored with the `atomic:` scheme.
 - `label`: optional, up to 256 bytes.
 - `nonce`: required, 1 to 128 bytes.
 

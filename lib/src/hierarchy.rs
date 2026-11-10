@@ -531,6 +531,15 @@ async fn check_token_rights<S: Storelike>(
     grant: &crate::agents::TokenGrant,
     right: Right,
 ) -> AtomicResult<String> {
+    // Access tokens are read-only (decision D17): no write or append through
+    // a token, whatever its scopes, its agent or the resource's own ACL say
+    // (a resource anyone may write included).
+    if right != Right::Read {
+        return Err(crate::errors::AtomicError::unauthorized(format!(
+            "Access token {} is read-only; {} needs the agent's own key",
+            grant.token_id, right
+        )));
+    }
     if token_scopes_cover(store, resource, grant, right).await {
         let agent = ForAgent::AgentSubject(grant.agent.clone());
         if let Ok(reason) = check_rights_impl(store, resource, &agent, right, None).await {
@@ -1577,7 +1586,7 @@ mod test {
         }
 
         #[tokio::test]
-        async fn a_read_scope_does_not_allow_writing_for_a_writer() {
+        async fn a_token_never_writes_whatever_its_scope() {
             let f = fixture(crate::urls::WRITE).await;
             let agent = ForAgent::AgentSubject(f.reader.clone());
             assert!(
@@ -1587,10 +1596,15 @@ mod test {
             let t = token(&f.reader, &[(&f.drive, Right::Read)]);
             assert!(can_read(&f, &f.doc_a, &t).await);
             assert!(!can_write(&f, &f.doc_a, &t).await);
+            // D17: tokens are read-only. Even a write scope held by a writer
+            // grants neither write nor append.
             let t = token(&f.reader, &[(&f.drive, Right::Write)]);
+            assert!(!can_write(&f, &f.doc_a, &t).await);
+            let doc = f.store.get_resource(&f.doc_a).await.unwrap();
             assert!(
-                can_write(&f, &f.doc_a, &t).await,
-                "within a write scope it may"
+                crate::hierarchy::check_rights(&f.store, &doc, &t, Right::Append)
+                    .await
+                    .is_err()
             );
         }
 
@@ -1615,6 +1629,26 @@ mod test {
                 !can_read(&f, &f.doc_a, &empty).await,
                 "no scope, no private reads"
             );
+        }
+
+        #[tokio::test]
+        async fn a_publicly_writable_resource_is_not_writable_through_a_token() {
+            let f = fixture(crate::urls::READ).await;
+            let mut doc = f.store.get_resource(&f.public_doc).await.unwrap();
+            doc.set(
+                crate::urls::WRITE.into(),
+                Value::ResourceArray(vec![crate::urls::PUBLIC_AGENT.into()]),
+                &f.store,
+            )
+            .await
+            .unwrap();
+            doc.save_locally(&f.store).await.unwrap();
+            assert!(
+                can_write(&f, &f.public_doc, &ForAgent::Public).await,
+                "precondition: anyone may write it"
+            );
+            let t = token(&f.reader, &[(&f.drive, Right::Write)]);
+            assert!(!can_write(&f, &f.public_doc, &t).await);
         }
 
         #[tokio::test]

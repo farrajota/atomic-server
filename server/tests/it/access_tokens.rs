@@ -274,7 +274,7 @@ async fn minting_needs_a_version_2_signature_by_the_key_not_a_token() {
 async fn a_tampered_body_does_not_mint() {
     let f = fixture(start_server("tokens_tamper")).await;
     let signed_for = mint_body(&[(&f.folder_a, "read")], 600, "n1");
-    let sent = mint_body(&[(&f.drive, "write")], 600, "n1");
+    let sent = mint_body(&[(&f.drive, "read")], 600, "n1");
     let url = format!("{}/tokens", f.base);
     let mut req = http().post(&url).body(sent);
     for (k, v) in get_authentication_headers_v2("POST", &url, &signed_for, &f.alice).unwrap() {
@@ -299,6 +299,14 @@ async fn mint_requests_are_validated() {
 
     let no_scopes = post(mint_body(&[], 60, "n2")).await.unwrap();
     assert_eq!(no_scopes.status(), StatusCode::BAD_REQUEST);
+
+    // D17: tokens are read-only, so a write or append scope is refused.
+    for right in ["write", "append"] {
+        let refused = post(mint_body(&[(&f.drive, right)], 60, right))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{right}");
+    }
 
     let bad_right = post(mint_body(&[(&f.drive, "admin")], 60, "n3"))
         .await
@@ -524,7 +532,7 @@ async fn removing_the_agents_acl_right_applies_to_its_live_token() {
 #[tokio::test]
 async fn a_token_is_refused_by_endpoints_that_do_not_take_one() {
     let f = fixture(start_server("tokens_other_endpoints")).await;
-    let token = token_of(&mint(&f, &[(&f.drive, "write")], 600, "n1").await);
+    let token = token_of(&mint(&f, &[(&f.drive, "read")], 600, "n1").await);
     let doc = urlencoding::encode(&f.doc_a).into_owned();
     let drive = urlencoding::encode(&f.drive).into_owned();
     for path in [
@@ -550,7 +558,7 @@ async fn a_token_is_refused_by_endpoints_that_do_not_take_one() {
 #[tokio::test]
 async fn a_token_cannot_commit() {
     let f = fixture(start_server("tokens_commit")).await;
-    let token = token_of(&mint(&f, &[(&f.drive, "write")], 600, "n1").await);
+    let token = token_of(&mint(&f, &[(&f.drive, "read")], 600, "n1").await);
     let commit = json!({
         "https://atomicdata.dev/properties/isA": ["https://atomicdata.dev/classes/Commit"],
         "https://atomicdata.dev/properties/subject": f.doc_a,
