@@ -66,16 +66,23 @@ pub(crate) fn signed_url(req: &HttpRequest, appstate: &AppState) -> AtomicServer
     crate::helpers::signed_subject(req, &origin)
 }
 
-/// The agent whose own key signed `req`, in its canonical spelling. Never an
-/// access token: tokens may not mint, list, or revoke other tokens. The
-/// signature must be version 2, so it covers the method and `body`, and it
-/// is good once: the same signed request is refused when it comes again,
-/// whatever happened to it the first time.
+/// A verified signed request: who signed it, and the signature to use up.
+struct Signed {
+    /// The agent whose key signed, in its canonical spelling.
+    agent: Subject,
+    signature: String,
+    timestamp: i64,
+}
+
+/// The agent whose own key signed `req`. Never an access token: tokens may
+/// not mint, list, or revoke other tokens. The signature must be version 2,
+/// so it covers the method and `body`. Only checks; [`spend`] then charges
+/// the agent and uses the signature up.
 async fn signing_agent(
     req: &HttpRequest,
     appstate: &AppState,
     body: &[u8],
-) -> AtomicServerResult<Subject> {
+) -> AtomicServerResult<Signed> {
     if access_tokens::bearer_token(req.headers()).is_some() {
         return Err(unauthorized(
             "An access token cannot do this; sign the request with the agent's own key",
@@ -110,17 +117,48 @@ async fn signing_agent(
     let timestamp = header("x-atomic-timestamp")
         .and_then(|t| t.parse::<i64>().ok())
         .ok_or_else(|| unauthorized("x-atomic-timestamp must be a number"))?;
-    let store = appstate.store.clone();
-    blocking(move || access_tokens::consume_proof(&store, &signature, timestamp)).await?;
-    Ok(Subject::from_raw(
-        &access_tokens::canonical_agent(&agent),
-        None,
-    ))
+    Ok(Signed {
+        agent: Subject::from_raw(&access_tokens::canonical_agent(&agent), None),
+        signature,
+        timestamp,
+    })
+}
+
+/// Charge a signed request to its agent's write budget, then use its
+/// signature up, so the same signed request is refused when it comes again,
+/// whatever happens to it next. The budget comes first: a key flooding
+/// `/tokens` is refused at an in-memory check, before anything is recorded.
+fn spend(req: &HttpRequest, appstate: &AppState, signed: &Signed) -> AtomicServerResult<()> {
+    crate::helpers::enforce_write_rate_limit(
+        appstate,
+        req,
+        &ForAgent::AgentSubject(signed.agent.clone()),
+    )?;
+    appstate.used_token_proofs.consume(
+        &signed.signature,
+        signed.timestamp,
+        atomic_lib::utils::now(),
+    )
+}
+
+/// 409: the agent already minted with this nonce. Never the token value,
+/// which is not stored.
+fn duplicate(
+    record: &atomic_lib::db::access_tokens::AccessTokenRecord,
+) -> AtomicServerResult<HttpResponse> {
+    let mut body = serde_json::to_value(TokenView::from(record))
+        .map_err(|e| format!("Could not serialize token: {e}"))?;
+    body["error"] = json!(
+        "A token with this nonce was already minted for this agent; its value is not stored and cannot be returned again"
+    );
+    Ok(HttpResponse::Conflict().json(body))
 }
 
 /// A token only narrows rights its agent holds, so the agent must read every
-/// target now. A target that does not exist here, or lives elsewhere, is
-/// refused the same way as an unreadable one.
+/// target now, and not only through public rights: a scope over data anyone
+/// may read (every agent's own resource included) grants nothing a token
+/// adds, so a key that was never granted anything cannot mint. A target that
+/// does not exist here, or lives elsewhere, is refused the same way.
 async fn require_readable(store: &Db, agent: &Subject, target: &str) -> AtomicServerResult<()> {
     let refused = || {
         AtomicServerError {
@@ -136,6 +174,18 @@ async fn require_readable(store: &Db, agent: &Subject, target: &str) -> AtomicSe
         return Err(refused());
     }
     let resource = store.get_resource(&subject).await.map_err(|_| refused())?;
+    if atomic_lib::hierarchy::check_read(store, &resource, &ForAgent::Public)
+        .await
+        .is_ok()
+    {
+        return Err(AtomicServerError {
+            message: format!(
+                "Anyone may read the scope target {target}; a token over public data adds nothing, so none is issued"
+            ),
+            error_type: AppErrorType::Forbidden,
+            error_resource: None,
+        });
+    }
     atomic_lib::hierarchy::check_read(store, &resource, &ForAgent::AgentSubject(agent.clone()))
         .await
         .map_err(|_| refused())?;
@@ -148,15 +198,20 @@ pub async fn mint(
     body: web::Bytes,
     appstate: web::Data<AppState>,
 ) -> AtomicServerResult<HttpResponse> {
-    let agent = signing_agent(&req, &appstate, &body).await?;
-    crate::helpers::enforce_write_rate_limit(
-        &appstate,
-        &req,
-        &ForAgent::AgentSubject(agent.clone()),
-    )?;
+    let signed = signing_agent(&req, &appstate, &body).await?;
+    spend(&req, &appstate, &signed)?;
+    let agent = signed.agent;
     let request: MintRequest = crate::helpers::parse_json(&body)?;
     let max_ttl = appstate.config.opts.access_token_max_ttl;
     access_tokens::validate(&request, max_ttl)?;
+    // A retried mint learns about its earlier token before anything else is
+    // checked: its agent may have lost read on a target meanwhile.
+    let (store, a, nonce) = (appstate.store.clone(), agent.clone(), request.nonce.clone());
+    if let Some(record) =
+        blocking(move || access_tokens::minted_with_nonce(&store, &a, &nonce)).await?
+    {
+        return duplicate(&record);
+    }
     for scope in &request.scopes {
         require_readable(&appstate.store, &agent, &scope.target).await?;
     }
@@ -171,14 +226,7 @@ pub async fn mint(
                 .insert_header(("Cache-Control", "no-store"))
                 .json(body))
         }
-        MintOutcome::Duplicate(record) => {
-            let mut body = serde_json::to_value(TokenView::from(&record))
-                .map_err(|e| format!("Could not serialize token: {e}"))?;
-            body["error"] = json!(
-                "A token with this nonce was already minted for this agent; its value is not stored and cannot be returned again"
-            );
-            Ok(HttpResponse::Conflict().json(body))
-        }
+        MintOutcome::Duplicate(record) => duplicate(&record),
     }
 }
 
@@ -200,8 +248,9 @@ pub async fn list(
     req: HttpRequest,
     appstate: web::Data<AppState>,
 ) -> AtomicServerResult<HttpResponse> {
-    let agent = signing_agent(&req, &appstate, &[]).await?;
-    let store = appstate.store.clone();
+    let signed = signing_agent(&req, &appstate, &[]).await?;
+    spend(&req, &appstate, &signed)?;
+    let (store, agent) = (appstate.store.clone(), signed.agent);
     let records = blocking(move || access_tokens::list(&store, &agent)).await?;
     let views: Vec<TokenView> = records.iter().map(TokenView::from).collect();
     Ok(HttpResponse::Ok()
@@ -222,17 +271,25 @@ pub async fn revoke(
         Some(token) => {
             let record = access_tokens::resolve(&appstate.store, token)?;
             // A token may revoke itself and nothing else.
-            (record.token_id == token_id).then(|| Subject::from_raw(&record.agent, None))
+            let agent =
+                (record.token_id == token_id).then(|| Subject::from_raw(&record.agent, None));
+            if let Some(agent) = &agent {
+                crate::helpers::enforce_write_rate_limit(
+                    &appstate,
+                    &req,
+                    &ForAgent::AgentSubject(agent.clone()),
+                )?;
+            }
+            agent
         }
-        None => Some(signing_agent(&req, &appstate, &[]).await?),
+        None => {
+            let signed = signing_agent(&req, &appstate, &[]).await?;
+            spend(&req, &appstate, &signed)?;
+            Some(signed.agent)
+        }
     };
     let revoked = match agent {
         Some(agent) => {
-            crate::helpers::enforce_write_rate_limit(
-                &appstate,
-                &req,
-                &ForAgent::AgentSubject(agent.clone()),
-            )?;
             let store = appstate.store.clone();
             let id = token_id.clone();
             blocking(move || access_tokens::revoke(&store, &agent, &id)).await?

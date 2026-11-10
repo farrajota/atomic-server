@@ -41,8 +41,9 @@ pub const TOKEN_PREFIX: &str = "atk_";
 pub const DEFAULT_MAX_TTL_SECONDS: u64 = 25 * 60 * 60;
 
 /// The smallest `--access-token-max-ttl` a node accepts: as long as a signed
-/// request stays acceptable (`AUTH_MAX_AGE_MS`), so records and their nonces
-/// are never dropped while the request that minted them could still verify.
+/// request stays acceptable (`AUTH_MAX_AGE_MS`). A smaller cap would only
+/// produce tokens that die before the request that minted them stops being
+/// retryable; nonces are kept for that window regardless ([`retain_until`]).
 pub const MIN_MAX_TTL_SECONDS: u64 = 300;
 
 /// Bounds on what a mint request may carry. Together they bound one record
@@ -52,28 +53,40 @@ const MAX_TARGET_LEN: usize = 512;
 const MAX_LABEL_LEN: usize = 256;
 const MAX_NONCE_LEN: usize = 128;
 
-/// How many records one agent may have retained at once: live, revoked or
-/// expired but still kept for its nonce. Bounds what one key can make this
-/// node store. A plugin minting one token per lease keeps every token for the
-/// retention window (the TTL cap), so this allows a busy day of leases.
+/// How many live (unrevoked, unexpired) tokens one agent may hold at once.
+/// Revoked and expired records do not count: they are dropped once their
+/// short retention ends ([`retain_until`]), and counting them would lock out
+/// a role that mints and revokes one token per lease.
 pub const MAX_TOKENS_PER_AGENT: usize = 200;
+
+/// How many used signatures [`UsedProofs`] remembers at once. Each is kept
+/// for about five minutes, so this allows a sustained rate of signed
+/// `/tokens` requests of several hundred per second.
+pub const MAX_USED_PROOFS: usize = 250_000;
+
+/// How often [`UsedProofs`] forgets signatures that can no longer verify.
+const USED_PROOFS_PRUNE_EVERY_MS: i64 = 10_000;
 
 /// How far ahead of this server's clock a signed request's timestamp may be
 /// (`atomic_lib::authentication` accepts 10 s).
 const PROOF_CLOCK_SKEW_MS: i64 = 10_000;
 
-/// Serializes mints, revokes and used-proof records, so two requests with the
-/// same nonce or the same signature cannot both pass their check. One process
+/// Serializes mints and revokes, so two requests with the same nonce cannot
+/// both pass the duplicate check. One process
 /// owns the store, so a process lock is enough. Only taken off the actix
 /// workers (`web::block` in the handlers).
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// How long a record, and with it its nonce, is kept after it was minted: the
-/// TTL cap, and never less than a signed request stays acceptable.
-pub fn retention_ms(max_ttl_seconds: u64) -> i64 {
-    (max_ttl_seconds as i64)
-        .saturating_mul(1000)
-        .max(atomic_lib::authentication::AUTH_MAX_AGE_MS + PROOF_CLOCK_SKEW_MS)
+/// Until when a record, and with it its nonce, is kept: until the token
+/// expires, and never less than a signed request stays acceptable, so the
+/// retry of a mint whose answer was lost finds its nonce (409). Used
+/// signatures are remembered separately ([`UsedProofs`]), so the record need
+/// not outlive that.
+pub fn retain_until(created_at: i64, expires_at: i64) -> i64 {
+    expires_at.max(
+        created_at
+            .saturating_add(atomic_lib::authentication::AUTH_MAX_AGE_MS + PROOF_CLOCK_SKEW_MS),
+    )
 }
 
 fn lock() -> AtomicServerResult<std::sync::MutexGuard<'static, ()>> {
@@ -295,17 +308,22 @@ pub fn mint(
     if let Some(record) = store.get_access_token_by_nonce(&agent, &request.nonce)? {
         return Ok(MintOutcome::Duplicate(record));
     }
-    let held = store.access_tokens_of(&agent)?.len();
+    let held = store
+        .access_tokens_of(&agent)?
+        .iter()
+        .filter(|r| r.is_live(now))
+        .count();
     if held >= MAX_TOKENS_PER_AGENT {
         return Err(AtomicServerError {
             message: format!(
-                "{agent} already holds {held} access token records (live, or kept for their nonce); at most {MAX_TOKENS_PER_AGENT}. Revoked and expired ones are dropped when their retention ends."
+                "{agent} already holds {held} live access tokens, the most one agent may hold; revoke some first"
             ),
             error_type: crate::errors::AppErrorType::TooManyRequests,
             error_resource: None,
         });
     }
 
+    let expires_at = now.saturating_add(request.ttl_seconds.saturating_mul(1000));
     let token = format!(
         "{TOKEN_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes::<32>())
@@ -325,9 +343,9 @@ pub fn mint(
         label: request.label.clone(),
         nonce: request.nonce.clone(),
         created_at: now,
-        expires_at: now.saturating_add(request.ttl_seconds.saturating_mul(1000)),
+        expires_at,
         revoked_at: None,
-        retain_until: now.saturating_add(retention_ms(max_ttl_seconds)),
+        retain_until: retain_until(now, expires_at),
     };
     // One batch: the record, its hash and its nonce land together or not at
     // all, so a retried request never finds half a mint.
@@ -335,21 +353,89 @@ pub fn mint(
     Ok(MintOutcome::Created { record, token })
 }
 
-/// Use up a signed `/tokens` request: the same signature is refused for as
-/// long as it could still verify, whatever happened to the request the first
-/// time (minted, refused, rate limited, failed). Blocks on the store.
-pub fn consume_proof(store: &Db, signature: &str, timestamp: i64) -> AtomicServerResult<()> {
-    let _guard = lock()?;
-    store.prune_access_tokens(atomic_lib::utils::now())?;
-    let retain_until =
-        timestamp.saturating_add(atomic_lib::authentication::AUTH_MAX_AGE_MS + PROOF_CLOCK_SKEW_MS);
-    if store.consume_access_token_proof(&hash_token(signature), retain_until)? {
+/// The token `agent` already minted with `nonce`, if it is still retained.
+/// Lets a retried mint answer 409 before anything else is checked. Blocks on
+/// the store.
+pub fn minted_with_nonce(
+    store: &Db,
+    agent: &Subject,
+    nonce: &str,
+) -> AtomicServerResult<Option<AccessTokenRecord>> {
+    Ok(store.get_access_token_by_nonce(&canonical_agent(agent), nonce)?)
+}
+
+/// Signed `/tokens` requests already used, so each is accepted once: the
+/// same signature is refused for as long as it could still verify (its
+/// timestamp plus five minutes and the allowed clock skew).
+///
+/// Kept in memory under its own lock, not in the store: recording one is a
+/// hash-map insert, so a flood of signed requests costs no disk write and
+/// does not hold up mints. One process owns the store, so one map is
+/// complete. A restart forgets it; within five minutes after one, a request
+/// signed before it could be sent again. A repeated mint that had minted
+/// meets its nonce (409), a repeated revoke is idempotent and a repeated
+/// list returns metadata to whoever signed it; a mint that had been refused
+/// (rate limit, 403) could mint then.
+pub struct UsedProofs {
+    capacity: usize,
+    state: Mutex<UsedProofsState>,
+}
+
+struct UsedProofsState {
+    /// BLAKE3 of the signature -> Unix ms until which it could verify.
+    seen: HashMap<[u8; 32], i64>,
+    next_prune: i64,
+}
+
+impl Default for UsedProofs {
+    fn default() -> Self {
+        Self::with_capacity(MAX_USED_PROOFS)
+    }
+}
+
+impl UsedProofs {
+    pub fn with_capacity(capacity: usize) -> Self {
+        UsedProofs {
+            capacity,
+            state: Mutex::new(UsedProofsState {
+                seen: HashMap::new(),
+                next_prune: i64::MIN,
+            }),
+        }
+    }
+
+    /// Use up the signed request with `signature` and `timestamp` at `now`.
+    /// 401 when it was used before; 429 when the map is full of signatures
+    /// that can all still verify (one is never forgotten early, since that
+    /// would let it be replayed).
+    pub fn consume(&self, signature: &str, timestamp: i64, now: i64) -> AtomicServerResult<()> {
+        let key = *blake3::hash(signature.as_bytes()).as_bytes();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "used-proof lock poisoned".to_string())?;
+        if now >= state.next_prune {
+            state.seen.retain(|_, valid_until| *valid_until > now);
+            state.next_prune = now.saturating_add(USED_PROOFS_PRUNE_EVERY_MS);
+        }
+        if state.seen.contains_key(&key) {
+            return Err(AtomicError::unauthorized(
+                "This signed request was already used; sign a new one".to_string(),
+            )
+            .into());
+        }
+        if state.seen.len() >= self.capacity {
+            return Err(AtomicServerError {
+                message: "Too many signed /tokens requests in the last five minutes; retry shortly"
+                    .into(),
+                error_type: crate::errors::AppErrorType::TooManyRequests,
+                error_resource: None,
+            });
+        }
+        let valid_until = timestamp
+            .saturating_add(atomic_lib::authentication::AUTH_MAX_AGE_MS + PROOF_CLOCK_SKEW_MS);
+        state.seen.insert(key, valid_until);
         Ok(())
-    } else {
-        Err(AtomicError::unauthorized(
-            "This signed request was already used; sign a new one".to_string(),
-        )
-        .into())
     }
 }
 
@@ -606,15 +692,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_are_kept_for_the_cap_and_at_least_the_proof_window() {
+    async fn records_are_kept_until_expiry_and_at_least_the_proof_window() {
         let store = store("retention").await;
-        let (record, _) = created(mint(&store, &agent(), &request("n1", 60), 3600).unwrap());
-        assert_eq!(record.retain_until, record.created_at + 3_600_000);
-        // A cap shorter than a signed proof lives would let a proof outlive
-        // the nonce it minted; retention never goes below the proof window.
+        // A long token is kept until it expires, not for the whole cap.
+        let (long, _) = created(mint(&store, &agent(), &request("long", 3000), 3600).unwrap());
+        assert_eq!(long.retain_until, long.expires_at);
+        // A short one is kept as long as a signed request could still be
+        // retried, so the retry finds its nonce (409).
+        let (short, _) = created(mint(&store, &agent(), &request("short", 1), 3600).unwrap());
         let window = atomic_lib::authentication::AUTH_MAX_AGE_MS;
-        assert!(retention_ms(MIN_MAX_TTL_SECONDS) > window);
-        assert!(retention_ms(1) > window);
+        assert!(short.retain_until > short.created_at + window);
+        assert!(short.retain_until > short.expires_at);
     }
 
     #[tokio::test]
@@ -636,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_holds_a_bounded_number_of_tokens() {
+    async fn an_agent_holds_a_bounded_number_of_live_tokens() {
         let store = store("per_agent_cap").await;
         for n in 0..MAX_TOKENS_PER_AGENT {
             created(mint(&store, &agent(), &request(&format!("n{n}"), 60), 3600).unwrap());
@@ -649,24 +737,56 @@ mod tests {
             "{}",
             err.message
         );
-        // Revoked tokens still count until they are pruned: revoking is not
-        // a way around the bound on what one key makes this node store.
-        let first = store.access_tokens_of(&canonical_agent(&agent())).unwrap()[0].clone();
-        assert!(revoke(&store, &agent(), &first.token_id).unwrap());
-        assert!(mint(&store, &agent(), &request("still-over", 60), 3600).is_err());
+        // Only live tokens count: a role that mints and revokes a token per
+        // lease is not locked out by the ones it already revoked.
+        let records = store.access_tokens_of(&canonical_agent(&agent())).unwrap();
+        assert!(revoke(&store, &agent(), &records[0].token_id).unwrap());
+        created(mint(&store, &agent(), &request("after-revoke", 60), 3600).unwrap());
+        assert!(mint(&store, &agent(), &request("full-again", 60), 3600).is_err());
+        // Nor do expired ones.
+        let mut expired = records[1].clone();
+        expired.expires_at = atomic_lib::utils::now();
+        store.put_access_token(&expired).unwrap();
+        created(mint(&store, &agent(), &request("after-expiry", 60), 3600).unwrap());
         // Another agent is not affected.
         let other: Subject = "atomic:agent:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
         assert!(mint(&store, &other, &request("n0", 60), 3600).is_ok());
     }
 
-    #[tokio::test]
-    async fn a_signed_request_is_accepted_once() {
-        let store = store("proof_once").await;
+    #[test]
+    fn a_signed_request_is_accepted_once() {
+        let proofs = UsedProofs::with_capacity(10);
         let now = atomic_lib::utils::now();
-        consume_proof(&store, "signature-a", now).unwrap();
-        let err = consume_proof(&store, "signature-a", now).expect_err("a replayed proof");
+        proofs.consume("signature-a", now, now).unwrap();
+        let err = proofs
+            .consume("signature-a", now, now)
+            .expect_err("a replayed proof");
         assert!(err.message.contains("already used"), "{}", err.message);
-        consume_proof(&store, "signature-b", now).unwrap();
+        proofs.consume("signature-b", now, now).unwrap();
+    }
+
+    #[test]
+    fn used_proofs_are_bounded_and_forget_the_ones_that_can_no_longer_verify() {
+        let proofs = UsedProofs::with_capacity(2);
+        let now = atomic_lib::utils::now();
+        let stale = now - atomic_lib::authentication::AUTH_MAX_AGE_MS - 60_000;
+        proofs.consume("old-a", stale, stale).unwrap();
+        proofs.consume("old-b", stale, stale).unwrap();
+        // Full, but both entries are past the window: they make room.
+        proofs.consume("fresh-a", now, now).unwrap();
+        proofs.consume("fresh-b", now, now).unwrap();
+        // Full of entries that are still within the window: refused, and
+        // never by forgetting one that could still be replayed.
+        let err = proofs.consume("fresh-c", now, now).expect_err("full");
+        assert!(
+            matches!(err.error_type, crate::errors::AppErrorType::TooManyRequests),
+            "{}",
+            err.message
+        );
+        assert!(
+            proofs.consume("fresh-a", now, now).is_err(),
+            "still remembered"
+        );
     }
 
     #[test]

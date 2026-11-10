@@ -129,9 +129,8 @@ pub struct Opts {
 
     /// The longest lifetime, in seconds, an access token (`POST /tokens`) may
     /// ask for. A request for more is refused with 400, not shortened. The
-    /// default, 25 hours, covers a 24 hour lease plus a margin. At least 300:
-    /// tokens and their nonces are kept at least this long after they are
-    /// minted, which must cover the 5 minutes a signed request stays valid.
+    /// default, 25 hours, covers a 24 hour lease plus a margin. At least 300,
+    /// the 5 minutes a signed request stays valid.
     #[clap(long, default_value_t = crate::access_tokens::DEFAULT_MAX_TTL_SECONDS, value_parser = clap::value_parser!(u64).range(crate::access_tokens::MIN_MAX_TTL_SECONDS..), env = "ATOMIC_ACCESS_TOKEN_MAX_TTL")]
     pub access_token_max_ttl: u64,
 

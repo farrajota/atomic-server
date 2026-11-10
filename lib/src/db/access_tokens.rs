@@ -9,9 +9,8 @@
 //! - `nonce\0<agent>\0<nonce>`: the token id, so a repeated mint is found
 //!   without a scan;
 //! - `agent\0<agent>\0<token_id>`: empty, so one agent's tokens are a prefix;
-//! - `proof\0<hash of a request signature>`: a signed request already used;
-//! - `exp\0<retain_until, 16 hex digits>\0<t|p>\0<id or proof hash>`: empty,
-//!   ordered by when the row may go, so pruning reads only what has expired.
+//! - `exp\0<retain_until, 16 hex digits>\0t\0<token_id>`: empty, ordered by
+//!   when the record may go, so pruning reads only what has expired.
 //!
 //! A record's rows are written and removed in one batch. Nothing here is
 //! cached: every lookup reads the store, so a revoke applies to the next
@@ -59,7 +58,6 @@ impl AccessTokenRecord {
 }
 
 const RECORD: u8 = b't';
-const PROOF: u8 = b'p';
 
 fn key(parts: &[&[u8]]) -> Vec<u8> {
     parts.join(&b"\0"[..])
@@ -87,10 +85,6 @@ fn agent_key(agent: &str, token_id: &str) -> Vec<u8> {
     let mut k = agent_prefix(agent);
     k.extend_from_slice(token_id.as_bytes());
     k
-}
-
-fn proof_key(proof_hash: &str) -> Vec<u8> {
-    key(&[b"proof", proof_hash.as_bytes()])
 }
 
 /// Hex of a Unix ms time, fixed width, so keys sort by time. Times before
@@ -230,30 +224,8 @@ impl Db {
         Ok(())
     }
 
-    /// Record that the signed request `proof_hash` was used, until
-    /// `retain_until`. `false` when it was already recorded: a replay.
-    pub fn consume_access_token_proof(
-        &self,
-        proof_hash: &str,
-        retain_until: i64,
-    ) -> AtomicResult<bool> {
-        if self
-            .kv
-            .contains_key(Tree::AccessTokens, &proof_key(proof_hash))?
-        {
-            return Ok(false);
-        }
-        self.kv.apply_batch(&[
-            insert(proof_key(proof_hash), time_hex(retain_until).into_bytes()),
-            insert(expiry_key(retain_until, PROOF, proof_hash), Vec::new()),
-        ])?;
-        self.kv.flush()?;
-        Ok(true)
-    }
-
-    /// Drop every record and used proof whose retention ended at or before
-    /// `now`. Reads only the expired part of the expiry index. Returns how
-    /// many rows of either kind went.
+    /// Drop every record whose retention ended at or before `now`. Reads only
+    /// the expired part of the expiry index. Returns how many went.
     pub fn prune_access_tokens(&self, now: i64) -> AtomicResult<usize> {
         let start = b"exp\0".to_vec();
         let end = key(&[b"exp", time_hex(now.saturating_add(1)).as_bytes()]);
@@ -271,7 +243,6 @@ impl Db {
                         ops.extend(record_keys(&record).into_iter().map(delete));
                     }
                 }
-                PROOF => ops.push(delete(proof_key(id))),
                 _ => return Err("Corrupt access token expiry row".into()),
             }
             ops.push(delete(expiry));
@@ -373,11 +344,9 @@ mod tests {
         let kept = record("kept", "bb", "atomic:agent:a", "n2");
         db.put_access_token(&old).unwrap();
         db.put_access_token(&kept).unwrap();
-        assert!(db.consume_access_token_proof("p-old", 500).unwrap());
-        assert!(db.consume_access_token_proof("p-kept", 1_000).unwrap());
 
         assert_eq!(db.prune_access_tokens(499).unwrap(), 0);
-        assert_eq!(db.prune_access_tokens(500).unwrap(), 2);
+        assert_eq!(db.prune_access_tokens(500).unwrap(), 1);
 
         assert_eq!(db.get_access_token("old").unwrap(), None);
         assert_eq!(
@@ -387,23 +356,8 @@ mod tests {
         );
         assert_eq!(db.get_access_token_by_hash("aa").unwrap(), None);
         assert_eq!(db.get_access_token("kept").unwrap(), Some(kept.clone()));
-        assert!(
-            db.consume_access_token_proof("p-old", 2_000).unwrap(),
-            "pruned"
-        );
-        assert!(
-            !db.consume_access_token_proof("p-kept", 2_000).unwrap(),
-            "kept"
-        );
-        // kept: 5 rows; p-kept: 2 rows; p-old again: 2 rows.
-        assert_eq!(rows(&db), 9);
-    }
-
-    #[tokio::test]
-    async fn a_proof_is_consumed_once() {
-        let db = Db::init_temp("access_tokens_proof").await.unwrap();
-        assert!(db.consume_access_token_proof("p", 1_000).unwrap());
-        assert!(!db.consume_access_token_proof("p", 1_000).unwrap());
+        // Only the kept record's five rows are left.
+        assert_eq!(rows(&db), 5);
     }
 
     #[tokio::test]

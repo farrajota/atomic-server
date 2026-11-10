@@ -57,11 +57,32 @@ usual checks:
   accept, is checked against the configured origin and fails. So a request
   signed for a laptop's `http://localhost:9883/tokens` cannot be replayed to a
   production node of the same agent.
-- **Good once.** The server records each accepted signature until it could no
-  longer verify (its timestamp plus 5 minutes and 10 seconds). The same signed
-  request sent again gets 401 ("already used"), whatever happened to it the
-  first time: minted, refused, rate limited or failed. Sign a new request to
-  retry.
+- **In-cluster callers.** `/tokens` is served only on the configured host.
+  A caller that connects to the in-cluster Service (for example
+  `http://atomic-server.home-lab.svc.cluster.local:9883`) sends
+  `X-Forwarded-Host: atomic.zay.home` and `X-Forwarded-Proto: https`, and
+  signs `https://atomic.zay.home/tokens…`. Without those headers the server
+  checks the signature against its configured origin
+  (`http://atomic.zay.home:9883` when it does not terminate TLS itself), which
+  a signature for the public URL does not match.
+- **Charged first.** Every signed request, a list included, spends the agent's
+  write rate budget (`--write-rate-limit`, keyed on the canonical
+  `atomic:agent:` spelling) before anything else is done; over budget is 429.
+- **Good once.** Then the signature is used up: the server remembers it in
+  memory until it could no longer verify (its timestamp plus 5 minutes and 10
+  seconds), and the same signed request sent again gets 401 ("already used"),
+  whatever happened to it: minted, refused or failed. Sign a new request to
+  retry. At most 250 000 signatures are remembered at once; when that many are
+  still within their five minutes, further signed requests get 429 until some
+  age out. A restart forgets them: within five minutes after a restart, a
+  request signed before it could be sent again. A repeated mint that had
+  minted then meets its nonce (409), a repeated revoke is idempotent and a
+  repeated list only lists; a mint that had been refused (rate limit, 403)
+  could mint.
+
+There is no per-address limit. The server sees only the socket peer, which
+behind the ingress is the ingress for every client, including the OpenBao
+plugin, so such a limit would throttle all of them together.
 
 ### `POST /tokens`: mint
 
@@ -85,13 +106,19 @@ Signed as above.
 - `label`: optional, up to 256 bytes.
 - `nonce`: required, 1 to 128 bytes, no control characters.
 
-**403 Forbidden** unless the agent can read every target now. A token only
-narrows rights its agent holds, so a target it cannot read, one that does not
-exist on this node, or one hosted elsewhere refuses the whole request.
+**409** for a nonce this agent already used (see below) is answered before the
+checks that follow, so a retried mint learns about its earlier token even if
+the agent lost read on a target since.
 
-**429 Too Many Requests** when the agent already has 200 retained token records
-(live, or revoked and expired ones still kept for their nonce, see below), or
-when the agent's write rate budget is spent. The budget is keyed on the agent's
+**403 Forbidden** unless the agent can read every target now, through rights
+of its own. A token only narrows rights its agent holds, so a target it cannot
+read, one that does not exist on this node, or one hosted elsewhere refuses
+the whole request. So does a target anyone may read (a public drive, and every
+agent's own resource): a token over public data adds nothing, so a key that
+was never granted anything cannot mint.
+
+**429 Too Many Requests** when the agent already holds 200 live (unrevoked,
+unexpired) tokens, or when its write rate budget is spent. The budget is keyed on the agent's
 canonical spelling, so `did:ad:agent:…` and `atomic:agent:…` share it.
 
 **201 Created**:
@@ -113,9 +140,9 @@ This is the only time the token value is ever returned. `expires_at` is
 `created_at + ttl_seconds * 1000`. From that instant on the token is refused.
 
 **409 Conflict**: the agent already minted a token with this `nonce`. A token
-counts here for as long as it is retained (`created_at` plus the TTL cap, and
-never less than 5 minutes and 10 seconds), whether it is still live, revoked
-or expired. The nonce is written in the same batch as the token, so a mint
+counts here for as long as it is retained: until it expires, and never less
+than 5 minutes and 10 seconds after it was minted, whether it is still live
+or revoked. The nonce is written in the same batch as the token, so a mint
 either happened with its nonce or not at all. The body is the earlier token's view (as for
 `GET /tokens/self`) plus an `error` string. It never includes the token value,
 which is not stored. So a retried mint cannot create a second token.
@@ -193,11 +220,11 @@ export (`POST /recovery/export`, a bundle of selected resources and their Loro
 state): a token is not a resource. An agent that
 needs tokens on a restored node mints new ones.
 
-A record is kept until `created_at` plus the TTL cap (at least 5 minutes and
-10 seconds), then dropped by the next mint or signed request, which read only
-the expired part of an expiry-ordered index. Mints, revokes and used-signature
-records are serialized by one lock and run on actix's blocking pool, not on
-the workers that serve requests.
+A record is kept until the token expires (and at least 5 minutes and 10
+seconds after it was minted), then dropped by the next mint, which reads only
+the expired part of an expiry-ordered index. Mints and revokes are serialized
+by one lock and run on actix's blocking pool, not on the workers that serve
+requests. Used signatures are kept in memory, not in the store.
 
 ## Known costs and limits
 

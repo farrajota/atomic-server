@@ -920,24 +920,50 @@ async fn a_signed_tokens_request_is_accepted_once() {
     );
 }
 
-/// The mint budget belongs to the agent, not to how its subject is spelled:
-/// `did:ad:agent:` and `atomic:agent:` are one key.
-#[tokio::test]
-async fn both_spellings_of_an_agent_share_one_mint_budget() {
-    let port = start_server_with_args("tokens_rate_spelling", &["--write-rate-limit", "2"]);
-    wait_for_server(port).await;
-    let base = format!("http://localhost:{port}");
-    let bob = Client::new(&base)
+/// Alice's private drive, readable by Bob through an explicit grant, on a
+/// server with the given extra flags. Two commits by Alice.
+async fn shared_drive(base: &str) -> (Client, Agent, Agent, String) {
+    let client = Client::new(base).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive = client.new_drive(&alice, "Shared").await.unwrap();
+    let bob = Client::new(base)
         .await
         .unwrap()
         .new_agent("Bob")
         .await
         .unwrap();
+    set_readers(&client, &drive, &[&alice, &bob]).await;
+    (client, alice, bob, drive)
+}
+
+async fn set_readers(client: &Client, drive: &str, readers: &[&Agent]) {
+    let mut resource = client.get_resource(drive).await.unwrap();
+    resource
+        .set_unsafe(
+            urls::READ.into(),
+            Value::ResourceArray(
+                readers
+                    .iter()
+                    .map(|a| a.subject.to_string().into())
+                    .collect(),
+            ),
+        )
+        .unwrap();
+    resource.save_remote(client.store()).await.unwrap();
+}
+
+/// The mint budget belongs to the agent, not to how its subject is spelled:
+/// `did:ad:agent:` and `atomic:agent:` are one key.
+#[tokio::test]
+async fn both_spellings_of_an_agent_share_one_mint_budget() {
+    let port = start_server_with_args("tokens_rate_spelling", &["--write-rate-limit", "3"]);
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let (_client, _alice, bob, drive) = shared_drive(&base).await;
     let canonical = bob.subject.to_string().replace("did:ad:", "atomic:");
     let legacy = canonical.replace("atomic:", "did:ad:");
     let mint_as = |spelling: &str, nonce: &str| {
-        // Bob's own agent resource: anyone may read it.
-        let body = mint_body(&[(&canonical, "read")], 60, nonce);
+        let body = mint_body(&[(&drive, "read")], 60, nonce);
         let url = format!("{base}/tokens");
         let mut req = http().post(&url).body(body.clone());
         for (k, v) in get_authentication_headers_v2("POST", &url, &body, &bob).unwrap() {
@@ -951,16 +977,92 @@ async fn both_spellings_of_an_agent_share_one_mint_budget() {
         req.send()
     };
 
+    for (spelling, nonce) in [(&legacy, "n1"), (&legacy, "n2"), (&canonical, "n3")] {
+        assert_eq!(
+            mint_as(spelling, nonce).await.unwrap().status(),
+            StatusCode::CREATED,
+            "{nonce}"
+        );
+    }
     assert_eq!(
-        mint_as(&legacy, "n1").await.unwrap().status(),
-        StatusCode::CREATED
+        mint_as(&legacy, "n4").await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "three mints spent the budget, whichever spelling signed them"
     );
+}
+
+/// Listing spends the agent's budget too, so a key cannot keep the store busy
+/// with lists.
+#[tokio::test]
+async fn listing_is_rate_limited_per_agent() {
+    let port = start_server_with_args("tokens_list_rate", &["--write-rate-limit", "2"]);
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let bob = Client::new(&base)
+        .await
+        .unwrap()
+        .new_agent("Bob")
+        .await
+        .unwrap();
+    let list = || signed_v2(reqwest::Method::GET, &base, "/tokens", b"", &bob).send();
+    assert_eq!(list().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(list().await.unwrap().status(), StatusCode::OK);
     assert_eq!(
-        mint_as(&legacy, "n2").await.unwrap().status(),
-        StatusCode::CREATED
-    );
-    assert_eq!(
-        mint_as(&canonical, "n3").await.unwrap().status(),
+        list().await.unwrap().status(),
         StatusCode::TOO_MANY_REQUESTS
     );
+}
+
+/// A scope over data anyone may read grants nothing a token adds, and every
+/// agent's own resource is public: such a mint is refused, so a key that was
+/// never granted anything cannot make the node store tokens.
+#[tokio::test]
+async fn a_scope_over_public_data_is_refused() {
+    let port = start_server("tokens_public_scope");
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let client = Client::new(&base).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let public = client.new_public_drive(&alice, "Public").await.unwrap();
+    let stranger = Client::new(&base)
+        .await
+        .unwrap()
+        .new_agent("Stranger")
+        .await
+        .unwrap();
+    let own_did = stranger.subject.to_string();
+    let alice_did = alice.subject.to_string();
+    for (agent, target) in [
+        (&stranger, own_did.as_str()),
+        (&stranger, alice_did.as_str()),
+        (&stranger, public.as_str()),
+        (&alice, public.as_str()),
+    ] {
+        let resp = signed_v2(
+            reqwest::Method::POST,
+            &base,
+            "/tokens",
+            &mint_body(&[(target, "read")], 60, &format!("n-{}", target.len())),
+            agent,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{target}");
+    }
+}
+
+/// A retried mint finds its earlier token (409) before anything else is
+/// checked, even when the agent has lost read on a target since.
+#[tokio::test]
+async fn a_retried_mint_reports_its_duplicate_even_after_read_was_lost() {
+    let port = start_server("tokens_retry_after_revoke");
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let (client, alice, bob, drive) = shared_drive(&base).await;
+    let body = mint_body(&[(&drive, "read")], 600, "retry-me");
+    let mint = || signed_v2(reqwest::Method::POST, &base, "/tokens", &body, &bob).send();
+    assert_eq!(mint().await.unwrap().status(), StatusCode::CREATED);
+    set_readers(&client, &drive, &[&alice]).await;
+    assert_eq!(mint().await.unwrap().status(), StatusCode::CONFLICT);
 }

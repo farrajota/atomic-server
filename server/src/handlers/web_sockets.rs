@@ -99,6 +99,7 @@ pub async fn web_socket_handler(
             index_status_subscribed: std::collections::HashSet::new(),
             sync_frames: Arc::default(),
             auth_generation: 0,
+            expiry_timer: None,
             token_sessions: appstate.token_sessions.clone(),
         },
         &req,
@@ -170,6 +171,9 @@ pub struct WebSocketConnection {
     /// happened to the identity meanwhile, so an older proof can never
     /// overwrite a newer identity (a token session included).
     auth_generation: u64,
+    /// The timer that closes the session when its token expires; cancelled
+    /// when the identity changes, so switching tokens leaves none behind.
+    expiry_timer: Option<actix::SpawnHandle>,
     /// Where revokes find this session (`crate::access_tokens`). A session
     /// is a token session exactly when `agent` is `ForAgent::Token`; there
     /// is no other record of it.
@@ -467,6 +471,9 @@ impl WebSocketConnection {
             self.token_sessions
                 .deregister(&old.token_id, &ctx.address());
         }
+        if let Some(timer) = self.expiry_timer.take() {
+            ctx.cancel_future(timer);
+        }
         // Subscriptions were admitted under the previous identity; have the
         // monitor re-check them against this one (see `Handler<RebindAgent>`).
         self.commit_monitor_addr
@@ -478,11 +485,14 @@ impl WebSocketConnection {
             self.token_sessions.register(&grant.token_id, ctx.address());
             let remaining = (grant.expires_at - atomic_lib::utils::now()).max(0) as u64;
             let token_id = grant.token_id.clone();
-            ctx.run_later(Duration::from_millis(remaining), move |act, ctx| {
-                if act.token_grant().is_some_and(|g| g.token_id == token_id) {
-                    act.close_token_session(ctx, "access token expired");
-                }
-            });
+            self.expiry_timer = Some(ctx.run_later(
+                Duration::from_millis(remaining),
+                move |act, ctx| {
+                    if act.token_grant().is_some_and(|g| g.token_id == token_id) {
+                        act.close_token_session(ctx, "access token expired");
+                    }
+                },
+            ));
         }
         self.agent = agent;
     }

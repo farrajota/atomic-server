@@ -51,6 +51,8 @@ pub struct AppState {
     /// WebSocket sessions opened with an access token, so revoking the token
     /// closes them. See `crate::access_tokens`.
     pub token_sessions: Arc<crate::access_tokens::TokenSessions>,
+    /// Signed `/tokens` requests already used; see `crate::access_tokens`.
+    pub used_token_proofs: Arc<crate::access_tokens::UsedProofs>,
 }
 
 impl AppState {
@@ -299,6 +301,7 @@ impl AppState {
             managed_dashboard_url: server_info.managed_dashboard_url,
             view_tokens: Arc::new(Default::default()),
             token_sessions: Arc::new(Default::default()),
+            used_token_proofs: Arc::new(Default::default()),
         })
     }
 

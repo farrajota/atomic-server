@@ -383,6 +383,12 @@ agent that a mid-session `AUTH` upgrades, invalidating the per-connection
 drive-verdict cache so a `Public` verdict cached before the upgrade does not
 stick.
 
+On a WebSocket, a signed `AUTH` is verified off the connection actor, and the
+last `AUTH` sent decides the identity. A signed `AUTH` that verifies after a
+later `AUTH` (signed or access token) has arrived is not applied: it is
+answered with `ERROR` `AUTH_FAILED` and the message `Auth superseded by a
+later AUTH on this connection`. Send one `AUTH` and wait for its answer.
+
 **Iroh mutual auth.** After a successful `AUTH` the accept side writes, in
 order: `AUTH_OK`, its own `HELLO`, then an `AUTH` of its own back to the
 initiator, signed for the remote node key. Best effort: a node with no
