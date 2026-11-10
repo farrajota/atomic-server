@@ -1385,3 +1385,39 @@ async fn search_and_history_refuse_a_revoked_token() {
         assert!(body.contains("revoked"), "{path}: {body}");
     }
 }
+
+/// A token's search walks each requested parent against its scopes, so the
+/// list is bounded: more than 32 parents is a 400.
+#[tokio::test]
+async fn a_tokens_search_takes_a_bounded_number_of_parents() {
+    let f = search_fixture("tokens_search_parent_cap").await;
+    let parents = |n: usize| {
+        (0..n)
+            .map(|i| format!("atomic:not-a-parent-{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (status, _, body) = get_as(
+        &f.base,
+        &format!(
+            "/search?q=zebranest&parents={}",
+            urlencoding::encode(&parents(32))
+        ),
+        Some(&f.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(search_results(&body).is_empty(), "{body}");
+    let (status, _, body) = get_as(
+        &f.base,
+        &format!(
+            "/search?q=zebranest&parents={}",
+            urlencoding::encode(&parents(33))
+        ),
+        Some(&f.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

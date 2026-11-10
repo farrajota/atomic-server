@@ -37,8 +37,8 @@ Tokens are accepted only in these places:
   nothing). Public data outside the scopes is not searched through a token;
   ask anonymously for that. Every candidate is then read-checked as the token,
   so only hits it may read are listed or included. A token's `limit` is at
-  most 100 (each candidate costs an uncached rights walk); page with
-  `parents` for more.
+  most 100 (each candidate costs an uncached rights walk), and it names at
+  most 32 `parents` (400 beyond); page with `parents` for more.
 - **History**: `GET /history-attribution?subject=…`, answered only when the
   token may read `subject` (401 otherwise, as for a resource read). The answer
   describes that subject's own commits: their signers, times and signatures.
@@ -243,6 +243,11 @@ requests. Used signatures are kept in memory, not in the store.
 
 ## Known costs and limits
 
+- **Search response time.** `/search` sends no timing unless the operator sets
+  `--debug-search-timing`, but the total response time still grows with the
+  number of index matches found before the rights filter, so a caller timing
+  many requests could roughly estimate how many resources match a query. This
+  holds for any caller, not only tokens.
 - **Uncached rights walks.** A rights check through a token runs the agent's
   check and the scope walk without the per-request rights cache (the cache
   holds one agent's verdicts, and this check asks as two). A large `/query`

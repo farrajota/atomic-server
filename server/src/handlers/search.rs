@@ -57,27 +57,50 @@ pub fn effective_limit(requested: Option<usize>, token: bool) -> usize {
     }
 }
 
+/// How many `parents` an access token's search may name. Each is fetched and
+/// walked against the token's scopes before the index is asked.
+pub const TOKEN_SEARCH_MAX_PARENTS: usize = 32;
+
 /// The parents an access token's search runs under: its scope targets when
 /// the request names none; otherwise each requested parent that lies inside a
 /// scope, and each scope target that lies inside a requested parent. `None`
 /// when nothing is left, which answers as a search without hits. Matches the
 /// token may not read can then not fill the result window, and a requested
-/// parent outside every scope learns nothing.
+/// parent outside every scope learns nothing. 400 for more than
+/// [`TOKEN_SEARCH_MAX_PARENTS`] requested parents.
 async fn token_search_parents(
     store: &atomic_lib::Db,
     grant: &atomic_lib::agents::TokenGrant,
     requested: Option<&[String]>,
-) -> Option<Vec<String>> {
+) -> AtomicServerResult<Option<Vec<String>>> {
     let targets: Vec<&str> = grant.scopes.iter().map(|s| s.target.as_str()).collect();
     let requested = match requested {
         Some(requested) if !requested.is_empty() => requested,
-        _ => return (!targets.is_empty()).then(|| targets.iter().map(|t| t.to_string()).collect()),
+        _ => {
+            return Ok(
+                (!targets.is_empty()).then(|| targets.iter().map(|t| t.to_string()).collect())
+            )
+        }
     };
+    if requested.len() > TOKEN_SEARCH_MAX_PARENTS {
+        return Err(crate::errors::AtomicServerError::bad_request(format!(
+            "An access token's search takes at most {TOKEN_SEARCH_MAX_PARENTS} parents"
+        )));
+    }
     // Only subjects this node holds: never fetch a requested URL elsewhere.
     let local = |raw: &str| {
         let subject = atomic_lib::Subject::from_raw(raw.trim(), store.get_base_domain().as_deref());
         subject.is_local().then_some(subject)
     };
+    // The scope targets, fetched once for every requested parent.
+    let mut target_resources = Vec::new();
+    for target in &targets {
+        if let Some(subject) = local(target) {
+            if let Ok(resource) = store.get_resource(&subject).await {
+                target_resources.push((*target, resource));
+            }
+        }
+    }
     let mut parents: Vec<String> = Vec::new();
     for parent in requested {
         let Some(subject) = local(parent) else {
@@ -89,20 +112,15 @@ async fn token_search_parents(
                 continue;
             }
         }
-        for target in &targets {
-            let Some(target_subject) = local(target) else {
-                continue;
-            };
-            if let Ok(resource) = store.get_resource(&target_subject).await {
-                if atomic_lib::hierarchy::is_within_any(store, &resource, &[parent.as_str()]).await
-                    && !parents.iter().any(|p| p == target)
-                {
-                    parents.push(target.to_string());
-                }
+        for (target, resource) in &target_resources {
+            if !parents.iter().any(|p| p == target)
+                && atomic_lib::hierarchy::is_within_any(store, resource, &[parent.as_str()]).await
+            {
+                parents.push(target.to_string());
             }
         }
     }
-    (!parents.is_empty()).then_some(parents)
+    Ok((!parents.is_empty()).then_some(parents))
 }
 
 /// Parses a search query and responds with a list of resources
@@ -149,7 +167,7 @@ pub async fn search_query(
     // A token searches under its scopes only (see `token_search_parents`).
     let mut nothing_to_search = false;
     if let Some(grant) = token {
-        match token_search_parents(store, grant, params.parents.as_deref()).await {
+        match token_search_parents(store, grant, params.parents.as_deref()).await? {
             Some(parents) => opts.parents = Some(parents),
             None => nothing_to_search = true,
         }
