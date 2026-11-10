@@ -29,11 +29,19 @@ Tokens are accepted only in these places:
 - **Resource reads**: `GET /resource?subject=…`, path subjects, and the endpoints
   served through them, such as `/query`. Pass the token as
   `Authorization: Bearer atk_…`.
+- **Full-text search**: `GET /search?q=…` (with `parents`, `filters`,
+  `limit`, `include`). The index's candidates are read-checked one by one as
+  the token, so only hits it may read are listed or included. The
+  `Server-Timing` header leaves out the index's candidate counts for a token,
+  since they are counted before that check.
+- **History**: `GET /history-attribution?subject=…`, answered only when the
+  token may read `subject` (401 otherwise, as for a resource read). The answer
+  describes that subject's own commits: their signers, times and signatures.
 - **WebSocket `AUTH`**: see below.
 - **`/tokens/self`** and **self-revoke**.
 
-Every other endpoint answers 401 to an access token (for example `/search`,
-`/export`, `/commit` and the plugin endpoints). The older
+Every other endpoint answers 401 to an access token (for example `/export`,
+`/commit`, `/vector_search` and the plugin endpoints). The older
 `Authorization: Bearer <base64 auth proof>` keeps working where it worked before.
 The `atk_` prefix tells the two apart.
 

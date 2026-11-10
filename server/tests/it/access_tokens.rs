@@ -545,7 +545,6 @@ async fn a_token_is_refused_by_endpoints_that_do_not_take_one() {
     let doc = urlencoding::encode(&f.doc_a).into_owned();
     let drive = urlencoding::encode(&f.drive).into_owned();
     for path in [
-        "/search?q=Doc".to_string(),
         format!("/export?subject={doc}&format=csv"),
         format!("/app-agent?drive={drive}&app={doc}"),
         format!("/drive-usage?subject={drive}"),
@@ -1065,4 +1064,192 @@ async fn a_retried_mint_reports_its_duplicate_even_after_read_was_lost() {
     assert_eq!(mint().await.unwrap().status(), StatusCode::CREATED);
     set_readers(&client, &drive, &[&alice]).await;
     assert_eq!(mint().await.unwrap().status(), StatusCode::CONFLICT);
+}
+
+/// Alice holds two private drives, A and B, and a public one; each has one
+/// document named with `word` and its letter. A token scoped to A.
+struct SearchFixture {
+    base: String,
+    alice: Agent,
+    drive_b: String,
+    doc_a: String,
+    doc_b: String,
+    doc_public: String,
+    token: String,
+    token_id: String,
+}
+
+async fn search_fixture(name: &str) -> SearchFixture {
+    let port = start_server(name);
+    wait_for_server(port).await;
+    let base = format!("http://localhost:{port}");
+    let client = Client::new(&base).await.unwrap();
+    let alice = client.new_agent("Alice").await.unwrap();
+    let drive_a = client.new_drive(&alice, "Drive A").await.unwrap();
+    let drive_b = client.new_drive(&alice, "Drive B").await.unwrap();
+    let public = client.new_public_drive(&alice, "Public").await.unwrap();
+    let doc_a = child(&client, &drive_a, "zebranest alpha").await;
+    let doc_b = child(&client, &drive_b, "zebranest bravo").await;
+    let doc_public = child(&client, &public, "zebranest public").await;
+    let resp = signed_v2(
+        reqwest::Method::POST,
+        &base,
+        "/tokens",
+        &mint_body(&[(&drive_a, "read")], 600, "search"),
+        &alice,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let minted: Json = resp.json().await.unwrap();
+    SearchFixture {
+        base,
+        alice,
+        drive_b,
+        doc_a,
+        doc_b,
+        doc_public,
+        token: token_of(&minted),
+        token_id: id_of(&minted),
+    }
+}
+
+/// What a caller gets back from `path`: status, the `Server-Timing` header
+/// and the body.
+async fn get_as(
+    base: &str,
+    path: &str,
+    bearer: Option<&str>,
+    agent: Option<&Agent>,
+) -> (StatusCode, String, String) {
+    let url = format!("{base}{path}");
+    let mut req = http().get(&url).header("Accept", "application/ad+json");
+    if let Some(token) = bearer {
+        req = req.bearer_auth(token);
+    }
+    if let Some(agent) = agent {
+        for (k, v) in get_authentication_headers(&url, agent).unwrap() {
+            req = req.header(k, v);
+        }
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    let timing = resp
+        .headers()
+        .get("Server-Timing")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, timing, resp.text().await.unwrap())
+}
+
+/// A token's search answers what the token may read, the way a resource GET
+/// does: hits in its scope and public hits, never a hit the agent could read
+/// outside the scope, not by subject, title or count.
+#[tokio::test]
+async fn search_through_a_token_finds_only_what_it_may_read() {
+    let f = search_fixture("tokens_search").await;
+    for path in [
+        "/search?q=zebranest".to_string(),
+        "/search?q=zebranest&include=true".to_string(),
+        format!(
+            "/search?q=zebranest&parents={}",
+            urlencoding::encode(&f.drive_b)
+        ),
+    ] {
+        let (status, timing, body) = get_as(&f.base, &path, Some(&f.token), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(
+            !body.contains(&f.doc_b),
+            "{path}: B's subject leaked: {body}"
+        );
+        assert!(!body.contains("bravo"), "{path}: B's title leaked: {body}");
+        assert!(
+            !timing.contains("candidates"),
+            "{path}: the index's candidate count leaks what the token cannot read: {timing}"
+        );
+    }
+    let (_, _, body) = get_as(&f.base, "/search?q=zebranest", Some(&f.token), None).await;
+    assert!(body.contains(&f.doc_a), "in scope: {body}");
+    assert!(
+        body.contains(&f.doc_public),
+        "public, as for anonymous: {body}"
+    );
+
+    // Anonymous: only the public document.
+    let (status, _, body) = get_as(&f.base, "/search?q=zebranest", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&f.doc_public) && !body.contains(&f.doc_a) && !body.contains(&f.doc_b));
+
+    // The agent's own signed search is unchanged: all three, with the timing.
+    let (status, timing, body) = get_as(&f.base, "/search?q=zebranest", None, Some(&f.alice)).await;
+    assert_eq!(status, StatusCode::OK);
+    for doc in [&f.doc_a, &f.doc_b, &f.doc_public] {
+        assert!(body.contains(doc.as_str()), "{doc}: {body}");
+    }
+    assert!(timing.contains("candidates"), "{timing}");
+}
+
+/// `/history-attribution` through a token: the history of what it may read,
+/// a 401 for anything else, exactly as a resource read would answer.
+#[tokio::test]
+async fn history_through_a_token_is_limited_to_what_it_may_read() {
+    let f = search_fixture("tokens_history").await;
+    let history = |subject: &str| {
+        format!(
+            "/history-attribution?subject={}",
+            urlencoding::encode(subject)
+        )
+    };
+
+    let (status, _, body) = get_as(&f.base, &history(&f.doc_a), Some(&f.token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let report: Json = serde_json::from_str(&body).unwrap();
+    assert!(report["attributions"].is_array(), "{report}");
+
+    let (status, _, body) = get_as(&f.base, &history(&f.doc_b), Some(&f.token), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "outside the scope: {body}"
+    );
+    assert!(!body.contains("attributions"), "{body}");
+
+    let (status, _, _) = get_as(&f.base, &history(&f.doc_public), Some(&f.token), None).await;
+    assert_eq!(status, StatusCode::OK, "public, as for anonymous");
+    let (status, _, _) = get_as(&f.base, &history(&f.doc_public), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The agent itself, signed, still reads B's history.
+    let (status, _, _) = get_as(&f.base, &history(&f.doc_b), None, Some(&f.alice)).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A revoked token gets 401 on both endpoints, like everywhere else.
+#[tokio::test]
+async fn search_and_history_refuse_a_revoked_token() {
+    let f = search_fixture("tokens_search_revoked").await;
+    let revoked = signed_v2(
+        reqwest::Method::DELETE,
+        &f.base,
+        &format!("/tokens/{}", f.token_id),
+        b"",
+        &f.alice,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    for path in [
+        "/search?q=zebranest".to_string(),
+        format!(
+            "/history-attribution?subject={}",
+            urlencoding::encode(&f.doc_a)
+        ),
+    ] {
+        let (status, _, body) = get_as(&f.base, &path, Some(&f.token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert!(body.contains("revoked"), "{path}: {body}");
+    }
 }

@@ -52,6 +52,20 @@ pub async fn search_query(
 
     let origin = RequestContext::new(&req, &appstate).origin;
     let store = &appstate.store;
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .ok_or("Add a query param")?
+        .to_string();
+    // Who is asking, before any index work. An access token is accepted, as
+    // for a resource read: every hit below is read-checked as this identity,
+    // so a token sees the hits its narrowed rights allow and nothing else.
+    let for_agent = crate::helpers::get_client_agent_or_access_token(
+        req.headers(),
+        &appstate,
+        &format!("{}{}", origin, path_and_query),
+    )
+    .await?;
 
     let fetch_limit = (limit * UNAUTHORIZED_RESULTS_FACTOR) as u32;
     let mut opts = SearchOpts {
@@ -76,11 +90,6 @@ pub async fn search_query(
         params
     );
 
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .ok_or("Add a query param")?
-        .to_string();
     let subject =
         atomic_lib::Subject::from_raw(&path_and_query, store.get_base_domain().as_deref());
 
@@ -90,14 +99,7 @@ pub async fn search_query(
     results_resource.set_subject(subject.to_string());
 
     timer.add("build_endpoint");
-    let resources = get_resources(
-        req,
-        &appstate,
-        &format!("{}{}", origin, path_and_query),
-        subjects.clone(),
-        limit,
-    )
-    .await?;
+    let resources = readable_resources(&appstate, &for_agent, subjects.clone(), limit).await;
     timer.add("get_resources");
     tracing::info!(
         "search_query: after auth filter -> {} resources (was {} subjects)",
@@ -129,21 +131,31 @@ pub async fn search_query(
     let mut builder = HttpResponse::Ok();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     // Sub-steps of `execute_query`, plus how many documents were considered.
-    let server_timing = format!(
-        "{}, score;dur={:.1}, scope;dur={:.1}, rank;dur={:.1}, candidates;desc=\"{} in scope of {}\"",
+    let mut server_timing = format!(
+        "{}, score;dur={:.1}, scope;dur={:.1}, rank;dur={:.1}",
         timer.header_value(),
         ms(timings.score),
         ms(timings.scope),
         ms(timings.rank),
-        timings.in_scope,
-        timings.candidates,
     );
+    // The candidate counts come from the index before the rights filter. A
+    // token must not learn how many matches lie outside its scopes, so they
+    // are left out for it (they are unchanged for everyone else).
+    if !matches!(for_agent, atomic_lib::agents::ForAgent::Token(_)) {
+        server_timing.push_str(&format!(
+            ", candidates;desc=\"{} in scope of {}\"",
+            timings.in_scope, timings.candidates,
+        ));
+    }
     builder.append_header(("Server-Timing", server_timing));
     builder.content_type("application/ad+json");
 
     Ok(builder.body(Resource::vec_to_json_ad(&result_vec, Some(&origin))?))
 }
 
+/// [`readable_resources`] for a caller that is authenticated here and may not
+/// use an access token (`/vector_search`).
+#[cfg(feature = "vector-search")]
 #[tracing::instrument(skip(appstate, req))]
 pub async fn get_resources(
     req: actix_web::HttpRequest,
@@ -152,13 +164,26 @@ pub async fn get_resources(
     subjects: Vec<String>,
     limit: usize,
 ) -> AtomicServerResult<Vec<Resource>> {
-    let mut resources: Vec<Resource> = Vec::new();
-
     let for_agent = crate::helpers::get_client_agent(req.headers(), appstate, subject).await?;
+    Ok(readable_resources(appstate, &for_agent, subjects, limit).await)
+}
+
+/// The first `limit` of `subjects` that `for_agent` may read, each fetched
+/// through the same read check as a resource GET
+/// (`get_resource_extended`, `hierarchy::check_read`). For an access token
+/// that is its narrowed rights: (agent rights and scopes) or public. Every
+/// check builds its own state; nothing is cached across results.
+pub async fn readable_resources(
+    appstate: &AppState,
+    for_agent: &atomic_lib::agents::ForAgent,
+    subjects: Vec<String>,
+    limit: usize,
+) -> Vec<Resource> {
+    let mut resources: Vec<Resource> = Vec::new();
     for s in subjects {
         match appstate
             .store
-            .get_resource_extended(&s.clone().into(), true, &for_agent)
+            .get_resource_extended(&s.clone().into(), true, for_agent)
             .await
         {
             Ok(r) => {
@@ -174,5 +199,5 @@ pub async fn get_resources(
             }
         }
     }
-    Ok(resources)
+    resources
 }

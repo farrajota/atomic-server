@@ -2,7 +2,9 @@
 //! history, as far as this node kept the envelopes (`atomic_lib::envelopes`).
 //!
 //! Read-gated like the resource itself: the caller must be allowed to read
-//! `subject`. The answer is the verified signer per Loro change, matched by
+//! `subject`. An access token is accepted, as for a resource read, and is
+//! held to the same narrowed read check (its agent's rights within its
+//! scopes, or public); the answer only describes `subject`. The answer is the verified signer per Loro change, matched by
 //! the op IDs each envelope introduced when this node applied it (never by
 //! the client-chosen change message), plus whether every change is covered.
 //! A node on `latest` retention answers with the genesis and the newest
@@ -11,7 +13,7 @@
 
 use crate::{
     appstate::AppState, context::RequestContext, errors::AtomicServerResult,
-    helpers::get_client_agent,
+    helpers::get_client_agent_or_access_token,
 };
 use actix_web::{web, HttpRequest, HttpResponse};
 use atomic_lib::{Storelike, Subject};
@@ -35,7 +37,7 @@ pub async fn handle_history_attribution(
     // The client signs the full request URL (path + query); rebuild it exactly
     // so the signature check matches what it signed.
     let full_url = format!("{}{}", origin, req.uri());
-    let for_agent = get_client_agent(req.headers(), &appstate, &full_url).await?;
+    let for_agent = get_client_agent_or_access_token(req.headers(), &appstate, &full_url).await?;
 
     // A destroyed subject has no resource to check against; its drive is the
     // rights anchor, the same gate `SYNC_DIFF.removeCommits` uses. Only a
